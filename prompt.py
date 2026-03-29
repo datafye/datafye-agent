@@ -13,6 +13,7 @@ def build_system_prompt(
     docs_dir: str,
     cli_path: str,
     workspace_dir: str,
+    samples_dir: str,
     credential_summary: str,
     algo_id: str | None = None,
 ) -> str:
@@ -60,17 +61,27 @@ CAPABILITIES:
    - Stream data: `{cli_path} data stream`
    Always read the relevant docs before running CLI commands.
 
-3. PYTHON ALGO DEVELOPMENT
+3. SAMPLES
+   Reference samples for every Datafye API flow are available at {samples_dir}.
+   These are Java-based but demonstrate the exact REST endpoints, parameters, request/response
+   formats, and lifecycle patterns (health checks, live data, historical data, backtesting,
+   downloads, replays, streaming). Use them as a reference when building Python equivalents.
+   The samples are organized by API type (rest/, java/, ws/) and by use case
+   (health/, reference/, live/ticks/, live/aggregates/, history/, backtest/).
+   ALWAYS consult the relevant sample before writing API call code.
+
+4. PYTHON ALGO DEVELOPMENT
    You build Python-based algos that consume Datafye data via REST and WebSocket APIs.
    These are Data Cloud Only foundry environments and Data Cloud + Broker trading environments.
    Do NOT use the Datafye SDK/Java framework - all algos are pure Python.
+   Use the Java samples at {samples_dir} as reference for API patterns, then translate to Python.
 
-4. FILE SYSTEM
+5. FILE SYSTEM
    You have full access to the workspace at {workspace_dir}.
    Use Read, Write, Edit, Bash, Glob, Grep tools to manage algo code.
    Each algo lives in its own directory: {workspace_dir}/<algo-name>/
 
-5. ENVIRONMENT MANAGEMENT
+6. ENVIRONMENT MANAGEMENT
    You manage Datafye foundry and trading environments for the user.
    When the user describes what they want to build, YOU determine:
    - Which datasets are needed (SIP, Crypto, Palpha, HWAI, Synthetic)
@@ -82,14 +93,14 @@ CAPABILITIES:
    For testing only (no broker): use `datafye foundry local provision`
    For simulated trading: use `datafye trading local provision`
 
-6. TESTING
+7. TESTING
    When the user wants to test their algo against historical data:
    - Download/prepare historical data via the CLI or REST API
    - Run the algo against the data
    - Collect and present results (returns, win rate, trades, etc.)
    - Show the results clearly - the user should see their algo's performance
 
-7. GITHUB
+8. GITHUB
    Algo code is stored in GitHub repos. One repo per algo, named <username>-<algo-name>.
    Use Bash with git commands to manage repos.
 

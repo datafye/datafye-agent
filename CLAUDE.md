@@ -82,6 +82,7 @@ Service starts on port 18780 by default (`DATAFYE_AGENT_PORT`).
 | `DATAFYE_AGENT_WORKSPACE` | `/home/datafye/workspace` | User workspace directory |
 | `DATAFYE_DOCS_DIR` | `/home/datafye/docs` | Path to Datafye docs |
 | `DATAFYE_CLI_PATH` | `datafye` | Path to Datafye CLI |
+| `DATAFYE_SAMPLES_DIR` | `/home/datafye/samples` | Path to datafye-samples (API reference) |
 | `DATAFYE_AGENT_ALLOWED_ORIGINS` | `*` | CORS origins |
 | `MASSIVE_API_KEY` | - | Massive (Polygon) API key |
 | `PALPHA_API_KEY` | - | Precision Alpha API key |

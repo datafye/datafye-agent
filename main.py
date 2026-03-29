@@ -51,6 +51,9 @@ DOCS_DIR = os.getenv("DATAFYE_DOCS_DIR", "/home/datafye/docs")
 # Path to Datafye CLI binary
 CLI_PATH = os.getenv("DATAFYE_CLI_PATH", "datafye")
 
+# Path to Datafye samples (Java-based reference for API patterns)
+SAMPLES_DIR = os.getenv("DATAFYE_SAMPLES_DIR", "/home/datafye/samples")
+
 # User credentials (injected per-user at launch)
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "")
 PALPHA_API_KEY = os.getenv("PALPHA_API_KEY", "")
@@ -229,6 +232,7 @@ async def stream_agent_response(
         docs_dir=DOCS_DIR,
         cli_path=CLI_PATH,
         workspace_dir=WORKSPACE_DIR,
+        samples_dir=SAMPLES_DIR,
         credential_summary=get_credential_summary(),
         algo_id=algo_id,
     )
@@ -344,7 +348,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"  API key configured: {'yes' if ANTHROPIC_API_KEY else 'no'}")
 
     docs_available = os.path.isdir(DOCS_DIR)
+    samples_available = os.path.isdir(SAMPLES_DIR)
     logger.info(f"  Docs available: {docs_available}")
+    logger.info(f"  Samples dir: {SAMPLES_DIR} (available: {samples_available})")
 
     yield
     logger.info("Datafye Agent Service shutting down...")
