@@ -31,14 +31,15 @@ datafye-agent/
 pip install -r requirements.txt
 
 # Required environment variables
-export ANTHROPIC_API_KEY="sk-ant-..."
-export DATAFYE_DOCS_DIR="/path/to/datafye-docs"
-export DATAFYE_CLI_PATH="/path/to/datafye"
+export DATAFYE_AGENT_ANTHROPIC_API_KEY="sk-ant-..."
+export DATAFYE_AGENT_DOCS_DIR="/path/to/datafye-docs"
+export DATAFYE_AGENT_CLI_PATH="/path/to/datafye"
 export DATAFYE_AGENT_WORKSPACE="/path/to/workspace"
+export DATAFYE_AGENT_SAMPLES_DIR="/path/to/datafye-samples"
 
 # Optional: user credentials
-export MASSIVE_API_KEY="..."
-export CONNECTTRADE_CLIENT_ID="..."
+export DATAFYE_AGENT_MASSIVE_API_KEY="..."
+export DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID="..."
 # ... etc
 
 # Run
@@ -76,24 +77,25 @@ Service starts on port 18780 by default (`DATAFYE_AGENT_PORT`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | Required | Anthropic API key |
+| `DATAFYE_AGENT_ANTHROPIC_API_KEY` | Required | Anthropic API key |
 | `DATAFYE_AGENT_MODEL` | `opus` | Claude model |
 | `DATAFYE_AGENT_PORT` | `18780` | HTTP port |
 | `DATAFYE_AGENT_WORKSPACE` | `/home/datafye/workspace` | User workspace directory |
-| `DATAFYE_DOCS_DIR` | `/home/datafye/docs` | Path to Datafye docs |
-| `DATAFYE_CLI_PATH` | `datafye` | Path to Datafye CLI |
-| `DATAFYE_SAMPLES_DIR` | `/home/datafye/samples` | Path to datafye-samples (API reference) |
+| `DATAFYE_AGENT_DOCS_DIR` | `/home/datafye/docs` | Path to Datafye docs |
+| `DATAFYE_AGENT_CLI_PATH` | `datafye` | Path to Datafye CLI |
+| `DATAFYE_AGENT_SAMPLES_DIR` | `/home/datafye/samples` | Path to datafye-samples (API reference) |
 | `DATAFYE_AGENT_ALLOWED_ORIGINS` | `*` | CORS origins |
-| `MASSIVE_API_KEY` | - | Massive (Polygon) API key |
-| `PALPHA_API_KEY` | - | Precision Alpha API key |
-| `HWAI_API_KEY` | - | HWAI API key |
-| `CONNECTTRADE_CLIENT_ID` | - | ConnectTrade client ID |
-| `CONNECTTRADE_CLIENT_SECRET` | - | ConnectTrade client secret |
-| `CONNECTTRADE_USER_ID` | - | ConnectTrade user ID |
-| `CONNECTTRADE_USER_SECRET` | - | ConnectTrade user secret |
-| `GITHUB_USER` | - | Personal GitHub username (optional) |
-| `GITHUB_TOKEN` | - | Personal GitHub token (optional) |
-| `GITHUB_ORG` | `datafye` | GitHub org for algo repos |
+| `DATAFYE_AGENT_MASSIVE_API_KEY` | - | Massive (Polygon) API key |
+| `DATAFYE_AGENT_PALPHA_API_KEY` | - | Precision Alpha API key |
+| `DATAFYE_AGENT_HWAI_API_KEY` | - | HWAI API key |
+| `DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID` | - | ConnectTrade client ID |
+| `DATAFYE_AGENT_CONNECTTRADE_CLIENT_SECRET` | - | ConnectTrade client secret |
+| `DATAFYE_AGENT_CONNECTTRADE_USER_ID` | - | ConnectTrade user ID |
+| `DATAFYE_AGENT_CONNECTTRADE_USER_SECRET` | - | ConnectTrade user secret |
+| `DATAFYE_AGENT_GITHUB_USER` | - | Personal GitHub username (optional) |
+| `DATAFYE_AGENT_GITHUB_TOKEN` | - | Personal GitHub token (optional) |
+| `DATAFYE_AGENT_GITHUB_ORG` | `datafye` | GitHub org for algo repos |
+| `DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL` | `[]` | Additional MCP servers (JSON) |
 
 ## Key Design Decisions
 

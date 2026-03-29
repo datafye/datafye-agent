@@ -124,7 +124,7 @@ echo ""
 if [ "$IS_UPGRADE" = true ] && [ -f "${ENV_FILE}" ]; then
     info "Preserving existing configuration..."
     if [ -z "$ANTHROPIC_API_KEY" ]; then
-        ANTHROPIC_API_KEY=$(grep -oP '^ANTHROPIC_API_KEY=\K.*' "${ENV_FILE}" || true)
+        ANTHROPIC_API_KEY=$(grep -oP '^DATAFYE_AGENT_ANTHROPIC_API_KEY=\K.*' "${ENV_FILE}" || true)
     fi
     EXISTING_PORT=$(grep -oP '^DATAFYE_AGENT_PORT=\K.*' "${ENV_FILE}" || true)
     if [ -n "$EXISTING_PORT" ]; then
@@ -239,7 +239,7 @@ cat > "${ENV_FILE}" << EOF
 # Updated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 DATAFYE_AGENT_VERSION=${VERSION}
 DATAFYE_AGENT_PORT=${AGENT_PORT}
-ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+DATAFYE_AGENT_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 EOF
 chmod 600 "${ENV_FILE}"
 echo "${VERSION}" > "${INSTALL_DIR}/version"
@@ -262,20 +262,20 @@ fi
 source "${ENV_FILE}"
 
 # Resolve Anthropic key: env file -> EC2 user data (IMDSv2)
-if [ -z "${ANTHROPIC_API_KEY}" ]; then
+if [ -z "${DATAFYE_AGENT_ANTHROPIC_API_KEY}" ]; then
     TOKEN=$(curl -s --connect-timeout 2 -X PUT "http://169.254.169.254/latest/api/token" \
         -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
     if [ -n "$TOKEN" ]; then
         USER_DATA=$(curl -s --connect-timeout 2 \
             -H "X-aws-ec2-metadata-token: $TOKEN" \
             "http://169.254.169.254/latest/user-data" 2>/dev/null || true)
-        ANTHROPIC_API_KEY=$(echo "$USER_DATA" | grep -oP 'ANTHROPIC_API_KEY=\K.*' || true)
-        [ -n "${ANTHROPIC_API_KEY}" ] && echo "Loaded Anthropic key from EC2 user data"
+        DATAFYE_AGENT_ANTHROPIC_API_KEY=$(echo "$USER_DATA" | grep -oP 'DATAFYE_AGENT_ANTHROPIC_API_KEY=\K.*' || true)
+        [ -n "${DATAFYE_AGENT_ANTHROPIC_API_KEY}" ] && echo "Loaded Anthropic key from EC2 user data"
     fi
 fi
 
-if [ -z "${ANTHROPIC_API_KEY}" ]; then
-    echo "Error: ANTHROPIC_API_KEY not set."
+if [ -z "${DATAFYE_AGENT_ANTHROPIC_API_KEY}" ]; then
+    echo "Error: DATAFYE_AGENT_ANTHROPIC_API_KEY not set."
     echo "Set it in ${ENV_FILE} or pass via EC2 user data."
     exit 1
 fi
@@ -290,7 +290,7 @@ docker run -d \
     --name "${CONTAINER_NAME}" \
     --restart unless-stopped \
     -p "${DATAFYE_AGENT_PORT}:${DATAFYE_AGENT_PORT}" \
-    -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
+    -e "DATAFYE_AGENT_ANTHROPIC_API_KEY=${DATAFYE_AGENT_ANTHROPIC_API_KEY}" \
     -e "DATAFYE_AGENT_PORT=${DATAFYE_AGENT_PORT}" \
     -v "${WORKSPACE_DIR}:/home/datafye/workspace" \
     "${IMAGE}"

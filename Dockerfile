@@ -30,7 +30,6 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # ── Datafye CLI ───────────────────────────────────────────────────
 RUN curl -fsSL https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh | bash
-ENV DATAFYE_CLI_PATH=/usr/local/opt/datafye/cli/${VERSION}/bin/datafye
 
 # ── Datafye Docs (at release tag) ────────────────────────────────
 RUN git clone --depth 1 --branch v${VERSION} \
@@ -59,9 +58,10 @@ RUN useradd -u 1000 -m datafye && \
 ENV DATAFYE_AGENT_VERSION="${VERSION}"
 ENV DATAFYE_AGENT_PORT="18780"
 ENV DATAFYE_AGENT_WORKSPACE="/home/datafye/workspace"
-ENV DATAFYE_DOCS_DIR="/opt/datafye/docs"
-ENV DATAFYE_SAMPLES_DIR="/opt/datafye/samples"
-ENV ANTHROPIC_API_KEY=""
+ENV DATAFYE_AGENT_DOCS_DIR="/opt/datafye/docs"
+ENV DATAFYE_AGENT_SAMPLES_DIR="/opt/datafye/samples"
+ENV DATAFYE_AGENT_CLI_PATH="/usr/local/opt/datafye/cli/${VERSION}/bin/datafye"
+ENV DATAFYE_AGENT_ANTHROPIC_API_KEY=""
 
 EXPOSE 18780
 

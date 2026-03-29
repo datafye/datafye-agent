@@ -37,7 +37,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Configuration from environment ────────────────────────────────
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# All env vars use DATAFYE_AGENT_ prefix for consistency
+ANTHROPIC_API_KEY = os.getenv("DATAFYE_AGENT_ANTHROPIC_API_KEY")
 CLAUDE_MODEL = os.getenv("DATAFYE_AGENT_MODEL", "opus")
 PORT = int(os.getenv("DATAFYE_AGENT_PORT", "18780"))
 ALLOWED_ORIGINS = os.getenv("DATAFYE_AGENT_ALLOWED_ORIGINS", "*").split(",")
@@ -46,30 +47,30 @@ ALLOWED_ORIGINS = os.getenv("DATAFYE_AGENT_ALLOWED_ORIGINS", "*").split(",")
 WORKSPACE_DIR = os.getenv("DATAFYE_AGENT_WORKSPACE", "/home/datafye/workspace")
 
 # Path to local Datafye documentation
-DOCS_DIR = os.getenv("DATAFYE_DOCS_DIR", "/home/datafye/docs")
+DOCS_DIR = os.getenv("DATAFYE_AGENT_DOCS_DIR", "/home/datafye/docs")
 
 # Path to Datafye CLI binary
-CLI_PATH = os.getenv("DATAFYE_CLI_PATH", "datafye")
+CLI_PATH = os.getenv("DATAFYE_AGENT_CLI_PATH", "datafye")
 
 # Path to Datafye samples (Java-based reference for API patterns)
-SAMPLES_DIR = os.getenv("DATAFYE_SAMPLES_DIR", "/home/datafye/samples")
+SAMPLES_DIR = os.getenv("DATAFYE_AGENT_SAMPLES_DIR", "/home/datafye/samples")
 
 # User credentials (injected per-user at launch)
-MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "")
-PALPHA_API_KEY = os.getenv("PALPHA_API_KEY", "")
-HWAI_API_KEY = os.getenv("HWAI_API_KEY", "")
-CONNECTTRADE_CLIENT_ID = os.getenv("CONNECTTRADE_CLIENT_ID", "")
-CONNECTTRADE_CLIENT_SECRET = os.getenv("CONNECTTRADE_CLIENT_SECRET", "")
-CONNECTTRADE_USER_ID = os.getenv("CONNECTTRADE_USER_ID", "")
-CONNECTTRADE_USER_SECRET = os.getenv("CONNECTTRADE_USER_SECRET", "")
+MASSIVE_API_KEY = os.getenv("DATAFYE_AGENT_MASSIVE_API_KEY", "")
+PALPHA_API_KEY = os.getenv("DATAFYE_AGENT_PALPHA_API_KEY", "")
+HWAI_API_KEY = os.getenv("DATAFYE_AGENT_HWAI_API_KEY", "")
+CONNECTTRADE_CLIENT_ID = os.getenv("DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID", "")
+CONNECTTRADE_CLIENT_SECRET = os.getenv("DATAFYE_AGENT_CONNECTTRADE_CLIENT_SECRET", "")
+CONNECTTRADE_USER_ID = os.getenv("DATAFYE_AGENT_CONNECTTRADE_USER_ID", "")
+CONNECTTRADE_USER_SECRET = os.getenv("DATAFYE_AGENT_CONNECTTRADE_USER_SECRET", "")
 
 # GitHub - defaults to Datafye org, user can override
-GITHUB_USER = os.getenv("GITHUB_USER", "")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GITHUB_ORG = os.getenv("GITHUB_ORG", "datafye")
+GITHUB_USER = os.getenv("DATAFYE_AGENT_GITHUB_USER", "")
+GITHUB_TOKEN = os.getenv("DATAFYE_AGENT_GITHUB_TOKEN", "")
+GITHUB_ORG = os.getenv("DATAFYE_AGENT_GITHUB_ORG", "datafye")
 
 # MCP servers (optional, for additional tooling)
-MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_MCP_SERVERS_ADDITIONAL", "[]")
+MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
 
 # ── Internal tools ────────────────────────────────────────────────
 INTERNAL_TOOLS = [
