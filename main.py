@@ -36,7 +36,7 @@ from prompt import build_system_prompt
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Configuration from environment ────────────────────────────────
+# -- Configuration from environment --------------------------------
 # All env vars use DATAFYE_AGENT_ prefix for consistency
 ANTHROPIC_API_KEY = os.getenv("DATAFYE_AGENT_ANTHROPIC_API_KEY")
 CLAUDE_MODEL = os.getenv("DATAFYE_AGENT_MODEL", "opus")
@@ -72,7 +72,7 @@ GITHUB_ORG = os.getenv("DATAFYE_AGENT_GITHUB_ORG", "datafye")
 # MCP servers (optional, for additional tooling)
 MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
 
-# ── Internal tools ────────────────────────────────────────────────
+# -- Internal tools ------------------------------------------------
 INTERNAL_TOOLS = [
     # File operations
     "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS",
@@ -88,12 +88,12 @@ INTERNAL_TOOLS = [
     "Skill", "ToolSearch",
 ]
 
-# ── Session storage ───────────────────────────────────────────────
-# Single session per user — maps conversation_id -> agent session_id
+# -- Session storage -----------------------------------------------
+# Single session per user -- maps conversation_id -> agent session_id
 sessions: dict[str, str] = {}
 
 
-# ── Request/Response Models ───────────────────────────────────────
+# -- Request/Response Models ---------------------------------------
 
 class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
@@ -125,7 +125,7 @@ class CredentialsUpdate(BaseModel):
     github_token: Optional[str] = None
 
 
-# ── Credential state (mutable at runtime) ─────────────────────────
+# -- Credential state (mutable at runtime) -------------------------
 credentials = {
     "massive_api_key": MASSIVE_API_KEY,
     "palpha_api_key": PALPHA_API_KEY,
@@ -201,7 +201,7 @@ def get_credential_summary() -> str:
     return "\n".join(lines)
 
 
-# ── SSE Helpers ───────────────────────────────────────────────────
+# -- SSE Helpers ---------------------------------------------------
 
 def sse_event(event_type: str, data: dict) -> str:
     """Format a Server-Sent Event."""
@@ -216,7 +216,7 @@ def truncate(text: str, limit: int = 150) -> str:
     return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
 
 
-# ── Agent Streaming ───────────────────────────────────────────────
+# -- Agent Streaming -----------------------------------------------
 
 async def stream_agent_response(
     message: str,
@@ -331,7 +331,7 @@ async def stream_agent_response(
         })
 
 
-# ── App Setup ─────────────────────────────────────────────────────
+# -- App Setup -----------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -368,7 +368,7 @@ app.add_middleware(
 )
 
 
-# ── Endpoints ─────────────────────────────────────────────────────
+# -- Endpoints -----------------------------------------------------
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
