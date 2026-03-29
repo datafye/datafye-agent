@@ -353,15 +353,44 @@ fi
 
 nginx -t && systemctl restart nginx
 
+# ── Install auto-upgrade check ────────────────────────────────────
+echo "[7/8] Configuring auto-upgrade..."
+
+# Copy the upgrade-check script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -f "${SCRIPT_DIR}/upgrade-check.sh" ]; then
+    cp "${SCRIPT_DIR}/upgrade-check.sh" "${INSTALL_DIR}/upgrade-check.sh"
+elif [ -f "${INSTALL_DIR}/upgrade-check.sh" ]; then
+    : # Already installed from previous run
+else
+    # Fetch from downloads
+    curl -fsSL "https://downloads.n5corp.com/datafye/agent/${VERSION}/upgrade-check.sh" \
+        -o "${INSTALL_DIR}/upgrade-check.sh" 2>/dev/null || true
+fi
+chmod +x "${INSTALL_DIR}/upgrade-check.sh" 2>/dev/null || true
+
+# Also keep a copy of the installer itself for self-upgrades
+if [ -f "${SCRIPT_DIR}/install.sh" ]; then
+    cp "${SCRIPT_DIR}/install.sh" "${INSTALL_DIR}/install.sh"
+    chmod +x "${INSTALL_DIR}/install.sh"
+fi
+
+# Set up cron (every 5 minutes)
+cat > /etc/cron.d/datafye-agent-upgrade << CRON
+# Datafye Agent auto-upgrade check
+*/5 * * * * root ${INSTALL_DIR}/upgrade-check.sh >> /var/log/datafye-agent-upgrade.log 2>&1
+CRON
+echo "  Auto-upgrade check: every 5 minutes"
+
 # ── Start agent (unless AMI prep) ─────────────────────────────────
 if [ "$AMI_PREP" = true ]; then
-    echo "[7/7] AMI prep mode - skipping agent startup"
+    echo "[8/8] AMI prep mode - skipping agent startup"
     echo ""
     echo "  The startup script reads ANTHROPIC_API_KEY from:"
     echo "    1. ${ENV_FILE}"
     echo "    2. EC2 user data (IMDSv2)"
 else
-    echo "[7/7] Starting agent..."
+    echo "[8/8] Starting agent..."
     if [ -z "$ANTHROPIC_API_KEY" ]; then
         echo ""
         echo "  WARNING: No Anthropic key provided."
