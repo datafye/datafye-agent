@@ -48,9 +48,9 @@ Options:
 Published structure:
   <root>/datafye/agent/<version>/install.sh
   <root>/datafye/agent/<version>/upgrade-check.sh
-  <root>/datafye/agent/<version>/build-ami.sh
   <root>/datafye/agent/latest/version.txt
-  <root>/datafye/agent/latest -> <version>  (symlink)
+  <root>/datafye/agent/latest/install.sh
+  <root>/datafye/agent/latest/upgrade-check.sh
 EOF
 }
 
@@ -109,7 +109,7 @@ main() {
     validate_version "$version"
 
     # Check source files exist
-    for f in install.sh upgrade-check.sh build-ami.sh; do
+    for f in install.sh upgrade-check.sh; do
         if [[ ! -f "${SCRIPT_DIR}/${f}" ]]; then
             error "Source script not found: ${SCRIPT_DIR}/${f}"
             exit 1
@@ -137,9 +137,7 @@ main() {
         info "[DRY RUN] Would create: $target_dir/"
         info "[DRY RUN] Would publish: install.sh (with version baked in)"
         info "[DRY RUN] Would publish: upgrade-check.sh"
-        info "[DRY RUN] Would publish: build-ami.sh (with version baked in)"
         info "[DRY RUN] Would write:   $latest_dir/version.txt -> $version"
-        info "[DRY RUN] Would symlink: latest -> $version"
     else
         # Create version directory
         mkdir -p "$target_dir"
@@ -158,12 +156,6 @@ main() {
         cp "${SCRIPT_DIR}/upgrade-check.sh" "$target_dir/upgrade-check.sh"
         chmod +x "$target_dir/upgrade-check.sh"
         ok "Published: $target_dir/upgrade-check.sh"
-
-        # build-ami.sh — bake in the version as the default
-        sed "s/^VERSION=\"\"/VERSION=\"${version}\"/" "${SCRIPT_DIR}/build-ami.sh" > "$temp_dir/build-ami.sh"
-        chmod +x "$temp_dir/build-ami.sh"
-        cp "$temp_dir/build-ami.sh" "$target_dir/build-ami.sh"
-        ok "Published: $target_dir/build-ami.sh"
 
         rm -rf "$temp_dir"
 
@@ -184,7 +176,6 @@ main() {
         # Copy versioned scripts into latest/ too (so latest/install.sh works)
         cp "$target_dir/install.sh" "$latest_dir/install.sh"
         cp "$target_dir/upgrade-check.sh" "$latest_dir/upgrade-check.sh"
-        cp "$target_dir/build-ami.sh" "$latest_dir/build-ami.sh"
         ok "Updated: latest/ with v${version} scripts"
     fi
 
