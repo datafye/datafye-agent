@@ -88,11 +88,8 @@ INTERNAL_TOOLS = [
 ]
 
 # ── Session storage ───────────────────────────────────────────────
-# Maps conversation_id -> agent session_id
+# Single session per user — maps conversation_id -> agent session_id
 sessions: dict[str, str] = {}
-
-# Maps algo_id -> conversation_id (so switching algos resumes context)
-algo_sessions: dict[str, str] = {}
 
 
 # ── Request/Response Models ───────────────────────────────────────
@@ -274,8 +271,6 @@ async def stream_agent_response(
                     session_id = data.get('session_id')
                     if conversation_id and session_id:
                         sessions[conversation_id] = session_id
-                        if algo_id:
-                            algo_sessions[algo_id] = conversation_id
                     yield sse_event('init', {'session_id': session_id})
                 else:
                     yield sse_event('system', {'subtype': subtype, 'data': data})
