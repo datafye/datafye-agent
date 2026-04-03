@@ -2,32 +2,42 @@
 #
 # Datafye Agent - AMI Builder
 #
-# Runs the backend installer + installs the frontend, preparing the machine
-# for an AMI snapshot. Run this on a fresh EC2 instance, then create the AMI.
+# Builds AMIs for hosted (sandbox) or standalone (marketplace) deployment.
 #
 # Usage:
-#   sudo ./build-ami.sh --version 2.0.4
+#   # Hosted AMI (Rumi cloud sandbox - fully baked, ready on boot)
+#   sudo ./build-ami.sh --version 2.0.4 --mode hosted
+#
+#   # Standalone AMI (marketplace - minimal, installs on first boot via user data)
+#   sudo ./build-ami.sh --version 2.0.4 --mode standalone
 #
 # Prerequisites:
-#   - Fresh Amazon Linux 2023 or Ubuntu EC2 instance
-#   - Internet access (to pull Docker images, clone repos)
+#   - Fresh Amazon Linux 2023 EC2 instance
+#   - Internet access
 #   - This script must be run as root
 #
 
 set -e
 
 VERSION=""
+MODE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --version) VERSION="$2"; shift 2 ;;
+        --mode)    MODE="$2"; shift 2 ;;
         *)         echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-if [ -z "$VERSION" ]; then
-    echo "Error: --version is required"
-    echo "Usage: build-ami.sh --version <version>"
+if [ -z "$VERSION" ] || [ -z "$MODE" ]; then
+    echo "Error: --version and --mode are required"
+    echo "Usage: build-ami.sh --version <version> --mode <hosted|standalone>"
+    exit 1
+fi
+
+if [ "$MODE" != "hosted" ] && [ "$MODE" != "standalone" ]; then
+    echo "Error: --mode must be 'hosted' or 'standalone'"
     exit 1
 fi
 
@@ -35,74 +45,72 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "================================================"
 echo "  Datafye Agent AMI Builder v${VERSION}"
+echo "  Mode: ${MODE}"
 echo "================================================"
 echo ""
 
-# ── Step 1: Run backend installer in AMI prep mode ────────────────
-echo "=== Step 1: Installing backend ==="
-bash "${SCRIPT_DIR}/install.sh" --version "${VERSION}" --ami-prep
+if [ "$MODE" = "hosted" ]; then
+    # ── Hosted AMI: fully baked ──────────────────────────────────
+    # Run the full installer. Agent, CLI, docs, samples all installed.
+    # On boot, systemd starts the agent which reads key from user data.
 
-# ── Step 2: Install frontend ─────────────────────────────────────
-echo ""
-echo "=== Step 2: Installing frontend ==="
+    echo "=== Building hosted AMI (fully baked) ==="
+    bash "${SCRIPT_DIR}/install_template.sh" --version "${VERSION}" --mode hosted
 
-FRONTEND_DIR="/var/www/datafye-agent"
-FRONTEND_REPO="https://github.com/datafye/datafye-agent-app.git"
+    # Stop the agent (will start on boot via systemd)
+    systemctl stop datafye-agent 2>/dev/null || true
 
-# Clone frontend at release tag (fall back to main)
-rm -rf /tmp/datafye-agent-app
-git clone --depth 1 --branch "v${VERSION}" "${FRONTEND_REPO}" /tmp/datafye-agent-app 2>/dev/null \
-    || git clone --depth 1 "${FRONTEND_REPO}" /tmp/datafye-agent-app
+else
+    # ── Standalone AMI: minimal ──────────────────────────────────
+    # Only install the first-boot script. Everything else is installed
+    # on first boot from user data.
 
-# Copy static files to nginx web root
-rm -rf "${FRONTEND_DIR}"
-mkdir -p "${FRONTEND_DIR}"
-cp -r /tmp/datafye-agent-app/index.html "${FRONTEND_DIR}/"
-cp -r /tmp/datafye-agent-app/styles "${FRONTEND_DIR}/"
-cp -r /tmp/datafye-agent-app/js "${FRONTEND_DIR}/"
-cp -r /tmp/datafye-agent-app/assets "${FRONTEND_DIR}/"
-# Copy lib directory if it exists (charting libraries etc.)
-[ -d /tmp/datafye-agent-app/lib ] && cp -r /tmp/datafye-agent-app/lib "${FRONTEND_DIR}/"
+    echo "=== Building standalone AMI (first-boot install) ==="
 
-rm -rf /tmp/datafye-agent-app
+    cp "${SCRIPT_DIR}/first-boot.sh" /opt/datafye-first-boot.sh
+    chmod +x /opt/datafye-first-boot.sh
 
-echo "  Frontend installed at ${FRONTEND_DIR}"
-
-# ── Step 3: Configure auto-start on boot ──────────────────────────
-echo ""
-echo "=== Step 3: Configuring auto-start ==="
-
-cat > /etc/systemd/system/datafye-agent.service << EOF
+    # Install first-boot as a one-shot systemd service
+    cat > /etc/systemd/system/datafye-first-boot.service << 'EOF'
 [Unit]
-Description=Datafye Agent Service
-After=docker.service
-Requires=docker.service
+Description=Datafye Agent First Boot Installer
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/opt/datafye/agent/version
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
-ExecStart=/opt/datafye/agent/start.sh
-ExecStop=/opt/datafye/agent/stop.sh
+ExecStart=/opt/datafye-first-boot.sh
+RemainAfterExit=no
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable datafye-agent.service
-echo "  Systemd service enabled (datafye-agent.service)"
+    systemctl daemon-reload
+    systemctl enable datafye-first-boot.service
 
-# ── Step 4: Clean up for AMI ─────────────────────────────────────
+    echo "  First-boot script installed at /opt/datafye-first-boot.sh"
+    echo "  Systemd service: datafye-first-boot.service"
+
+fi
+
+# ── Clean up for AMI snapshot ────────────────────────────────────
 echo ""
-echo "=== Step 4: Cleaning up for AMI snapshot ==="
+echo "=== Cleaning up for AMI snapshot ==="
 
-# Clear the Anthropic key (will be injected at launch)
-sed -i 's/^ANTHROPIC_API_KEY=.*/ANTHROPIC_API_KEY=/' /opt/datafye/agent/agent.env
+# Clear the Anthropic key if env file exists
+if [ -f /opt/datafye/agent/agent.env ]; then
+    sed -i 's/^DATAFYE_AGENT_ANTHROPIC_API_KEY=.*/DATAFYE_AGENT_ANTHROPIC_API_KEY=/' /opt/datafye/agent/agent.env
+fi
 
 # Clear logs
 journalctl --rotate 2>/dev/null || true
 journalctl --vacuum-time=1s 2>/dev/null || true
-rm -rf /var/log/nginx/*.log
+rm -rf /var/log/nginx/*.log 2>/dev/null || true
+rm -f /var/log/datafye-agent-upgrade.log
 docker system prune -f 2>/dev/null || true
 
 # Clear shell history
@@ -115,13 +123,21 @@ echo "  AMI ready for snapshot"
 echo "================================================"
 echo ""
 echo "  Version: ${VERSION}"
-echo "  Backend: Docker image pre-pulled"
-echo "  Frontend: ${FRONTEND_DIR}"
-echo "  Auto-start: systemd (datafye-agent.service)"
+echo "  Mode:    ${MODE}"
 echo ""
-echo "  On launch, the agent reads ANTHROPIC_API_KEY from:"
-echo "    1. /opt/datafye/agent/agent.env"
-echo "    2. EC2 user data (ANTHROPIC_API_KEY=sk-ant-...)"
+
+if [ "$MODE" = "hosted" ]; then
+    echo "  Contents: Agent, CLI, docs, samples, Python venv (all pre-installed)"
+    echo "  On boot:  systemd starts agent, reads Anthropic key from user data"
+else
+    echo "  Contents: First-boot script only (minimal)"
+    echo "  On boot:  Reads user data, downloads and installs everything"
+    echo ""
+    echo "  Required user data:"
+    echo "    DATAFYE_AGENT_VERSION=${VERSION}"
+    echo "    DATAFYE_AGENT_ANTHROPIC_API_KEY=sk-ant-..."
+    echo "    DATAFYE_AGENT_DNS=agent.mycompany.com  (optional, for SSL)"
+fi
 echo ""
 echo "  Next: Create AMI from this instance."
 echo ""

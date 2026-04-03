@@ -20,6 +20,13 @@ datafye-agent/
 ├── main.py          # FastAPI app, endpoints, SSE streaming, session management
 ├── prompt.py        # System prompt builder (assembled from runtime context)
 ├── requirements.txt # Python dependencies
+├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
+├── install/
+│   ├── install_template.sh   # Installer/upgrader template (--mode hosted|standalone)
+│   ├── build-ami.sh          # AMI builder (runs installer, cleans up for snapshot)
+│   ├── first-boot.sh         # Marketplace first-boot script (reads EC2 user data, runs installer)
+│   ├── upgrade-check.sh      # Auto-upgrade cron script
+│   └── publish_installer.sh  # Publishes versioned installer to downloads server
 ├── CLAUDE.md        # This file
 └── PROJECT.md       # Detailed project documentation
 ```
@@ -47,6 +54,56 @@ python main.py
 ```
 
 Service starts on port 18780 by default (`DATAFYE_AGENT_PORT`).
+
+## Deployment
+
+The agent runs **natively** on the host (not in a Docker container). Docker is installed on the instance for Datafye environment containers that the agent manages via the CLI.
+
+### Two Deployment Modes
+
+| Mode | Use Case | What's on the Instance |
+|------|----------|----------------------|
+| `hosted` | Rumi cloud sandbox (managed by accounts service) | Agent, CLI, docs, samples pre-installed. No nginx/SSL (jump server proxies). |
+| `standalone` | AWS Marketplace / DIY | First-boot script only. Downloads and installs everything on first boot from user data. Includes nginx + SSL. |
+
+### Installer
+
+```bash
+# Hosted mode (Rumi cloud sandbox)
+sudo ./install.sh --version 2.0.4 --mode hosted
+
+# Standalone mode (marketplace)
+sudo ./install.sh --version 2.0.4 --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
+
+# Upgrade (preserves config, mode, credentials)
+sudo ./install.sh --version 2.0.5
+```
+
+### AMI Build
+
+```bash
+# Hosted AMI (fully baked, starts on boot)
+sudo ./build-ami.sh --version 2.0.4 --mode hosted
+
+# Standalone AMI (minimal, first-boot installs)
+sudo ./build-ami.sh --version 2.0.4 --mode standalone
+```
+
+### Installed Layout
+
+```
+/opt/datafye/agent/
+├── app/             # Agent source (cloned from GitHub)
+├── venv/            # Python virtual environment
+├── agent.env        # Configuration (credentials, mode, paths)
+├── version          # Installed version
+├── install.sh       # Installer (for upgrades)
+└── upgrade-check.sh # Auto-upgrade script
+/opt/datafye/docs/       # Datafye docs (cloned from GitHub)
+/opt/datafye/samples/    # Datafye samples (cloned from GitHub)
+/usr/local/opt/datafye/cli/<version>/  # Datafye CLI
+/home/datafye/workspace/ # User workspace
+```
 
 ## API Endpoints
 
@@ -99,7 +156,9 @@ Service starts on port 18780 by default (`DATAFYE_AGENT_PORT`).
 
 ## Key Design Decisions
 
+- **Native execution**: Agent runs directly on the host (not in Docker) because it needs to manage Docker containers for Datafye environments
 - **Per-user instances**: Each user gets their own agent process (not shared)
+- **Open source agent**: Agent source is public on GitHub — the value is in the Datafye platform, not the glue code
 - **Local docs over MCP**: Datafye docs are on disk, not via a docs MCP server - faster and more reliable
 - **Credentials at runtime**: Frontend can update credentials via `/v1/credentials` without restarting
 - **Python-only algos**: No SDK/Java algos - all strategies are pure Python using REST/WebSocket APIs
