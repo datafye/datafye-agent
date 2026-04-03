@@ -67,22 +67,23 @@ The agent runs **natively** on the host (not in a Docker container). Docker is i
 
 ### Installer
 
+The version is baked into `install.sh` by `publish_installer.sh` — no `--version` flag needed.
+
 ```bash
 # Hosted mode (Rumi cloud sandbox)
-sudo ./install.sh --version 2.0.4 --mode hosted
+sudo ./install.sh --mode hosted
 
 # Standalone mode (marketplace)
-sudo ./install.sh --version 2.0.4 --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
+sudo ./install.sh --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
 
-# Upgrade (preserves config, mode, credentials)
-sudo ./install.sh --version 2.0.5
+# Upgrades happen automatically via the auto-upgrade cron (preserves config, mode, credentials)
 ```
 
 ### AMI Build
 
 ```bash
 # Hosted AMI (install + cleanup for snapshot)
-sudo ./install.sh --version 2.0.4 --mode hosted --ami-cleanup
+sudo ./install.sh --mode hosted --ami-cleanup
 
 # Standalone AMI (copy first-boot.sh, create systemd one-shot)
 # See first-boot.sh for details

@@ -10,28 +10,28 @@
 #   hosted     - For Rumi cloud sandbox instances (no nginx, no SSL, proxied by jump server)
 #   standalone - For marketplace/DIY instances (includes nginx + optional SSL)
 #
-# Usage:
+# Usage (version is baked in by publish_installer.sh):
 #   # Hosted mode (sandbox in Rumi cloud)
-#   sudo ./install.sh --version 2.0.4 --mode hosted
-#   sudo ./install.sh --version 2.0.4 --mode hosted --anthropic-key sk-ant-...
+#   sudo ./install.sh --mode hosted
+#   sudo ./install.sh --mode hosted --anthropic-key sk-ant-...
 #
 #   # Standalone mode (marketplace/DIY)
-#   sudo ./install.sh --version 2.0.4 --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
+#   sudo ./install.sh --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
 #
-#   # Upgrade (preserves credentials, mode, workspace)
-#   sudo ./install.sh --version 2.0.5
+#   # Upgrade (auto-upgrade downloads latest installer with new version baked in)
+#   # Credentials, mode, and workspace are preserved automatically
 #
 #   # Force reinstall same version (useful for SNAPSHOT builds)
-#   sudo ./install.sh --version 2.0.4-SNAPSHOT --force
+#   sudo ./install.sh --mode hosted --force
 #
 #   # Build hosted AMI (install + cleanup for snapshot)
-#   sudo ./install.sh --version 2.0.4 --mode hosted --ami-cleanup
+#   sudo ./install.sh --mode hosted --ami-cleanup
 #
 
 set -e
 
 # ── Defaults ──────────────────────────────────────────────────────
-VERSION=""
+VERSION="__VERSION__"
 MODE=""
 DNS_NAME=""
 ANTHROPIC_API_KEY=""
@@ -56,7 +56,6 @@ error() { echo -e "${RED}ERROR: $*${RESET}" >&2; }
 # ── Parse arguments ───────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --version)       VERSION="$2"; shift 2 ;;
         --mode)          MODE="$2"; shift 2 ;;
         --dns)           DNS_NAME="$2"; shift 2 ;;
         --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
@@ -68,10 +67,9 @@ while [[ $# -gt 0 ]]; do
 Datafye Agent Installer
 
 Usage:
-  install.sh --version <version> --mode <hosted|standalone> [OPTIONS]
+  install.sh --mode <hosted|standalone> [OPTIONS]
 
 Options:
-  --version <ver>     Datafye platform version (required)
   --mode <mode>       Installation mode (required for fresh install):
                         hosted     - Rumi cloud sandbox (no nginx, no SSL)
                         standalone - Marketplace/DIY (nginx + SSL)
@@ -88,8 +86,9 @@ EOF
     esac
 done
 
-if [ -z "$VERSION" ]; then
-    error "--version is required. Run with --help for usage."
+if [ "$VERSION" = "__VERSION__" ]; then
+    error "This is the installer template. Use the published installer from downloads.n5corp.com,"
+    error "or run publish_installer.sh to create a versioned installer."
     exit 1
 fi
 

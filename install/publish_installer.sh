@@ -100,8 +100,8 @@ publish_version() {
     else
         mkdir -p "$target_dir"
 
-        # Bake version into install.sh (replace default VERSION="")
-        sed "s/^VERSION=\"\"/VERSION=\"${version}\"/" "${SCRIPT_DIR}/install_template.sh" > "$target_dir/install.sh"
+        # Bake version into install.sh (replace __VERSION__ placeholder)
+        sed "s/__VERSION__/${version}/g" "${SCRIPT_DIR}/install_template.sh" > "$target_dir/install.sh"
         chmod +x "$target_dir/install.sh"
         ok "Published: $target_dir/install.sh"
 
