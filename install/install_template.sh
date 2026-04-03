@@ -24,6 +24,9 @@
 #   # Force reinstall same version (useful for SNAPSHOT builds)
 #   sudo ./install.sh --version 2.0.4-SNAPSHOT --force
 #
+#   # Build hosted AMI (install + cleanup for snapshot)
+#   sudo ./install.sh --version 2.0.4 --mode hosted --ami-cleanup
+#
 
 set -e
 
@@ -33,6 +36,7 @@ MODE=""
 DNS_NAME=""
 ANTHROPIC_API_KEY=""
 FORCE=false
+AMI_CLEANUP=false
 AGENT_PORT=18780
 INSTALL_DIR="/opt/datafye/agent"
 WORKSPACE_DIR="/home/datafye/workspace"
@@ -57,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --dns)           DNS_NAME="$2"; shift 2 ;;
         --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
         --force)         FORCE=true; shift ;;
+        --ami-cleanup)   AMI_CLEANUP=true; shift ;;
         --port)          AGENT_PORT="$2"; shift 2 ;;
         -h|--help)
             cat <<EOF
@@ -73,6 +78,7 @@ Options:
   --dns <name>        DNS name (standalone mode, e.g., agent.mycompany.com)
   --anthropic-key <k> Anthropic API key (can be set later or via EC2 user data)
   --force             Reinstall even if same version (useful for SNAPSHOT)
+  --ami-cleanup       Clean up for AMI snapshot (clear keys, logs, history)
   --port <port>       Agent port (default: 18780)
   -h, --help          Show this help
 EOF
@@ -560,6 +566,41 @@ cat > /etc/cron.d/datafye-agent-upgrade << CRON
 */5 * * * * root ${INSTALL_DIR}/upgrade-check.sh >> /var/log/datafye-agent-upgrade.log 2>&1
 CRON
 ok "Auto-upgrade: every 5 minutes"
+
+# ── AMI cleanup (if requested) ────────────────────────────────────
+if [ "$AMI_CLEANUP" = true ]; then
+    info "Cleaning up for AMI snapshot..."
+
+    # Stop agent if running
+    systemctl stop datafye-agent 2>/dev/null || true
+
+    # Clear Anthropic key (will be injected at launch via user data)
+    if [ -f "${ENV_FILE}" ]; then
+        sed -i 's/^DATAFYE_AGENT_ANTHROPIC_API_KEY=.*/DATAFYE_AGENT_ANTHROPIC_API_KEY=/' "${ENV_FILE}"
+    fi
+
+    # Clear logs
+    journalctl --rotate 2>/dev/null || true
+    journalctl --vacuum-time=1s 2>/dev/null || true
+    rm -rf /var/log/nginx/*.log 2>/dev/null || true
+    rm -f /var/log/datafye-agent-upgrade.log
+
+    # Clean Docker
+    docker system prune -f 2>/dev/null || true
+
+    # Clear shell history
+    > /root/.bash_history
+    history -c 2>/dev/null || true
+
+    ok "AMI cleanup complete"
+
+    echo ""
+    info "================================================"
+    ok "AMI ready for snapshot (v${VERSION}, ${MODE} mode)"
+    info "================================================"
+    echo ""
+    exit 0
+fi
 
 # ── Start agent ──────────────────────────────────────────────────
 if [ -z "$ANTHROPIC_API_KEY" ]; then

@@ -22,8 +22,7 @@ datafye-agent/
 ├── requirements.txt # Python dependencies
 ├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
 ├── install/
-│   ├── install_template.sh   # Installer/upgrader template (--mode hosted|standalone)
-│   ├── build-ami.sh          # AMI builder (runs installer, cleans up for snapshot)
+│   ├── install_template.sh   # Installer/upgrader template (--mode hosted|standalone, --ami-cleanup)
 │   ├── first-boot.sh         # Marketplace first-boot script (reads EC2 user data, runs installer)
 │   ├── upgrade-check.sh      # Auto-upgrade cron script
 │   └── publish_installer.sh  # Publishes versioned installer to downloads server
@@ -82,11 +81,11 @@ sudo ./install.sh --version 2.0.5
 ### AMI Build
 
 ```bash
-# Hosted AMI (fully baked, starts on boot)
-sudo ./build-ami.sh --version 2.0.4 --mode hosted
+# Hosted AMI (install + cleanup for snapshot)
+sudo ./install.sh --version 2.0.4 --mode hosted --ami-cleanup
 
-# Standalone AMI (minimal, first-boot installs)
-sudo ./build-ami.sh --version 2.0.4 --mode standalone
+# Standalone AMI (copy first-boot.sh, create systemd one-shot)
+# See first-boot.sh for details
 ```
 
 ### Installed Layout
