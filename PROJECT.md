@@ -110,8 +110,7 @@ Here's what a typical session looks like from the agent's perspective:
 
 We use `permission_mode="bypassPermissions"` which means the agent can execute anything. This is necessary for CLI operations and Python execution, but it means:
 - A malicious prompt could potentially access the host system
-- The per-user isolation is critical — this is why we don't share instances
-- Future: consider running in sandboxed containers
+- The per-user isolation is critical — each user gets their own EC2 instance in a Rumi private cloud
 
 ### Session Memory Has Limits
 
@@ -121,10 +120,20 @@ The Claude Agent SDK session stores conversation history, but there's a context 
 
 If a user updates their API key in Settings while an environment is running with the old key, the environment won't automatically pick up the new key. The agent would need to re-provision. This is a known edge case.
 
+## Deployment
+
+The agent runs **natively** on the host (not in a Docker container). This was a deliberate decision — the agent uses the Datafye CLI to spin up Datafye environment containers via Docker, and Docker-in-Docker is painful. Since the whole instance is dedicated to one user, there's no isolation benefit from containerizing the agent. The AMI is the packaging.
+
+Two deployment modes:
+- **Hosted**: Pre-baked AMI in a Rumi private cloud. Each user gets a sandbox instance at `{username}.app.datafye.io`, proxied through a jump server with wildcard SSL. Managed by the datafye-accounts service (elastic stop/start based on activity).
+- **Standalone (Marketplace)**: Minimal AMI with a first-boot script. User provides their Anthropic key and DNS via EC2 user data. Everything downloads and installs on first boot.
+
+The agent source is open source — the value is in the Datafye platform, not the glue code. Power users can fork and customize the prompt, add tools, tweak behavior.
+
 ## What's Next
 
-- **AWS-based distributed environments**: Currently foundries run locally; AWS support via `datafye foundry aws` is planned
+- **Wire to accounts service**: Sandbox provisioning, ensure endpoint, elastic idle management
+- **Authentication**: JWT validation from the frontend (SSO with developer.datafye.io)
+- **Health endpoint for idle detection**: Report `lastChatActivityAt`, `runningJobs`, active proxied apps
 - **SDK-based algos**: Java/Datafye SDK path alongside Python
 - **Live trading**: Currently capped at simulated trading (paper); live trading is a future capability
-- **Multi-user orchestration**: Container orchestration for spinning up per-user instances
-- **Authentication**: JWT validation from the frontend (SSO with developer.datafye.io)
