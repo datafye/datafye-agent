@@ -221,8 +221,8 @@ detect_platform() {
 }
 
 PLATFORM=$(detect_platform)
-TOTAL_STEPS=9
-[ "$MODE" = "standalone" ] && TOTAL_STEPS=11
+TOTAL_STEPS=11
+[ "$MODE" = "standalone" ] && TOTAL_STEPS=13
 STEP=0
 
 next_step() { STEP=$((STEP + 1)); }
@@ -421,6 +421,45 @@ fi
 "${VENV_DIR}/bin/pip" install -r "${AGENT_CODE_DIR}/requirements.txt" -q
 ok "Python dependencies installed"
 
+# ── Step: Configure /etc/hosts for Datafye local environment ─────
+next_step
+info "[${STEP}/${TOTAL_STEPS}] Configuring /etc/hosts for Datafye local environment..."
+
+HOSTS_MARKER_START="# BEGIN datafye-agent (managed)"
+HOSTS_MARKER_END="# END datafye-agent"
+
+# Strip any existing block (idempotent across re-installs)
+sed -i "/${HOSTS_MARKER_START}/,/${HOSTS_MARKER_END}/d" /etc/hosts
+# Remove any trailing blank lines the sed may have left behind
+sed -i -e :a -e '/^\s*$/{$d;N;ba' -e '}' /etc/hosts
+
+# Append the managed block
+cat >> /etc/hosts <<EOF
+
+${HOSTS_MARKER_START}
+127.0.0.1   local-foundry-dev-api.datafye.local
+127.0.0.1   local-foundry-dev-admin.datafye.local
+127.0.0.1   local-foundry-dev-monitor.datafye.local
+127.0.0.1   local-foundry-dev-mcp-api.datafye.local
+${HOSTS_MARKER_END}
+EOF
+ok "/etc/hosts configured (datafye.local hostnames → 127.0.0.1)"
+
+# ── Step: Provision / upgrade local Datafye foundry environment ──
+next_step
+if [ "$IS_UPGRADE" = true ]; then
+    info "[${STEP}/${TOTAL_STEPS}] Upgrading local Datafye foundry environment..."
+    sudo -u datafye "${CLI_PATH}" foundry local upgrade \
+        || { error "Foundry upgrade failed. The agent requires a working foundry environment and API MCP server to function. Resolve the issue and re-run the installer."; exit 1; }
+    ok "Foundry environment upgraded"
+else
+    info "[${STEP}/${TOTAL_STEPS}] Provisioning local Datafye foundry environment..."
+    info "  (First-time provision may take several minutes while Docker images are pulled.)"
+    sudo -u datafye "${CLI_PATH}" foundry local provision \
+        || { error "Foundry provision failed. The agent requires a working foundry environment and API MCP server to function. Resolve the issue and re-run the installer."; exit 1; }
+    ok "Foundry environment provisioned"
+fi
+
 # ── Write configuration ──────────────────────────────────────────
 cat > "${ENV_FILE}" << EOF
 # Datafye Agent Configuration
@@ -436,6 +475,7 @@ DATAFYE_AGENT_SAMPLES_DIR=${SAMPLES_DIR}
 DATAFYE_AGENT_CLI_PATH=${CLI_PATH}
 DATAFYE_AGENT_DNS=${DNS_NAME}
 DATAFYE_AGENT_PINNED=${VERSION_EXPLICIT}
+DATAFYE_AGENT_API_MCP_URL=http://local-foundry-dev-mcp-api.datafye.local:3200/mcp
 EOF
 chmod 600 "${ENV_FILE}"
 echo "${VERSION}" > "${INSTALL_DIR}/version"

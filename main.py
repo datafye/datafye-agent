@@ -17,8 +17,10 @@ including custom events for environment status, scorecard, and chart data.
 import json
 import os
 import logging
+import socket
 from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,8 +71,35 @@ GITHUB_USER = os.getenv("DATAFYE_AGENT_GITHUB_USER", "")
 GITHUB_TOKEN = os.getenv("DATAFYE_AGENT_GITHUB_TOKEN", "")
 GITHUB_ORG = os.getenv("DATAFYE_AGENT_GITHUB_ORG", "datafye")
 
+# Datafye API MCP server — provisioned alongside every foundry/trading
+# deployment by the CLI. The installer configures /etc/hosts so this URL
+# resolves to 127.0.0.1 on the agent machine.
+DATAFYE_API_MCP_URL = os.getenv(
+    "DATAFYE_AGENT_API_MCP_URL",
+    "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp",
+)
+
 # MCP servers (optional, for additional tooling)
 MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
+
+
+def check_api_mcp_reachable(url: str, timeout: float = 2.0) -> bool:
+    """Cheap TCP reachability check for the Datafye API MCP server.
+
+    Returns True if the port is listening. Doesn't validate the MCP protocol
+    itself — the installer's provision step is the load-bearing guarantee
+    that the server is correctly stood up. This is for runtime monitoring
+    (e.g., so the frontend can surface a useful message if the user has
+    stopped the foundry environment).
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 # -- Internal tools ------------------------------------------------
 INTERNAL_TOOLS = [
@@ -109,6 +138,7 @@ class HealthResponse(BaseModel):
     workspace: str
     docs_available: bool
     cli_available: bool
+    api_mcp_available: bool
     credentials: dict[str, bool]
 
 
@@ -143,6 +173,12 @@ def build_mcp_config() -> tuple[dict, list[str]]:
     """Build MCP servers dict and allowed tools list."""
     mcp_servers = {}
     allowed_tools = list(INTERNAL_TOOLS)
+
+    # Datafye API MCP server — primary interface to the running deployment.
+    # Always registered; if the foundry environment is down the SDK will
+    # surface tool-call errors on first use.
+    mcp_servers["datafye-api"] = {"type": "http", "url": DATAFYE_API_MCP_URL}
+    allowed_tools.append("mcp__datafye-api__*")
 
     # Additional MCP servers from JSON config
     try:
@@ -348,6 +384,15 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Docs available: {docs_available}")
     logger.info(f"  Samples dir: {SAMPLES_DIR} (available: {samples_available})")
 
+    if check_api_mcp_reachable(DATAFYE_API_MCP_URL):
+        logger.info(f"  Datafye API MCP: reachable at {DATAFYE_API_MCP_URL}")
+    else:
+        logger.warning(
+            f"  Datafye API MCP: NOT REACHABLE at {DATAFYE_API_MCP_URL}. "
+            f"Agent will start, but tool calls requiring the deployment will fail. "
+            f"Check the foundry environment: datafye foundry local status"
+        )
+
     yield
     logger.info("Datafye Agent Service shutting down...")
 
@@ -380,6 +425,7 @@ async def health():
         workspace=WORKSPACE_DIR,
         docs_available=os.path.isdir(DOCS_DIR),
         cli_available=shutil.which(CLI_PATH) is not None,
+        api_mcp_available=check_api_mcp_reachable(DATAFYE_API_MCP_URL),
         credentials={
             "massive": bool(credentials["massive_api_key"]),
             "precision_alpha": bool(credentials["palpha_api_key"]),
