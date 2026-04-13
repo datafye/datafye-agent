@@ -1,6 +1,6 @@
 # Datafye Agent
 
-A per-user AI backend for quantitative trading development. Wraps the [Claude Agent SDK](https://docs.claude.com/claude-code) in a FastAPI service, giving each user their own agent session that can **research market data, build trading signals and algos, package them into apps, and deploy and run all of it** — end-to-end through natural-language conversation.
+A per-user AI backend for quantitative trading development on the [Datafye platform](https://docs.datafye.io). Wraps the [Claude Agent SDK](https://docs.claude.com/claude-code) in a FastAPI service, giving each user their own agent session that can **research market data, build trading signals and algos, package them into apps, and deploy and run all of it on Datafye** — end-to-end through natural-language conversation.
 
 The agent is equipped with a purpose-built toolkit that turns Claude into a capable quant developer: Datafye's documentation, CLI, and data/trading APIs; general-purpose software tools (file system, code execution, git, shells); and third-party integrations for market data, brokers, and anything else a quant workflow needs. New tools can be added as MCP servers without changing the agent itself.
 
@@ -31,7 +31,7 @@ The Datafye platform is free for everything up to live trading — research, sig
 |---|---|---|---|
 | **Who runs the agent** | Datafye, in a managed sandbox | Datafye, in a managed sandbox | You, on your own infra |
 | **Anthropic key** | Datafye provides | Datafye provides | You bring your own |
-| **Usage limit** | N free hours (TBD) | None (within reason) | None — you pay Anthropic directly |
+| **Usage limit** | Capped by time and token quotas — whichever hits first (TBD) | None (within reason) | None — you pay Anthropic directly |
 | **Price** | Free | Subscription | Free (agent is Apache 2.0) |
 | **Frontend** | Built-in | Built-in | Use `developer.datafye.io` with your backend URL, or call the API directly |
 
@@ -52,7 +52,7 @@ sudo ./install.sh --mode standalone \
     --anthropic-key sk-ant-...
 ```
 
-Requirements: a clean Linux host (Ubuntu 22.04+ tested), public DNS pointing to the machine, root access.
+Requirements: a clean Linux host with `systemd` and root access, plus a public DNS name pointing to the machine. The installer supports Amazon Linux, Ubuntu, Debian, RHEL, CentOS, Fedora, Rocky, and AlmaLinux.
 
 The installer:
 - Creates a dedicated `datafye` user and workspace
