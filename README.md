@@ -6,6 +6,23 @@ The agent is equipped with a purpose-built toolkit that turns Claude into a capa
 
 This repository contains the **agent backend only**. It is the glue code that connects a Claude-powered conversational agent to the Datafye platform — the value lives in the platform, not the glue. It is open source so you can self-host, fork, extend, or audit it.
 
+> ⚠️ **Alpha.** This is pre-release software under active development. Install flows, configuration, and the API surface will change without notice. Not suitable for production use. Bug reports and feedback are very welcome — file them in this repo's [Issues](../../issues).
+
+## Status
+
+**Working today**
+- Native install on Linux (hosted and standalone modes) with systemd service management
+- Automatic upgrades via cron, or pin to a specific version with `--version`
+- SSE-streamed chat against the agent with credential management
+- Local docs + CLI + samples integration so the agent can research, build, test, and deploy
+- `developer.datafye.io` frontend configurable to point at any agent backend URL
+
+**Not yet wired up**
+- JWT authentication between `developer.datafye.io` and the agent backend (currently open per-instance)
+- Sandbox lifecycle (provision / start / stop / idle detection) managed by the Datafye accounts service
+- TradingView Lightweight Charts integration for the Test mode dashboard
+- Free-tier usage metering for `developer.datafye.io` hosted sandboxes
+
 ## Three ways to run it
 
 The Datafye platform is free for everything up to live trading — research, signal development, algo development, backtesting, and paper trading all cost nothing. **Live trading is the sole paid tier and runs exclusively on Datafye's cloud.** The agent itself is always free and open source.
