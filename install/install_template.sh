@@ -27,14 +27,24 @@
 #   # Build hosted AMI (install + cleanup for snapshot)
 #   sudo ./install.sh --mode hosted --ami-cleanup
 #
+#   # Pin to a specific released version (non-SNAPSHOT)
+#   sudo ./install.sh --mode hosted --version 2.0.5
+#
+#   # Install a SNAPSHOT build (internal testing). Requires a GitHub token with
+#   # read access to the private datafye-docs repo, and a locally-installed
+#   # Datafye CLI matching the SNAPSHOT version.
+#   sudo ./install.sh --mode hosted --version 2.0-SNAPSHOT --github-token ghp_...
+#
 
 set -e
 
 # ── Defaults ──────────────────────────────────────────────────────
 VERSION="__VERSION__"
+VERSION_EXPLICIT=false
 MODE=""
 DNS_NAME=""
 ANTHROPIC_API_KEY=""
+GITHUB_TOKEN=""
 FORCE=false
 AMI_CLEANUP=false
 AGENT_PORT=18780
@@ -45,6 +55,9 @@ SAMPLES_DIR="/opt/datafye/samples"
 CLI_BASE="/usr/local/opt/datafye/cli"
 VENV_DIR="/opt/datafye/agent/venv"
 AGENT_REPO="https://github.com/datafye/datafye-agent.git"
+SAMPLES_REPO="https://github.com/datafye/datafye-samples.git"
+DOCS_REPO="https://github.com/datafye/datafye-docs.git"
+DOCS_DOWNLOAD_BASE="https://downloads.n5corp.com/datafye/docs"
 
 # ── Colors ────────────────────────────────────────────────────────
 RED="\033[0;31m"; GREEN="\033[0;32m"; YELLOW="\033[1;33m"; CYAN="\033[0;36m"; RESET="\033[0m"
@@ -59,6 +72,8 @@ while [[ $# -gt 0 ]]; do
         --mode)          MODE="$2"; shift 2 ;;
         --dns)           DNS_NAME="$2"; shift 2 ;;
         --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
+        --version)       VERSION="$2"; VERSION_EXPLICIT=true; shift 2 ;;
+        --github-token)  GITHUB_TOKEN="$2"; shift 2 ;;
         --force)         FORCE=true; shift ;;
         --ami-cleanup)   AMI_CLEANUP=true; shift ;;
         --port)          AGENT_PORT="$2"; shift 2 ;;
@@ -70,15 +85,21 @@ Usage:
   install.sh --mode <hosted|standalone> [OPTIONS]
 
 Options:
-  --mode <mode>       Installation mode (required for fresh install):
-                        hosted     - Rumi cloud sandbox (no nginx, no SSL)
-                        standalone - Marketplace/DIY (nginx + SSL)
-  --dns <name>        DNS name (standalone mode, e.g., agent.mycompany.com)
-  --anthropic-key <k> Anthropic API key (can be set later or via EC2 user data)
-  --force             Reinstall even if same version (useful for SNAPSHOT)
-  --ami-cleanup       Clean up for AMI snapshot (clear keys, logs, history)
-  --port <port>       Agent port (default: 18780)
-  -h, --help          Show this help
+  --mode <mode>         Installation mode (required for fresh install):
+                          hosted     - Rumi cloud sandbox (no nginx, no SSL)
+                          standalone - Marketplace/DIY (nginx + SSL)
+  --dns <name>          DNS name (standalone mode, e.g., agent.mycompany.com)
+  --anthropic-key <k>   Anthropic API key (can be set later or via EC2 user data)
+  --version <v>         Override the baked-in version. Accepts X.Y.Z for
+                        released builds or X.Y-SNAPSHOT for internal testing.
+                        Passing --version pins the install; auto-upgrade is
+                        disabled until the pin is cleared.
+  --github-token <t>    GitHub token with read access to datafye-docs.
+                        Required for SNAPSHOT installs (docs repo is private).
+  --force               Reinstall even if same version (useful for SNAPSHOT)
+  --ami-cleanup         Clean up for AMI snapshot (clear keys, logs, history)
+  --port <port>         Agent port (default: 18780)
+  -h, --help            Show this help
 EOF
             exit 0
             ;;
@@ -88,7 +109,8 @@ done
 
 if [ "$VERSION" = "__VERSION__" ]; then
     error "This is the installer template. Use the published installer from downloads.n5corp.com,"
-    error "or run publish_installer.sh to create a versioned installer."
+    error "pass --version to override the baked-in value, or run publish_installer.sh to create"
+    error "a versioned installer."
     exit 1
 fi
 
@@ -100,6 +122,29 @@ fi
 
 # ── SNAPSHOT handling ─────────────────────────────────────────────
 is_snapshot() { [[ "$1" == *"-SNAPSHOT"* ]]; }
+
+# Resolve git refs (tags for releases, branches for SNAPSHOTs) and validate
+# SNAPSHOT prerequisites up front so we fail fast.
+if is_snapshot "$VERSION"; then
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+-SNAPSHOT$ ]]; then
+        error "SNAPSHOT version must be X.Y-SNAPSHOT (e.g., 2.0-SNAPSHOT). Got: $VERSION"
+        exit 1
+    fi
+    if [ -z "$GITHUB_TOKEN" ]; then
+        error "SNAPSHOT installs require --github-token (private datafye-docs access)."
+        exit 1
+    fi
+    SNAPSHOT_BRANCH="${VERSION%-SNAPSHOT}"
+    DOCS_REF="${SNAPSHOT_BRANCH}"
+    AGENT_REF="${SNAPSHOT_BRANCH}"
+    SAMPLES_REF="${SNAPSHOT_BRANCH}"
+    DOCS_CLONE_URL="https://${GITHUB_TOKEN}@github.com/datafye/datafye-docs.git"
+else
+    DOCS_REF="v${VERSION}"
+    AGENT_REF="v${VERSION}"
+    SAMPLES_REF="v${VERSION}"
+    DOCS_CLONE_URL=""   # not used for released versions
+fi
 
 # ── Detect existing installation ──────────────────────────────────
 CURRENT_VERSION=""
@@ -291,12 +336,29 @@ else
     ok "Claude Code CLI installed"
 fi
 
-# ── Step: Install Datafye CLI ────────────────────────────────────
+# ── Step: Install / validate Datafye CLI ─────────────────────────
 next_step
-info "[${STEP}/${TOTAL_STEPS}] Installing Datafye CLI v${VERSION}..."
-curl -fsSL "https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh" | bash
-CLI_PATH="${CLI_BASE}/${VERSION}/bin/datafye"
-ok "Datafye CLI: ${CLI_PATH}"
+if is_snapshot "$VERSION"; then
+    info "[${STEP}/${TOTAL_STEPS}] Validating local Datafye CLI (SNAPSHOT mode)..."
+    if ! command -v datafye &>/dev/null; then
+        error "Datafye CLI not found on PATH. SNAPSHOT installs require a locally-installed"
+        error "CLI matching version ${VERSION}."
+        exit 1
+    fi
+    INSTALLED_CLI_VERSION=$(datafye version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9.-]+)?' | head -1 || true)
+    if [ "$INSTALLED_CLI_VERSION" != "$VERSION" ]; then
+        error "Local Datafye CLI version '${INSTALLED_CLI_VERSION}' does not match requested"
+        error "SNAPSHOT '${VERSION}'. Install or update the local CLI first."
+        exit 1
+    fi
+    CLI_PATH=$(command -v datafye)
+    ok "Using local Datafye CLI: ${CLI_PATH} (v${INSTALLED_CLI_VERSION})"
+else
+    info "[${STEP}/${TOTAL_STEPS}] Installing Datafye CLI v${VERSION}..."
+    curl -fsSL "https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh" | bash
+    CLI_PATH="${CLI_BASE}/${VERSION}/bin/datafye"
+    ok "Datafye CLI: ${CLI_PATH}"
+fi
 
 # ── Step: Install/update docs, samples, and agent source ─────────
 next_step
@@ -305,29 +367,48 @@ info "[${STEP}/${TOTAL_STEPS}] Installing docs, samples, and agent source..."
 clone_or_update_repo() {
     local repo_url="$1"
     local target_dir="$2"
-    local version="$3"
+    local git_ref="$3"
     local label="$4"
 
     if [ -d "${target_dir}/.git" ]; then
         cd "${target_dir}"
-        git fetch --depth 1 origin "v${version}" 2>/dev/null && git checkout "v${version}" 2>/dev/null \
-            || { git fetch --depth 1 origin main && git checkout main; }
+        git remote set-url origin "${repo_url}"
+        git fetch --depth 1 origin "${git_ref}" \
+            || { error "${label}: failed to fetch ${git_ref}"; exit 1; }
+        git checkout -qf FETCH_HEAD
         cd - > /dev/null
     else
         rm -rf "${target_dir}"
-        git clone --depth 1 --branch "v${version}" \
-            "${repo_url}" "${target_dir}" 2>/dev/null \
-            || git clone --depth 1 "${repo_url}" "${target_dir}"
+        git clone --depth 1 --branch "${git_ref}" "${repo_url}" "${target_dir}" \
+            || { error "${label}: failed to clone ${git_ref}"; exit 1; }
     fi
     ok "${label}: ${target_dir}"
 }
 
-clone_or_update_repo "https://github.com/datafye/datafye-docs.git" "${DOCS_DIR}" "${VERSION}" "Docs"
-clone_or_update_repo "https://github.com/datafye/datafye-samples.git" "${SAMPLES_DIR}" "${VERSION}" "Samples"
+fetch_docs_tarball() {
+    local url="$1"
+    local target_dir="$2"
+    local label="$3"
+
+    info "Fetching docs tarball from ${url}..."
+    rm -rf "${target_dir}"
+    mkdir -p "${target_dir}"
+    curl -fsSL --retry 3 "${url}" | tar -xz -C "${target_dir}" --strip-components=1 \
+        || { error "${label}: failed to fetch or extract tarball"; exit 1; }
+    ok "${label}: ${target_dir}"
+}
+
+if is_snapshot "$VERSION"; then
+    clone_or_update_repo "${DOCS_CLONE_URL}" "${DOCS_DIR}" "${DOCS_REF}" "Docs"
+else
+    fetch_docs_tarball "${DOCS_DOWNLOAD_BASE}/${VERSION}/docs.tar.gz" "${DOCS_DIR}" "Docs"
+fi
+
+clone_or_update_repo "${SAMPLES_REPO}" "${SAMPLES_DIR}" "${SAMPLES_REF}" "Samples"
 
 # Agent source code (public repo)
 AGENT_CODE_DIR="${INSTALL_DIR}/app"
-clone_or_update_repo "${AGENT_REPO}" "${AGENT_CODE_DIR}" "${VERSION}" "Agent"
+clone_or_update_repo "${AGENT_REPO}" "${AGENT_CODE_DIR}" "${AGENT_REF}" "Agent"
 
 # ── Step: Install Python dependencies ────────────────────────────
 next_step
@@ -354,6 +435,7 @@ DATAFYE_AGENT_DOCS_DIR=${DOCS_DIR}
 DATAFYE_AGENT_SAMPLES_DIR=${SAMPLES_DIR}
 DATAFYE_AGENT_CLI_PATH=${CLI_PATH}
 DATAFYE_AGENT_DNS=${DNS_NAME}
+DATAFYE_AGENT_PINNED=${VERSION_EXPLICIT}
 EOF
 chmod 600 "${ENV_FILE}"
 echo "${VERSION}" > "${INSTALL_DIR}/version"

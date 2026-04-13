@@ -12,16 +12,30 @@
 # The version file is published by the agent build pipeline to:
 #   https://downloads.n5corp.com/datafye/agent/latest/version.txt
 #
+# If DATAFYE_AGENT_PINNED=true in agent.env (because the install used
+# --version), this script exits silently — a pinned install must be
+# upgraded manually.
+#
 
 set -e
 
 INSTALL_DIR="/opt/datafye/agent"
+ENV_FILE="${INSTALL_DIR}/agent.env"
 VERSION_URL="https://downloads.n5corp.com/datafye/agent/latest/version.txt"
 LOG_PREFIX="[datafye-agent-upgrade]"
 
 # Check we're installed
 if [ ! -f "${INSTALL_DIR}/version" ]; then
     exit 0
+fi
+
+# Respect pinning
+if [ -f "${ENV_FILE}" ]; then
+    PINNED=$(grep -oP '^DATAFYE_AGENT_PINNED=\K.*' "${ENV_FILE}" 2>/dev/null || true)
+    if [ "${PINNED}" = "true" ]; then
+        # Silent — this is expected for pinned installs
+        exit 0
+    fi
 fi
 
 CURRENT_VERSION=$(cat "${INSTALL_DIR}/version")
@@ -41,18 +55,11 @@ if [ "${CURRENT_VERSION}" = "${LATEST_VERSION}" ]; then
 fi
 
 echo "${LOG_PREFIX} $(date -u +%Y-%m-%dT%H:%M:%SZ) Upgrade available: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+echo "${LOG_PREFIX} Fetching installer v${LATEST_VERSION} from downloads.n5corp.com..."
 
-# Run the installer in upgrade mode
-# The installer preserves credentials and workspace automatically
-INSTALLER="${INSTALL_DIR}/install.sh"
-
-if [ -f "${INSTALLER}" ]; then
-    echo "${LOG_PREFIX} Running installer for v${LATEST_VERSION}..."
-    bash "${INSTALLER}" --version "${LATEST_VERSION}"
-    echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
-else
-    # Installer not on disk — fetch it from downloads
-    echo "${LOG_PREFIX} Fetching installer from downloads.n5corp.com..."
-    curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | bash -s -- --version "${LATEST_VERSION}"
-    echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
-fi
+# Always fetch the latest installer (which has the target version baked in);
+# do not reuse the local installer with --version, since that would change
+# pinning semantics. Config (mode, credentials, DNS, port) is preserved
+# automatically by the installer via agent.env.
+curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | bash
+echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
