@@ -113,6 +113,10 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/chat` | POST | SSE streaming chat with agent |
 | `/v1/credentials` | POST | Update user credentials at runtime |
 | `/v1/credentials/status` | GET | Check which credentials are configured |
+| `/v1/broker/brokers` | GET | List brokers Datafye supports (StocksBroker enum) |
+| `/v1/broker/connections` | GET | List the user's brokerage connections with linked accounts |
+| `/v1/broker/connections` | POST | Create a ConnectTrade OAuth URL for a chosen broker; body `{type, broker}` |
+| `/v1/broker/connections/{id}` | DELETE | Revoke a brokerage connection |
 
 ## SSE Event Types
 
@@ -153,6 +157,9 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `DATAFYE_AGENT_GITHUB_TOKEN` | - | Personal GitHub token (optional) |
 | `DATAFYE_AGENT_GITHUB_ORG` | `datafye` | GitHub org for algo repos |
 | `DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL` | `[]` | Additional MCP servers (JSON) |
+| `DATAFYE_AGENT_CONNECTTRADE_API_URL` | `https://api.connecttrade.com` | ConnectTrade REST base URL |
+| `DATAFYE_AGENT_BROKER_REDIRECT_URL` | `https://developer.datafye.io/broker-callback.html` | OAuth redirect target |
+| `DATAFYE_AGENT_BROKER_STATE_FILE` | `~/.datafye/agent/broker_user.json` | Where the ConnectTrade user_id / user_secret are persisted (TODO: migrate to accounts-manager) |
 
 ## Key Design Decisions
 

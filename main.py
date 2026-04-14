@@ -33,6 +33,7 @@ from claude_agent_sdk import (
 )
 
 from prompt import build_system_prompt
+import broker
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -411,6 +412,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# broker router — shares the credentials dict so updates via /v1/credentials stay visible,
+# and lazy-provisioned ConnectTrade user_id/user_secret flow back into it.
+broker.configure(credentials)
+app.include_router(broker.router)
 
 
 # -- Endpoints -----------------------------------------------------

@@ -8,6 +8,14 @@ This repository contains the **agent backend only**. It is the glue code that co
 
 > ⚠️ **Alpha.** This is pre-release software under active development. Install flows, configuration, and the API surface will change without notice. Not suitable for production use. Bug reports and feedback are very welcome — file them in this repo's [Issues](../../issues).
 
+## How the pieces fit
+
+The Datafye App at [developer.datafye.io](https://developer.datafye.io) is a **static frontend** (HTML/CSS/JS, no backend of its own). Your browser connects **directly** to the agent over HTTP + SSE — there is no intermediary server. This is true whether you're on a Datafye-managed sandbox or your own self-hosted agent: chat messages, credentials, and broker traffic never flow through any Datafye-operated app tier. The only server-side pieces Datafye runs for you are (a) serving the static app and (b) in the hosted model, the accounts service that provisions your sandbox. Once the sandbox is up, your browser talks straight to it.
+
+```
+Browser ──HTTP + SSE──▶ Your agent (sandbox or self-hosted) ──▶ ConnectTrade, Anthropic, etc.
+```
+
 ## Status
 
 **Working today**
@@ -15,7 +23,7 @@ This repository contains the **agent backend only**. It is the glue code that co
 - Automatic upgrades via cron, or pin to a specific version with `--version`
 - SSE-streamed chat against the agent with credential management
 - Local docs + CLI + samples integration so the agent can research, build, test, and deploy
-- `developer.datafye.io` frontend configurable to point at any agent backend URL
+- Static `developer.datafye.io` frontend connects directly to any agent backend URL (hosted sandbox or self-hosted), no Datafye-operated app tier in the middle
 
 **Not yet wired up**
 - JWT authentication between `developer.datafye.io` and the agent backend (currently open per-instance)
@@ -33,7 +41,7 @@ The Datafye platform is free for everything up to live trading — research, sig
 | **Anthropic key** | Datafye provides | Datafye provides | You bring your own |
 | **Usage limit** | Capped by time and token quotas — whichever hits first (TBD) | None (within reason) | None — you pay Anthropic directly |
 | **Price** | Free | Subscription | Free (agent is Apache 2.0) |
-| **Frontend** | Built-in | Built-in | Use `developer.datafye.io` with your backend URL, or call the API directly |
+| **Frontend** | `developer.datafye.io` (static, direct to your sandbox agent) | `developer.datafye.io` (static, direct to your sandbox agent) | `developer.datafye.io` pointed at your agent URL, or call the API directly |
 
 When you exhaust the free hours on `developer.datafye.io`, you have two graceful options: upgrade to a paid Datafye tier, or point `developer.datafye.io` at your own self-hosted backend and keep going for free. The custom-backend-URL setting in Settings is the graduation path.
 
@@ -72,7 +80,7 @@ Updates are automatic — a cron job polls `downloads.n5corp.com/datafye/agent/l
 
 ### Option 1 — Use developer.datafye.io
 
-Sign in at [developer.datafye.io](https://developer.datafye.io), open **Settings → Agent Backend**, and enter your agent URL (e.g. `https://agent.mycompany.com`). The frontend SSEs directly to your backend from then on — no data flows through Datafye.
+Sign in at [developer.datafye.io](https://developer.datafye.io), open **Settings → Agent Backend**, and enter your agent URL (e.g. `https://agent.mycompany.com`). The frontend is static HTML/JS and SSEs directly to the URL you set — there is no Datafye-operated app backend in the path, so chat messages, credentials, and broker traffic flow only between your browser and your agent.
 
 ### Option 2 — API directly
 
