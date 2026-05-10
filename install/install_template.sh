@@ -107,7 +107,8 @@ EOF
     esac
 done
 
-if [ "$VERSION" = "__VERSION__" ]; then
+# Note: sentinel is split so sed's __VERSION__ substitution doesn't replace it
+if [ "$VERSION" = "__""VERSION__" ]; then
     error "This is the installer template. Use the published installer from downloads.n5corp.com,"
     error "pass --version to override the baked-in value, or run publish_installer.sh to create"
     error "a versioned installer."
