@@ -18,15 +18,13 @@ Flow:
 TODO(accounts-manager): eventually the accounts manager stores and serves both the
 client_id/client_secret (system-wide) and user_id/user_secret (per-user). For now:
   - client_id / client_secret: sourced from env vars on the sandbox
-  - user_id / user_secret: lazily provisioned on first connect, persisted to disk
-    on the sandbox (single-user instance, so one file is enough)
+  - user_id / user_secret: lazily provisioned on first connect; persisted via the
+    shared encrypted credentials store (see credentials.py).
 """
 
-import json
 import logging
 import os
 import uuid
-from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -46,16 +44,6 @@ CONNECTTRADE_API_URL = os.getenv(
 BROKER_REDIRECT_URL = os.getenv(
     "DATAFYE_AGENT_BROKER_REDIRECT_URL",
     "https://developer.datafye.io/broker-callback.html",
-)
-
-# Where to persist the per-sandbox ConnectTrade user_id / user_secret.
-# Single file is fine because each sandbox is single-user.
-# TODO(accounts-manager): replace disk persistence with accounts-manager lookup.
-BROKER_STATE_FILE = Path(
-    os.getenv(
-        "DATAFYE_AGENT_BROKER_STATE_FILE",
-        os.path.expanduser("~/.datafye/agent/broker_user.json"),
-    )
 )
 
 # Datafye's supported brokers — mirrors StocksBroker enum in
@@ -106,39 +94,18 @@ def _client_headers() -> dict[str, str]:
     return {"client-id": client_id, "client-secret": client_secret}
 
 
-def _load_user_from_disk() -> tuple[str, str]:
-    try:
-        payload = json.loads(BROKER_STATE_FILE.read_text())
-        return payload.get("user_id", ""), payload.get("user_secret", "")
-    except (FileNotFoundError, json.JSONDecodeError):
-        return "", ""
-
-
-def _persist_user(user_id: str, user_secret: str) -> None:
-    BROKER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BROKER_STATE_FILE.write_text(json.dumps({
-        "user_id": user_id,
-        "user_secret": user_secret,
-    }))
-    try:
-        BROKER_STATE_FILE.chmod(0o600)
-    except OSError:
-        pass
-
-
 async def _ensure_user() -> tuple[str, str]:
-    """Return (user_id, user_secret), provisioning with ConnectTrade if needed."""
+    """
+    Return (user_id, user_secret), provisioning with ConnectTrade if needed.
+
+    Persistence is handled by the encrypted credentials store — writing to the
+    shared `creds` dict (which is a CredentialsStore instance) auto-flushes to
+    disk via __setitem__.
+    """
     creds = _creds()
     user_id = creds.get("connecttrade_user_id") or ""
     user_secret = creds.get("connecttrade_user_secret") or ""
     if user_id and user_secret:
-        return user_id, user_secret
-
-    # second source: on-disk state (populated by a previous provisioning)
-    user_id, user_secret = _load_user_from_disk()
-    if user_id and user_secret:
-        creds["connecttrade_user_id"] = user_id
-        creds["connecttrade_user_secret"] = user_secret
         return user_id, user_secret
 
     # provision a fresh user with ConnectTrade
@@ -161,7 +128,6 @@ async def _ensure_user() -> tuple[str, str]:
 
     creds["connecttrade_user_id"] = user_id
     creds["connecttrade_user_secret"] = user_secret
-    _persist_user(user_id, user_secret)
     logger.info("Provisioned new ConnectTrade user: %s", user_id)
     return user_id, user_secret
 

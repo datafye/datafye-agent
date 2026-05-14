@@ -34,6 +34,8 @@ from claude_agent_sdk import (
 
 from prompt import build_system_prompt
 import broker
+import credentials as credentials_module
+import identity
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -141,6 +143,8 @@ class HealthResponse(BaseModel):
     cli_available: bool
     api_mcp_available: bool
     credentials: dict[str, bool]
+    username: str
+    credentials_generation: str
 
 
 class CredentialsUpdate(BaseModel):
@@ -156,18 +160,32 @@ class CredentialsUpdate(BaseModel):
     github_token: Optional[str] = None
 
 
-# -- Credential state (mutable at runtime) -------------------------
-credentials = {
-    "massive_api_key": MASSIVE_API_KEY,
-    "palpha_api_key": PALPHA_API_KEY,
-    "hwai_api_key": HWAI_API_KEY,
-    "connecttrade_client_id": CONNECTTRADE_CLIENT_ID,
-    "connecttrade_client_secret": CONNECTTRADE_CLIENT_SECRET,
-    "connecttrade_user_id": CONNECTTRADE_USER_ID,
-    "connecttrade_user_secret": CONNECTTRADE_USER_SECRET,
-    "github_user": GITHUB_USER,
-    "github_token": GITHUB_TOKEN,
-}
+# -- Identity bootstrap -------------------------------------------
+# Read once at module load. Username (e.g. "u123456") is the agent's identity;
+# instance_id seeds the credentials store's encryption key. Refuses to start
+# if neither IMDS (production) nor env vars (local dev) can resolve them.
+AGENT_IDENTITY = identity.bootstrap()
+
+
+# -- Credential state (auto-persisting encrypted store) -------------
+# Loaded from ~/.datafye/agent/credentials.bin if it exists, otherwise
+# created fresh and seeded from the env vars above. The store is a dict
+# subclass — every write transparently re-encrypts and flushes to disk,
+# so existing code that does `credentials["foo"] = "bar"` keeps working.
+credentials = credentials_module.load(
+    instance_id=AGENT_IDENTITY.instance_id,
+    env_seed={
+        "massive_api_key": MASSIVE_API_KEY,
+        "palpha_api_key": PALPHA_API_KEY,
+        "hwai_api_key": HWAI_API_KEY,
+        "connecttrade_client_id": CONNECTTRADE_CLIENT_ID,
+        "connecttrade_client_secret": CONNECTTRADE_CLIENT_SECRET,
+        "connecttrade_user_id": CONNECTTRADE_USER_ID,
+        "connecttrade_user_secret": CONNECTTRADE_USER_SECRET,
+        "github_user": GITHUB_USER,
+        "github_token": GITHUB_TOKEN,
+    },
+)
 
 
 def build_mcp_config() -> tuple[dict, list[str]]:
@@ -204,34 +222,34 @@ def get_credential_summary() -> str:
     """Build a credential summary for the system prompt."""
     lines = []
 
-    if credentials["massive_api_key"]:
+    if credentials.get("massive_api_key"):
         lines.append("- Massive (Polygon) API key: configured (for SIP and Crypto datasets)")
     else:
         lines.append("- Massive (Polygon) API key: NOT configured (needed for SIP and Crypto datasets)")
 
-    if credentials["palpha_api_key"]:
+    if credentials.get("palpha_api_key"):
         lines.append("- Precision Alpha API key: configured (for Palpha dataset)")
     else:
         lines.append("- Precision Alpha API key: NOT configured (needed for Palpha dataset)")
 
-    if credentials["hwai_api_key"]:
+    if credentials.get("hwai_api_key"):
         lines.append("- HWAI API key: configured (for HWAI dataset)")
     else:
         lines.append("- HWAI API key: NOT configured (needed for HWAI dataset)")
 
     ct_configured = all([
-        credentials["connecttrade_client_id"],
-        credentials["connecttrade_client_secret"],
-        credentials["connecttrade_user_id"],
-        credentials["connecttrade_user_secret"],
+        credentials.get("connecttrade_client_id"),
+        credentials.get("connecttrade_client_secret"),
+        credentials.get("connecttrade_user_id"),
+        credentials.get("connecttrade_user_secret"),
     ])
     if ct_configured:
         lines.append("- ConnectTrade broker credentials: configured (for simulated trading)")
     else:
         lines.append("- ConnectTrade broker credentials: NOT configured (needed for simulated trading)")
 
-    if credentials["github_user"] and credentials["github_token"]:
-        lines.append(f"- GitHub: using personal account ({credentials['github_user']})")
+    if credentials.get("github_user") and credentials.get("github_token"):
+        lines.append(f"- GitHub: using personal account ({credentials.get('github_user')})")
     else:
         lines.append(f"- GitHub: using Datafye org ({GITHUB_ORG})")
 
@@ -433,17 +451,19 @@ async def health():
         cli_available=shutil.which(CLI_PATH) is not None,
         api_mcp_available=check_api_mcp_reachable(DATAFYE_API_MCP_URL),
         credentials={
-            "massive": bool(credentials["massive_api_key"]),
-            "precision_alpha": bool(credentials["palpha_api_key"]),
-            "hwai": bool(credentials["hwai_api_key"]),
+            "massive": bool(credentials.get("massive_api_key")),
+            "precision_alpha": bool(credentials.get("palpha_api_key")),
+            "hwai": bool(credentials.get("hwai_api_key")),
             "connecttrade": all([
-                credentials["connecttrade_client_id"],
-                credentials["connecttrade_client_secret"],
-                credentials["connecttrade_user_id"],
-                credentials["connecttrade_user_secret"],
+                credentials.get("connecttrade_client_id"),
+                credentials.get("connecttrade_client_secret"),
+                credentials.get("connecttrade_user_id"),
+                credentials.get("connecttrade_user_secret"),
             ]),
-            "github": bool(credentials["github_user"] and credentials["github_token"]),
-        }
+            "github": bool(credentials.get("github_user") and credentials.get("github_token")),
+        },
+        username=AGENT_IDENTITY.username,
+        credentials_generation=credentials.generation(),
     )
 
 
@@ -480,31 +500,29 @@ async def chat(request: ChatRequest):
 
 @app.post("/v1/credentials")
 async def update_credentials(update: CredentialsUpdate):
-    """Update user credentials at runtime (called from frontend settings)."""
-    updated = []
-    for field, value in update.model_dump(exclude_none=True).items():
-        if field in credentials:
-            credentials[field] = value
-            updated.append(field)
-
-    logger.info(f"Credentials updated: {updated}")
-    return {"updated": updated}
+    """Update user credentials at runtime (called from frontend settings).
+    Pydantic's CredentialsUpdate model is the schema; any field defined there
+    is a valid credential. Writes auto-persist via the encrypted store."""
+    payload = update.model_dump(exclude_none=True)
+    credentials.update(payload)
+    logger.info(f"Credentials updated: {list(payload.keys())}")
+    return {"updated": list(payload.keys())}
 
 
 @app.get("/v1/credentials/status")
 async def credentials_status():
     """Check which credentials are configured."""
     return {
-        "massive": bool(credentials["massive_api_key"]),
-        "precision_alpha": bool(credentials["palpha_api_key"]),
-        "hwai": bool(credentials["hwai_api_key"]),
+        "massive": bool(credentials.get("massive_api_key")),
+        "precision_alpha": bool(credentials.get("palpha_api_key")),
+        "hwai": bool(credentials.get("hwai_api_key")),
         "connecttrade": all([
-            credentials["connecttrade_client_id"],
-            credentials["connecttrade_client_secret"],
-            credentials["connecttrade_user_id"],
-            credentials["connecttrade_user_secret"],
+            credentials.get("connecttrade_client_id"),
+            credentials.get("connecttrade_client_secret"),
+            credentials.get("connecttrade_user_id"),
+            credentials.get("connecttrade_user_secret"),
         ]),
-        "github_personal": bool(credentials["github_user"] and credentials["github_token"]),
+        "github_personal": bool(credentials.get("github_user") and credentials.get("github_token")),
     }
 
 
