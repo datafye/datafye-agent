@@ -177,11 +177,56 @@ Two deployment modes:
 
 The agent source is open source — the value is in the Datafye platform, not the glue code. Power users can fork and customize the prompt, add tools, tweak behavior.
 
-## What's Next
+## What's Next — Receive-Only Integration with `datafye-accounts`
 
-- **Wire to accounts service**: Sandbox provisioning, ensure endpoint, elastic idle management
-- **Authentication**: JWT validation from the frontend (SSO with developer.datafye.io)
-- **Health endpoint for idle detection**: Report `lastChatActivityAt`, `runningJobs`, active proxied apps
-- **Migrate ConnectTrade creds to accounts-manager**: Today the client `id`/`secret` come from env vars and the user `id`/`secret` are persisted to a per-sandbox JSON file. Both should live in the Datafye accounts-manager — client creds as a tenant-wide secret, user creds as per-user storage that survives sandbox recreation.
-- **SDK-based algos**: Java/Datafye SDK path alongside Python
-- **Live trading**: Currently capped at simulated trading (paper); live trading is a future capability
+The next phase moves the agent from "standalone process the user configures by hand" to "receive-only worker in the Datafye sandbox plane." The design was settled in the 2026-05-13 design session; this section captures it.
+
+The shape of the agent's role contracts: it **receives** credentials and JWTs, it **does** work, it never **asks** accounts for anything. Accounts is the only writer in the relationship.
+
+### Thing 1: Identity bootstrap from IMDS
+
+At process startup, the agent reads its EC2 `Name` tag via Instance Metadata Service:
+
+```python
+# pseudo
+name_tag = read_imds("/meta-data/tags/instance/Name")        # e.g. "agents-u123456"
+username = name_tag.removeprefix("agents-")                  # "u123456"
+```
+
+The agent stores this on its global state and refuses to start if the tag is missing. The username is the single piece of identity the agent has — no secrets, no shared keys, just a tag that the AwsProvisioner sets at launch time. `AwsProvisioner.launchServiceInstance` always tags the instance with `Name=<instanceName>`, so as long as the provisioner is invoked with `instanceName == username`, the agent picks up its identity from AWS itself.
+
+### Thing 2: Encrypted on-disk credentials store
+
+The agent doesn't have a Rumi store (it's Python/FastAPI, not a Rumi application). Credentials live in a single binary file with light encryption:
+
+- Path: `~/.datafye/agent/credentials.bin` (mode 0600)
+- Format: msgpack
+- Encryption: `cryptography.fernet`. Key derived deterministically from the EC2 instance ID (`sha256("datafye-agent-creds-v1::" + instance_id)`, base64-urlsafe-encoded). The instance ID comes from IMDS — same call as the identity bootstrap. No key persisted to disk; the key is reconstructable on every agent restart.
+- Threat model: defends against casual file inspection and against leaked EBS snapshots (snapshot doesn't contain the instance ID, so key can't be derived offline). Does not defend against an attacker who has shell on the running instance — at that point they can read IMDS anyway. That's acceptable; encryption-at-rest is one layer of many.
+- Replaces today's `~/.datafye/agent/broker_user.json` plain-JSON file. Existing ConnectTrade user creds fold into this same store as one of the providers.
+- Compute a `credentialsGeneration` UUID (deterministic hash of contents) on load and on update; expose in `/health`.
+
+### Thing 3: Endpoint changes
+
+- **New: `POST /v1/credentials/update`** — body `{ provider, value }`. Accounts-only push. Updates in-memory cache + persists to `credentials.bin` atomically. Returns 204.
+- **Update `GET /health`** to include: `credentialsGeneration`, `lastChatActivityAt`, `runningJobs`, `activeProxiedApps`. Accounts polls this for both idle detection and cache-loss recovery (if `credentialsGeneration` differs from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section).
+- **Remove the existing direct-write `POST /v1/credentials`** (or repurpose to return 410 Gone with a "use accounts" message). The frontend stops writing credentials directly to the agent in the new model — all writes go through accounts.
+- **JWT validation middleware** on `/v1/chat`, `/v1/broker/*`. Verify accounts-signed JWT against accounts' JWKS, check `sub == self.username`. Reject otherwise.
+
+### Why this shape
+
+- **No agent → accounts calls** means no shared secret to bootstrap, no IAM-signing layer, no fallback mode when JWTs aren't available. Background tasks use the cached credentials, which are kept fresh by accounts' push + the generation-counter recovery mechanism.
+- **The agent never sees its own credentials before they're pushed.** Even on first boot, the agent has an empty cache until accounts (driven by the user's Settings activity) pushes values in. That's by design — accounts is the source of truth.
+- **No "stale cache + no user connected" race.** Credentials only change when the user takes action; the user is by definition online during that action; the push lands on the live agent before the user disconnects.
+
+### Implementation order
+
+| Order | Item |
+|---|---|
+| 1 | Thing 1 (IMDS identity) + Thing 2 (credentials store) — can be tested against the existing `gkumar74` sandbox by manually setting the `Name` tag and bootstrapping a few credentials. |
+| 2 | Thing 3 (new endpoint + health changes + JWT middleware) — requires accounts to be able to push, so this lands after `datafye-accounts` Chunks 1 + 4. |
+
+### Smaller follow-ups already on the list
+
+- SDK-based algos (Java / Datafye SDK path alongside Python)
+- Live trading (currently capped at simulated/paper)
