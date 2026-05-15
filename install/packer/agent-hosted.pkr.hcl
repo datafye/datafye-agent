@@ -138,6 +138,11 @@ build {
       "GITHUB_TOKEN=${var.github_token}",
       "AGENT_VERSION=${var.agent_version}",
       "AGENT_BRANCH=${var.agent_branch}",
+      # Redirect mktemp/tar staging off the tmpfs-backed /tmp (capped at
+      # ~50% of RAM on AL2023, so ~1GB on a t3.small) and onto /var/tmp,
+      # which lives on the 32GB root EBS. The Datafye CLI distribution
+      # tarball + its extracted contents together don't fit in 1GB.
+      "TMPDIR=/var/tmp",
     ]
     inline = [
       "set -e",
@@ -152,13 +157,15 @@ build {
       "sudo growpart /dev/xvda 1 || echo '(growpart no-op — partition already at max)'",
       "sudo xfs_growfs / 2>/dev/null || sudo resize2fs /dev/root 2>/dev/null || sudo resize2fs /dev/xvda1 2>/dev/null || echo '(filesystem already at max)'",
       "echo 'Post-grow disk usage:'; df -h /",
+      "echo 'tmpfs vs disk-backed dirs:'; mount | grep -E 'on (/tmp|/var/tmp)' || true",
+      "mkdir -p /var/tmp",
       "echo 'Installing git...'",
       "sudo dnf install -y git",
       "echo \"Cloning datafye-agent branch $AGENT_BRANCH (private; using token)...\"",
       "git clone --depth 1 -b \"$AGENT_BRANCH\" \"https://x-access-token:$${GITHUB_TOKEN}@github.com/datafye/datafye-agent.git\" /tmp/datafye-agent",
       "cd /tmp/datafye-agent/install",
       "echo \"Running install_template.sh --mode hosted --ami-cleanup --version $AGENT_VERSION...\"",
-      "sudo --preserve-env=GITHUB_TOKEN ./install_template.sh --mode hosted --ami-cleanup --version \"$AGENT_VERSION\" --github-token \"$GITHUB_TOKEN\"",
+      "sudo --preserve-env=GITHUB_TOKEN,TMPDIR ./install_template.sh --mode hosted --ami-cleanup --version \"$AGENT_VERSION\" --github-token \"$GITHUB_TOKEN\"",
       "echo 'Scrubbing /tmp/datafye-agent (its .git/config contains the token-embedded clone URL)...'",
       "sudo rm -rf /tmp/datafye-agent"
     ]
