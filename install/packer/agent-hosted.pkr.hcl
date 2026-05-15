@@ -97,16 +97,29 @@ build {
   sources = ["source.amazon-ebs.agent_hosted"]
 
   provisioner "shell" {
+    # github_token is required: the datafye-agent and datafye-docs repos are
+    # both private. Token is passed as an env var to the inline shell (rather
+    # than being inlined into a clone URL on the command line) so it doesn't
+    # land in process listings or shell history. Packer marks the variable
+    # sensitive=true so it's redacted from build logs.
+    environment_vars = [
+      "GITHUB_TOKEN=${var.github_token}",
+      "AGENT_VERSION=${var.agent_version}",
+    ]
     inline = [
       "set -e",
+      "if [ -z \"$GITHUB_TOKEN\" ]; then echo 'ERROR: GITHUB_TOKEN is required (datafye-agent and datafye-docs are private)'; exit 1; fi",
       "echo 'Waiting for cloud-init to finish (Rumi worker AMIs may run on-boot setup)...'",
       "sudo cloud-init status --wait || true",
-      "echo 'Cloning datafye-agent...'",
+      "echo 'Installing git...'",
       "sudo dnf install -y git",
-      "git clone --depth 1 https://github.com/datafye/datafye-agent.git /tmp/datafye-agent",
+      "echo 'Cloning datafye-agent (private; using token)...'",
+      "git clone --depth 1 \"https://x-access-token:$${GITHUB_TOKEN}@github.com/datafye/datafye-agent.git\" /tmp/datafye-agent",
       "cd /tmp/datafye-agent/install",
-      "echo 'Running install_template.sh --mode hosted --ami-cleanup --version ${var.agent_version}...'",
-      "sudo ./install_template.sh --mode hosted --ami-cleanup --version ${var.agent_version} ${var.github_token != "" ? "--github-token ${var.github_token}" : ""}"
+      "echo \"Running install_template.sh --mode hosted --ami-cleanup --version $AGENT_VERSION...\"",
+      "sudo --preserve-env=GITHUB_TOKEN ./install_template.sh --mode hosted --ami-cleanup --version \"$AGENT_VERSION\" --github-token \"$GITHUB_TOKEN\"",
+      "echo 'Scrubbing /tmp/datafye-agent (its .git/config contains the token-embedded clone URL)...'",
+      "sudo rm -rf /tmp/datafye-agent"
     ]
   }
 
