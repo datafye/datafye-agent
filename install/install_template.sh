@@ -38,6 +38,14 @@
 
 set -e
 
+# Default TMPDIR to /var/tmp (disk-backed) so any downloads + extracts in
+# this installer AND in the Datafye CLI installer this one curl-pipes
+# don't get stuck on the tmpfs /tmp. AL2023 mounts /tmp as tmpfs capped
+# at ~50% of memory — too small for the Datafye CLI distribution tarball
+# + its extracted libs/ on small instances. Caller-supplied TMPDIR wins.
+export TMPDIR="${TMPDIR:-/var/tmp}"
+mkdir -p "$TMPDIR"
+
 # ── Defaults ──────────────────────────────────────────────────────
 VERSION="__VERSION__"
 VERSION_EXPLICIT=false

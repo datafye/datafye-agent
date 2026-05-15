@@ -157,7 +157,6 @@ build {
       "sudo growpart /dev/xvda 1 || echo '(growpart no-op — partition already at max)'",
       "sudo xfs_growfs / 2>/dev/null || sudo resize2fs /dev/root 2>/dev/null || sudo resize2fs /dev/xvda1 2>/dev/null || echo '(filesystem already at max)'",
       "echo 'Post-grow disk usage:'; df -h /",
-      "echo 'tmpfs vs disk-backed dirs:'; mount | grep -E 'on (/tmp|/var/tmp)' || true",
       "mkdir -p /var/tmp",
       "echo 'Installing git...'",
       "sudo dnf install -y git",
