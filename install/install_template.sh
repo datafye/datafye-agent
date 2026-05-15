@@ -543,8 +543,17 @@ EOF
 ok "/etc/hosts configured (datafye.local hostnames → 127.0.0.1)"
 
 # ── Step: Provision / upgrade local Datafye foundry environment ──
+# Skip in --ami-cleanup mode: foundry provisioning pulls docker images,
+# starts containers, and writes instance-specific state under ~/.rumi
+# (admin-docker-compose.yml, named volumes, etc.) — none of which is
+# safe to snapshot into an AMI. Each per-user sandbox provisions its
+# own foundry at first boot.
 next_step
-if [ "$IS_UPGRADE" = true ]; then
+if [ "$AMI_CLEANUP" = true ]; then
+    info "[${STEP}/${TOTAL_STEPS}] Foundry provisioning skipped (--ami-cleanup mode)"
+    info "  Per-user sandboxes provision their own foundry at first boot."
+    ok "Foundry: deferred to first boot"
+elif [ "$IS_UPGRADE" = true ]; then
     info "[${STEP}/${TOTAL_STEPS}] Upgrading local Datafye foundry environment..."
     sudo -u datafye "${CLI_PATH}" foundry local upgrade \
         || { error "Foundry upgrade failed. The agent requires a working foundry environment and API MCP server to function. Resolve the issue and re-run the installer."; exit 1; }
