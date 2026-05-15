@@ -234,14 +234,18 @@ info "[${STEP}/${TOTAL_STEPS}] Installing system dependencies..."
 
 case $PLATFORM in
     amzn)
-        yum install -y python3 python3-pip git curl java-17-amazon-corretto-headless
+        # --allowerasing lets dnf swap curl-minimal (which AL2023 ships) for the
+        # full curl package without aborting on the conflict. On AL2 (which has
+        # full curl already), --allowerasing is a no-op.
+        yum install -y --allowerasing python3 python3-pip git curl java-17-amazon-corretto-headless
         ;;
     ubuntu|debian)
         apt-get update -qq
         apt-get install -y -qq python3 python3-pip python3-venv git curl openjdk-17-jre-headless
         ;;
     rhel|centos|fedora|rocky|almalinux)
-        yum install -y python3 python3-pip git curl java-17-openjdk-headless
+        # See note above on --allowerasing.
+        yum install -y --allowerasing python3 python3-pip git curl java-17-openjdk-headless
         ;;
     *)
         error "Unsupported platform: ${PLATFORM}"
