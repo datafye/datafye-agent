@@ -59,6 +59,12 @@ variable "instance_type" {
   default = "t3.small"
 }
 
+variable "volume_size_gb" {
+  type        = number
+  default     = 32
+  description = "Boot volume size (GB) for both the bake instance AND the resulting AMI. Source AMI defaults to ~8GB which can't fit Java + Docker + Datafye CLI extract + agent code + samples; 32GB gives headroom for Docker images at runtime too."
+}
+
 variable "source_ami" {
   type        = string
   default     = "ami-007009ba912f34d31"   # RUMI_SERVICE_WORKER_AMI_V1 (per AwsProvisioner.java)
@@ -87,6 +93,26 @@ source "amazon-ebs" "agent_hosted" {
   # bump the version (each version produces a uniquely-named AMI).
   force_deregister      = true
   force_delete_snapshot = true
+
+  # Bake-time disk: temp instance gets volume_size_gb on /dev/xvda so the
+  # agent installer (Java + Docker + Datafye CLI extract + agent code +
+  # samples) doesn't run out of space during dnf install / tar extract.
+  launch_block_device_mappings {
+    device_name = "/dev/xvda"
+    volume_size = var.volume_size_gb
+    volume_type = "gp3"
+    delete_on_termination = true
+  }
+
+  # Runtime disk: instances launched from this AMI also get volume_size_gb
+  # so Docker images + workspace files have room. Without this, AMI volume
+  # size resets to the source AMI's default on every launch.
+  ami_block_device_mappings {
+    device_name = "/dev/xvda"
+    volume_size = var.volume_size_gb
+    volume_type = "gp3"
+    delete_on_termination = true
+  }
 
   tags = {
     Name         = "datafye-agent-amzn2023-x86_64-v${var.agent_version}"
