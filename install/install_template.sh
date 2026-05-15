@@ -362,13 +362,20 @@ install_docker_compose
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Directories and user..."
 mkdir -p "${INSTALL_DIR}"
-mkdir -p "${WORKSPACE_DIR}"
 mkdir -p "${DOCS_DIR}"
 mkdir -p "${SAMPLES_DIR}"
 
 if ! id -u datafye &>/dev/null; then
     useradd -u 1000 -m -d /home/datafye -s /bin/bash datafye
 fi
+# Create the workspace AFTER useradd so it's owned by datafye outright;
+# also force-chown /home/datafye in case an earlier install pass (or any
+# other step that mkdir's a path under it) had created the home dir as
+# root, which makes useradd -m skip the chown and leaves the home tree
+# unwritable by the datafye runtime user (Rumi CLI's local provisioner
+# fails to mkdir /home/datafye/.rumi when this happens).
+mkdir -p "${WORKSPACE_DIR}"
+chown datafye:datafye /home/datafye
 chown -R datafye:datafye "${WORKSPACE_DIR}"
 # Allow datafye user to run docker
 usermod -aG docker datafye 2>/dev/null || true
