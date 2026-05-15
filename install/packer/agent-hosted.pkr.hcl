@@ -144,6 +144,14 @@ build {
       "if [ -z \"$GITHUB_TOKEN\" ]; then echo 'ERROR: GITHUB_TOKEN is required (datafye-agent and datafye-docs are private)'; exit 1; fi",
       "echo 'Waiting for cloud-init to finish (Rumi worker AMIs may run on-boot setup)...'",
       "sudo cloud-init status --wait || true",
+      # Grow the root partition + filesystem to fill the launch_block_device_mappings
+      # volume. The Rumi Worker AMI's cloud-init doesn't do this automatically, so
+      # without an explicit grow the agent installer (Java + Docker + Datafye CLI
+      # extract + agent code) runs out of space at ~8GB of the 32GB volume.
+      "echo 'Pre-grow disk usage:'; df -h /",
+      "sudo growpart /dev/xvda 1 || echo '(growpart no-op — partition already at max)'",
+      "sudo xfs_growfs / 2>/dev/null || sudo resize2fs /dev/root 2>/dev/null || sudo resize2fs /dev/xvda1 2>/dev/null || echo '(filesystem already at max)'",
+      "echo 'Post-grow disk usage:'; df -h /",
       "echo 'Installing git...'",
       "sudo dnf install -y git",
       "echo \"Cloning datafye-agent branch $AGENT_BRANCH (private; using token)...\"",
