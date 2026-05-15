@@ -392,8 +392,15 @@ if is_snapshot "$VERSION"; then
 else
     info "[${STEP}/${TOTAL_STEPS}] Installing Datafye CLI v${VERSION}..."
     curl -fsSL "https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh" | bash
-    CLI_PATH="${CLI_BASE}/${VERSION}/bin/datafye"
-    ok "Datafye CLI: ${CLI_PATH}"
+    # The CLI installer drops files at ${CLI_BASE}/versions/datafye-cli-<v>/
+    # and maintains a ${CLI_BASE}/current symlink to the active version.
+    # Use the stable symlink so we don't have to track the bundle-name format.
+    CLI_PATH="${CLI_BASE}/current/bin/datafye"
+    if [ ! -x "${CLI_PATH}" ]; then
+        error "Datafye CLI not found at ${CLI_PATH} after install"
+        exit 1
+    fi
+    ok "Datafye CLI: ${CLI_PATH} -> $(readlink -f "${CLI_PATH}")"
 fi
 
 # ── Step: Install/update docs, samples, and agent source ─────────
