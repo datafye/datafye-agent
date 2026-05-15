@@ -164,7 +164,12 @@ build {
       "git clone --depth 1 -b \"$AGENT_BRANCH\" \"https://x-access-token:$${GITHUB_TOKEN}@github.com/datafye/datafye-agent.git\" /tmp/datafye-agent",
       "cd /tmp/datafye-agent/install",
       "echo \"Running install_template.sh --mode hosted --ami-cleanup --version $AGENT_VERSION...\"",
-      "sudo --preserve-env=GITHUB_TOKEN,TMPDIR ./install_template.sh --mode hosted --ami-cleanup --version \"$AGENT_VERSION\" --github-token \"$GITHUB_TOKEN\"",
+      # --agent-source seeds /opt/datafye/agent/app from /tmp/datafye-agent
+      # so the installer skips a github.com clone that would need a tag the
+      # TC VCS labeling step hasn't pushed yet. The installer rewrites origin
+      # to the canonical AGENT_REPO so the token-embedded URL doesn't end up
+      # in the AMI.
+      "sudo --preserve-env=GITHUB_TOKEN,TMPDIR ./install_template.sh --mode hosted --ami-cleanup --version \"$AGENT_VERSION\" --github-token \"$GITHUB_TOKEN\" --agent-source /tmp/datafye-agent",
       "echo 'Scrubbing /tmp/datafye-agent (its .git/config contains the token-embedded clone URL)...'",
       "sudo rm -rf /tmp/datafye-agent"
     ]

@@ -75,16 +75,18 @@ ok()    { echo -e "${GREEN}  ok: $*${RESET}"; }
 error() { echo -e "${RED}ERROR: $*${RESET}" >&2; }
 
 # ── Parse arguments ───────────────────────────────────────────────
+AGENT_SOURCE_DIR=""
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --mode)          MODE="$2"; shift 2 ;;
-        --dns)           DNS_NAME="$2"; shift 2 ;;
-        --anthropic-key) ANTHROPIC_API_KEY="$2"; shift 2 ;;
-        --version)       VERSION="$2"; VERSION_EXPLICIT=true; shift 2 ;;
-        --github-token)  GITHUB_TOKEN="$2"; shift 2 ;;
-        --force)         FORCE=true; shift ;;
-        --ami-cleanup)   AMI_CLEANUP=true; shift ;;
-        --port)          AGENT_PORT="$2"; shift 2 ;;
+        --mode)           MODE="$2"; shift 2 ;;
+        --dns)            DNS_NAME="$2"; shift 2 ;;
+        --anthropic-key)  ANTHROPIC_API_KEY="$2"; shift 2 ;;
+        --version)        VERSION="$2"; VERSION_EXPLICIT=true; shift 2 ;;
+        --github-token)   GITHUB_TOKEN="$2"; shift 2 ;;
+        --agent-source)   AGENT_SOURCE_DIR="$2"; shift 2 ;;
+        --force)          FORCE=true; shift ;;
+        --ami-cleanup)    AMI_CLEANUP=true; shift ;;
+        --port)           AGENT_PORT="$2"; shift 2 ;;
         -h|--help)
             cat <<EOF
 Datafye Agent Installer
@@ -104,6 +106,12 @@ Options:
                         disabled until the pin is cleared.
   --github-token <t>    GitHub token with read access to datafye-docs.
                         Required for SNAPSHOT installs (docs repo is private).
+  --agent-source <dir>  Skip the agent-source git clone and seed the agent
+                        directory from a local checkout. Intended for the
+                        AMI bake, where the build commit isn't yet tagged on
+                        the remote. The local checkout's remote URL is
+                        rewritten to the canonical AGENT_REPO so auto-upgrade
+                        keeps working.
   --force               Reinstall even if same version (useful for SNAPSHOT)
   --ami-cleanup         Clean up for AMI snapshot (clear keys, logs, history)
   --port <port>         Agent port (default: 18780)
@@ -429,7 +437,23 @@ fi
 clone_or_update_repo "${SAMPLES_REPO}" "${SAMPLES_DIR}" "${SAMPLES_REF}" "Samples"
 
 AGENT_CODE_DIR="${INSTALL_DIR}/app"
-clone_or_update_repo "${AGENT_CLONE_URL}" "${AGENT_CODE_DIR}" "${AGENT_REF}" "Agent"
+if [ -n "${AGENT_SOURCE_DIR}" ]; then
+    # AMI-bake path: the build commit isn't tagged on origin yet, so seed
+    # the agent directory from a local checkout. Rewrite the origin URL so
+    # post-install upgrades fetch from the canonical remote.
+    if [ ! -d "${AGENT_SOURCE_DIR}/.git" ]; then
+        error "Agent: --agent-source path is not a git repo: ${AGENT_SOURCE_DIR}"
+        exit 1
+    fi
+    info "Seeding agent source from local checkout: ${AGENT_SOURCE_DIR}"
+    rm -rf "${AGENT_CODE_DIR}"
+    mkdir -p "$(dirname "${AGENT_CODE_DIR}")"
+    cp -a "${AGENT_SOURCE_DIR}" "${AGENT_CODE_DIR}"
+    git -C "${AGENT_CODE_DIR}" remote set-url origin "${AGENT_REPO}"
+    ok "Agent: ${AGENT_CODE_DIR} (from ${AGENT_SOURCE_DIR}, $(git -C "${AGENT_CODE_DIR}" rev-parse --short HEAD))"
+else
+    clone_or_update_repo "${AGENT_CLONE_URL}" "${AGENT_CODE_DIR}" "${AGENT_REF}" "Agent"
+fi
 
 # ── Step: Install Python dependencies ────────────────────────────
 next_step
