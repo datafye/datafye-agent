@@ -332,9 +332,31 @@ install_docker() {
     ok "Docker installed: $(docker --version)"
 }
 
+# AL2023's docker package doesn't bundle the Compose v2 plugin, so install it
+# directly from the docker/compose release for the host architecture. The CLI
+# uses 'docker compose' for foundry local provisioning.
+install_docker_compose() {
+    if docker compose version &>/dev/null; then
+        ok "Docker Compose: $(docker compose version | head -1)"
+        return
+    fi
+    local version="v2.27.0"
+    local arch
+    arch=$(uname -m)
+    local plugin_dir="/usr/libexec/docker/cli-plugins"
+    info "Installing Docker Compose plugin ${version} (${arch})..."
+    mkdir -p "${plugin_dir}"
+    curl -fsSL --retry 3 \
+        "https://github.com/docker/compose/releases/download/${version}/docker-compose-linux-${arch}" \
+        -o "${plugin_dir}/docker-compose"
+    chmod +x "${plugin_dir}/docker-compose"
+    ok "Docker Compose: $(docker compose version | head -1)"
+}
+
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Docker (for Datafye environment containers)..."
 install_docker
+install_docker_compose
 
 # ── Step: Create directories and user ────────────────────────────
 next_step
