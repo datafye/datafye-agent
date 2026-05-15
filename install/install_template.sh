@@ -149,9 +149,9 @@ if is_snapshot "$VERSION"; then
     SAMPLES_REF="${SNAPSHOT_BRANCH}"
     DOCS_CLONE_URL="https://${GITHUB_TOKEN}@github.com/datafye/datafye-docs.git"
 else
-    DOCS_REF="v${VERSION}"
-    AGENT_REF="v${VERSION}"
-    SAMPLES_REF="v${VERSION}"
+    DOCS_REF="${VERSION}"
+    AGENT_REF="${VERSION}"
+    SAMPLES_REF="${VERSION}"
     DOCS_CLONE_URL=""   # not used for released versions
 fi
 
