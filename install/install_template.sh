@@ -257,12 +257,17 @@ next_step() { STEP=$((STEP + 1)); }
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Installing system dependencies..."
 
+# PYTHON_BIN is the interpreter used to create the agent's venv. The agent
+# requires Python >= 3.10 (claude-agent-sdk constraint). AL2023's default
+# python3 is 3.9, so install python3.11 there and pin PYTHON_BIN to it.
+PYTHON_BIN="python3"
 case $PLATFORM in
     amzn)
         # --allowerasing lets dnf swap curl-minimal (which AL2023 ships) for the
         # full curl package without aborting on the conflict. On AL2 (which has
         # full curl already), --allowerasing is a no-op.
-        yum install -y --allowerasing python3 python3-pip git curl java-17-amazon-corretto-headless
+        yum install -y --allowerasing python3.11 python3.11-pip git curl java-17-amazon-corretto-headless
+        PYTHON_BIN="python3.11"
         ;;
     ubuntu|debian)
         apt-get update -qq
@@ -270,7 +275,8 @@ case $PLATFORM in
         ;;
     rhel|centos|fedora|rocky|almalinux)
         # See note above on --allowerasing.
-        yum install -y --allowerasing python3 python3-pip git curl java-17-openjdk-headless
+        yum install -y --allowerasing python3.11 python3.11-pip git curl java-17-openjdk-headless
+        PYTHON_BIN="python3.11"
         ;;
     *)
         error "Unsupported platform: ${PLATFORM}"
@@ -287,7 +293,7 @@ if ! command -v mvn &> /dev/null; then
     ln -sf "/opt/apache-maven-${MAVEN_VERSION}/bin/mvn" /usr/local/bin/mvn
 fi
 
-ok "Python: $(python3 --version)"
+ok "Python: $(${PYTHON_BIN} --version) (${PYTHON_BIN})"
 ok "Java: $(java -version 2>&1 | head -1)"
 ok "Maven: $(mvn --version 2>/dev/null | head -1)"
 ok "Git: $(git --version)"
@@ -460,7 +466,7 @@ next_step
 info "[${STEP}/${TOTAL_STEPS}] Installing Python dependencies..."
 
 if [ ! -d "${VENV_DIR}" ]; then
-    python3 -m venv "${VENV_DIR}"
+    ${PYTHON_BIN} -m venv "${VENV_DIR}"
 fi
 "${VENV_DIR}/bin/pip" install --upgrade pip -q
 "${VENV_DIR}/bin/pip" install -r "${AGENT_CODE_DIR}/requirements.txt" -q
