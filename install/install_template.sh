@@ -385,13 +385,23 @@ else
 fi
 
 # ── Step: Install Claude Code CLI ────────────────────────────────
+# claude.ai/install.sh always lays files under the invoking user's
+# ~/.local (binary + supporting state), and the binary resolves its
+# install root at runtime — so a root install + /usr/local/bin symlink
+# would not work. Install as the datafye user (the runtime user) so
+# claude lands at /home/datafye/.local/{bin,share}/claude.
+CLAUDE_BIN="/home/datafye/.local/bin/claude"
 next_step
-info "[${STEP}/${TOTAL_STEPS}] Installing Claude Code CLI..."
-if command -v claude &> /dev/null; then
-    ok "Claude Code CLI already installed"
+info "[${STEP}/${TOTAL_STEPS}] Installing Claude Code CLI (as datafye user)..."
+if [ -x "${CLAUDE_BIN}" ]; then
+    ok "Claude Code CLI already installed: ${CLAUDE_BIN}"
 else
-    curl -fsSL https://claude.ai/install.sh | bash
-    ok "Claude Code CLI installed"
+    sudo -u datafye -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+    if [ ! -x "${CLAUDE_BIN}" ]; then
+        error "Claude CLI not found at ${CLAUDE_BIN} after install"
+        exit 1
+    fi
+    ok "Claude Code CLI: ${CLAUDE_BIN}"
 fi
 
 # ── Step: Install / validate Datafye CLI ─────────────────────────
@@ -571,6 +581,10 @@ Wants=docker.service
 [Service]
 Type=simple
 User=datafye
+# systemd does not source the user's .bashrc, so add the datafye user's
+# ~/.local/bin (where claude is installed) and /usr/local/bin (datafye
+# CLI symlink) explicitly. The default PATH otherwise omits both.
+Environment=PATH=/home/datafye/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=${ENV_FILE}
 ExecStart=${VENV_DIR}/bin/python ${AGENT_CODE_DIR}/main.py
 Restart=on-failure
