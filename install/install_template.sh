@@ -152,7 +152,16 @@ else
     DOCS_REF="${VERSION}"
     AGENT_REF="${VERSION}"
     SAMPLES_REF="${VERSION}"
-    DOCS_CLONE_URL=""   # not used for released versions
+    DOCS_CLONE_URL=""   # not used for released versions (docs come from the downloads tarball)
+fi
+
+# datafye-agent is currently a private repo. Build a token-embedded clone URL
+# so authenticated clones work; falls back to the anonymous URL once the repo
+# is made public (token-embedded form is harmless for public repos).
+if [ -n "${GITHUB_TOKEN}" ]; then
+    AGENT_CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/datafye/datafye-agent.git"
+else
+    AGENT_CLONE_URL="${AGENT_REPO}"
 fi
 
 # ── Detect existing installation ──────────────────────────────────
@@ -419,9 +428,8 @@ fi
 
 clone_or_update_repo "${SAMPLES_REPO}" "${SAMPLES_DIR}" "${SAMPLES_REF}" "Samples"
 
-# Agent source code (public repo)
 AGENT_CODE_DIR="${INSTALL_DIR}/app"
-clone_or_update_repo "${AGENT_REPO}" "${AGENT_CODE_DIR}" "${AGENT_REF}" "Agent"
+clone_or_update_repo "${AGENT_CLONE_URL}" "${AGENT_CODE_DIR}" "${AGENT_REF}" "Agent"
 
 # ── Step: Install Python dependencies ────────────────────────────
 next_step
