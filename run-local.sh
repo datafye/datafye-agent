@@ -37,6 +37,11 @@ export DATAFYE_AGENT_MODEL="${DATAFYE_AGENT_MODEL:-opus}"
 export DATAFYE_AGENT_USERNAME="${DATAFYE_AGENT_USERNAME:-local-dev}"
 export DATAFYE_AGENT_INSTANCE_ID="${DATAFYE_AGENT_INSTANCE_ID:-local-dev-instance}"
 
+# Where the agent fetches JWKS from to verify inbound JWTs. Production
+# defaults to https://accounts.datafye.io; for local dev point at a
+# locally-running accounts service so chat endpoint auth can be tested.
+export DATAFYE_AGENT_ACCOUNTS_URL="${DATAFYE_AGENT_ACCOUNTS_URL:-http://127.0.0.1:7779}"
+
 # Create workspace
 mkdir -p "${DATAFYE_AGENT_WORKSPACE}"
 

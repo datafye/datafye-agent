@@ -22,7 +22,7 @@ from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -33,6 +33,7 @@ from claude_agent_sdk import (
 )
 
 from prompt import build_system_prompt
+import auth
 import broker
 import credentials as credentials_module
 import identity
@@ -125,6 +126,18 @@ INTERNAL_TOOLS = [
 sessions: dict[str, str] = {}
 
 
+# -- Activity tracking (read by /health for accounts' idle monitor) ---
+# lastChatActivityAt: epoch ms of the most recent /v1/chat invocation. 0 = never.
+# runningJobs: count of in-flight chat streams. Incremented on stream start,
+#   decremented on stream completion (in tracked_stream_agent_response below).
+# activeProxiedApps: list of agent-managed app routes currently registered with
+#   the accounts service. Empty for v1 — placeholder for the future feature
+#   where the agent can stand up Jupyter etc. and ask accounts to proxy them.
+last_chat_activity_at: int = 0
+running_jobs: int = 0
+active_proxied_apps: list[str] = []
+
+
 # -- Request/Response Models ---------------------------------------
 
 class ChatRequest(BaseModel):
@@ -145,6 +158,10 @@ class HealthResponse(BaseModel):
     credentials: dict[str, bool]
     username: str
     credentials_generation: str
+    # Idle signals consumed by accounts' poll loop (Chunk 4):
+    last_chat_activity_at: int      # epoch ms; 0 if no chat yet
+    running_jobs: int               # count of in-flight chat streams
+    active_proxied_apps: list[str]  # always [] in v1
 
 
 class CredentialsUpdate(BaseModel):
@@ -165,6 +182,10 @@ class CredentialsUpdate(BaseModel):
 # instance_id seeds the credentials store's encryption key. Refuses to start
 # if neither IMDS (production) nor env vars (local dev) can resolve them.
 AGENT_IDENTITY = identity.bootstrap()
+
+# Auth uses the bootstrapped username to enforce JWT.sub == self.username
+# on every request that touches user-scoped surfaces.
+auth.configure(AGENT_IDENTITY.username)
 
 
 # -- Credential state (auto-persisting encrypted store) -------------
@@ -269,6 +290,27 @@ def truncate(text: str, limit: int = 150) -> str:
         return "<empty>"
     cleaned = text.replace("\n", "\\n").replace("\r", "")
     return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
+
+
+import time
+
+async def tracked_stream_agent_response(
+    message: str,
+    conversation_id: Optional[str],
+    algo_id: Optional[str],
+) -> AsyncIterator[str]:
+    """Wraps stream_agent_response with running_jobs + lastChatActivityAt
+    bookkeeping. Increments running_jobs at stream start, decrements at end
+    (even on error), so /health reports an accurate live-job count for
+    accounts' idle monitor."""
+    global last_chat_activity_at, running_jobs
+    last_chat_activity_at = int(time.time() * 1000)
+    running_jobs += 1
+    try:
+        async for event in stream_agent_response(message, conversation_id, algo_id):
+            yield event
+    finally:
+        running_jobs -= 1
 
 
 # -- Agent Streaming -----------------------------------------------
@@ -464,13 +506,20 @@ async def health():
         },
         username=AGENT_IDENTITY.username,
         credentials_generation=credentials.generation(),
+        last_chat_activity_at=last_chat_activity_at,
+        running_jobs=running_jobs,
+        active_proxied_apps=active_proxied_apps,
     )
 
 
-@app.post("/v1/chat")
+@app.post("/v1/chat", dependencies=[Depends(auth.require_self_jwt)])
 async def chat(request: ChatRequest):
     """
     Streaming chat endpoint using Server-Sent Events.
+
+    Requires a valid Bearer JWT issued by accounts whose `sub` matches this
+    agent's bootstrapped username. The browser sends the JWT it received
+    from accounts at sign-in.
 
     SSE Event Types:
     - init: Session initialized {session_id}
@@ -489,7 +538,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
     return StreamingResponse(
-        stream_agent_response(
+        tracked_stream_agent_response(
             message=request.message,
             conversation_id=request.conversation_id,
             algo_id=request.algo_id,
@@ -499,19 +548,50 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/v1/credentials")
-async def update_credentials(update: CredentialsUpdate):
-    """Update user credentials at runtime (called from frontend settings).
-    Pydantic's CredentialsUpdate model is the schema; any field defined there
-    is a valid credential. Writes auto-persist via the encrypted store."""
-    payload = update.model_dump(exclude_none=True)
-    credentials.update(payload)
-    logger.info(f"Credentials updated: {list(payload.keys())}")
-    return {"updated": list(payload.keys())}
+async def update_credentials_deprecated(update: CredentialsUpdate):
+    """REMOVED — direct credential writes from the frontend are no longer
+    supported. The frontend now calls accounts (PUT /accounts/{username}/
+    credentials/{provider}); accounts then pushes the new value to this
+    agent via POST /v1/credentials/update.
+    Returns 410 Gone with a pointer message so any lingering caller fails
+    loudly rather than silently writing values that get clobbered by the
+    next push from accounts."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Direct credential writes are no longer accepted. Send credential "
+            "updates to the accounts service (PUT /accounts/{username}/"
+            "credentials/{provider}); accounts will push them here."
+        ),
+    )
 
 
-@app.get("/v1/credentials/status")
+class CredentialUpdate(BaseModel):
+    """Single-credential push from the accounts service."""
+    provider: str   # e.g. "massive_api_key", "palpha_api_key", "github_token", "connecttrade_user_secret"
+    value: str
+
+
+@app.post("/v1/credentials/update", status_code=204)
+async def push_credential(update: CredentialUpdate):
+    """Push a single credential value from accounts.
+
+    No JWT required for v1 — the only effect is updating a cache value
+    (no privilege escalation), and the accounts -> agent direction is
+    constrained by the jump server's routing (only accounts can reach
+    this URL in production). Hardenable later by requiring an
+    accounts-signed JWT here too.
+
+    The credentials store auto-persists on __setitem__, so this is a
+    single dict assignment + an encrypted disk write."""
+    credentials[update.provider] = update.value
+    logger.info(f"Credential pushed: {update.provider} (generation={credentials.generation()})")
+
+
+@app.get("/v1/credentials/status", dependencies=[Depends(auth.require_self_jwt)])
 async def credentials_status():
-    """Check which credentials are configured."""
+    """Check which credentials are configured. JWT-protected so a leaked
+    sandbox URL can't be probed for which integrations are wired up."""
     return {
         "massive": bool(credentials.get("massive_api_key")),
         "precision_alpha": bool(credentials.get("palpha_api_key")),

@@ -28,8 +28,10 @@ import uuid
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+import auth
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +154,9 @@ class ConnectRequest(BaseModel):
 
 
 # -- Routes --------------------------------------------------------
-router = APIRouter(prefix="/v1/broker", tags=["broker"])
+# All /v1/broker/* routes require a valid Bearer JWT issued by accounts
+# whose `sub` claim matches this agent's bootstrapped username.
+router = APIRouter(prefix="/v1/broker", tags=["broker"], dependencies=[Depends(auth.require_self_jwt)])
 
 
 @router.get("/brokers")
