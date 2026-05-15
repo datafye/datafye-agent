@@ -65,6 +65,12 @@ variable "source_ami" {
   description = "Source AMI to bake on top of. Defaults to the Rumi Service Worker AMI v1; bump when AwsProvisioner advances RUMI_SERVICE_WORKER_AMI_LATEST."
 }
 
+variable "agent_branch" {
+  type        = string
+  default     = "2.0"
+  description = "Branch of the datafye-agent repo to clone for the bake. Defaults to 2.0 (the active development branch); GitHub's default branch (main) is currently a stale pre-2.0 snapshot."
+}
+
 # ── Source ───────────────────────────────────────────────────────────────
 
 source "amazon-ebs" "agent_hosted" {
@@ -105,6 +111,7 @@ build {
     environment_vars = [
       "GITHUB_TOKEN=${var.github_token}",
       "AGENT_VERSION=${var.agent_version}",
+      "AGENT_BRANCH=${var.agent_branch}",
     ]
     inline = [
       "set -e",
@@ -113,8 +120,8 @@ build {
       "sudo cloud-init status --wait || true",
       "echo 'Installing git...'",
       "sudo dnf install -y git",
-      "echo 'Cloning datafye-agent (private; using token)...'",
-      "git clone --depth 1 \"https://x-access-token:$${GITHUB_TOKEN}@github.com/datafye/datafye-agent.git\" /tmp/datafye-agent",
+      "echo \"Cloning datafye-agent branch $AGENT_BRANCH (private; using token)...\"",
+      "git clone --depth 1 -b \"$AGENT_BRANCH\" \"https://x-access-token:$${GITHUB_TOKEN}@github.com/datafye/datafye-agent.git\" /tmp/datafye-agent",
       "cd /tmp/datafye-agent/install",
       "echo \"Running install_template.sh --mode hosted --ami-cleanup --version $AGENT_VERSION...\"",
       "sudo --preserve-env=GITHUB_TOKEN ./install_template.sh --mode hosted --ami-cleanup --version \"$AGENT_VERSION\" --github-token \"$GITHUB_TOKEN\"",
