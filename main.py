@@ -22,6 +22,7 @@ from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -42,8 +43,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # -- Configuration from environment --------------------------------
-# All env vars use DATAFYE_AGENT_ prefix for consistency
-ANTHROPIC_API_KEY = os.getenv("DATAFYE_AGENT_ANTHROPIC_API_KEY")
+# All env vars use DATAFYE_AGENT_ prefix for consistency.
+#
+# The Anthropic API key is NOT read here — it is a credential, held in the
+# encrypted credentials store and delivered by accounts (platform key) or
+# entered by the user (BYO key). _apply_anthropic_key() syncs it into
+# os.environ["ANTHROPIC_API_KEY"] so the Claude Agent SDK subprocess picks
+# it up. DATAFYE_AGENT_ANTHROPIC_API_KEY still works as a local-dev seed
+# (see _credential_env_seed()).
 CLAUDE_MODEL = os.getenv("DATAFYE_AGENT_MODEL", "opus")
 PORT = int(os.getenv("DATAFYE_AGENT_PORT", "18780"))
 ALLOWED_ORIGINS = os.getenv("DATAFYE_AGENT_ALLOWED_ORIGINS", "*").split(",")
@@ -150,7 +157,8 @@ class HealthResponse(BaseModel):
     """Response model for health endpoint."""
     status: str
     bootstrapped: bool              # False until the accounts bootstrap push lands
-    configured: bool
+    configured: bool                # an Anthropic key is set (any non-"missing" status)
+    anthropic_key_status: str       # missing | ok | invalid | unvalidated
     workspace: str
     docs_available: bool
     cli_available: bool
@@ -190,11 +198,20 @@ AGENT_USERNAME: Optional[str] = None
 credentials: Optional[credentials_module.CredentialsStore] = None
 _bootstrapped: bool = False
 
+# Anthropic key status, surfaced on /health and checked by /v1/chat:
+#   "missing"     — no key configured; chat unavailable
+#   "ok"          — validated against the Anthropic API
+#   "invalid"     — the Anthropic API rejected the key
+#   "unvalidated" — a key is set but validation couldn't be confirmed
+#                   (network blip); chat proceeds optimistically
+anthropic_key_status: str = "missing"
+
 
 def _credential_env_seed() -> dict:
     """Legacy env-var credential seed, applied only when a store is created
     fresh (local dev). In production, accounts pushes credentials."""
     return {
+        "anthropic_api_key": os.getenv("DATAFYE_AGENT_ANTHROPIC_API_KEY", ""),
         "massive_api_key": MASSIVE_API_KEY,
         "palpha_api_key": PALPHA_API_KEY,
         "hwai_api_key": HWAI_API_KEY,
@@ -205,6 +222,44 @@ def _credential_env_seed() -> dict:
         "github_user": GITHUB_USER,
         "github_token": GITHUB_TOKEN,
     }
+
+
+def _validate_anthropic_key(key: str) -> str:
+    """Quick liveness check of an Anthropic API key against the Anthropic
+    API. Returns "ok", "invalid", or "unvalidated" (the network couldn't
+    confirm — the caller treats that as a soft pass)."""
+    try:
+        resp = httpx.get(
+            "https://api.anthropic.com/v1/models",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+            timeout=5.0,
+        )
+    except httpx.HTTPError as e:
+        logger.warning("Anthropic key validation could not reach the API: %s", e)
+        return "unvalidated"
+    if resp.status_code == 200:
+        return "ok"
+    if resp.status_code in (401, 403):
+        return "invalid"
+    logger.warning("Anthropic key validation got unexpected HTTP %s", resp.status_code)
+    return "unvalidated"
+
+
+def _apply_anthropic_key() -> None:
+    """Sync the Anthropic key from the credentials store into the process
+    environment — the Claude Agent SDK subprocess inherits os.environ — and
+    validate it. Updates anthropic_key_status. Called after bootstrap and
+    after any credentials push that touches the Anthropic key."""
+    global anthropic_key_status
+    key = credentials.get("anthropic_api_key") if credentials else None
+    if not key:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        anthropic_key_status = "missing"
+        logger.warning("Anthropic API key not configured — chat is unavailable until one is set")
+        return
+    os.environ["ANTHROPIC_API_KEY"] = key
+    anthropic_key_status = _validate_anthropic_key(key)
+    logger.info("Anthropic API key applied (status=%s)", anthropic_key_status)
 
 
 def build_mcp_config() -> tuple[dict, list[str]]:
@@ -319,6 +374,7 @@ async def stream_agent_response(
     algo_id: Optional[str],
 ) -> AsyncIterator[str]:
     """Stream responses from Claude Agent SDK with structured SSE events."""
+    global anthropic_key_status
 
     mcp_servers, allowed_tools = build_mcp_config()
     system_prompt = build_system_prompt(
@@ -419,6 +475,10 @@ async def stream_agent_response(
         yield sse_event('done', {})
 
     except Exception as e:
+        emsg = str(e).lower()
+        if any(s in emsg for s in ("x-api-key", "authentication_error", "invalid api key", "401 unauthorized")):
+            anthropic_key_status = "invalid"
+            logger.warning("Anthropic call failed authentication — marking key invalid")
         logger.error(f"Agent error: {e}", exc_info=True)
         yield sse_event('error', {
             'message': str(e),
@@ -436,7 +496,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Workspace: {WORKSPACE_DIR}")
     logger.info(f"  Docs dir: {DOCS_DIR}")
     logger.info(f"  CLI path: {CLI_PATH}")
-    logger.info(f"  API key configured: {'yes' if ANTHROPIC_API_KEY else 'no'}")
+    logger.info("  Awaiting accounts bootstrap (identity, credentials, Anthropic key)")
 
     docs_available = os.path.isdir(DOCS_DIR)
     samples_available = os.path.isdir(SAMPLES_DIR)
@@ -501,7 +561,8 @@ async def health():
     return HealthResponse(
         status="healthy",
         bootstrapped=_bootstrapped,
-        configured=bool(ANTHROPIC_API_KEY),
+        configured=(anthropic_key_status != "missing"),
+        anthropic_key_status=anthropic_key_status,
         workspace=WORKSPACE_DIR,
         docs_available=os.path.isdir(DOCS_DIR),
         cli_available=shutil.which(CLI_PATH) is not None,
@@ -569,9 +630,10 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
         logger.error("Bootstrap failed opening credentials store: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not open credentials store: {e}")
     broker.configure(credentials)
+    _apply_anthropic_key()
     _bootstrapped = True
-    logger.info("Bootstrapped: username=%s (credentials generation=%s)",
-                user_id, credentials.generation())
+    logger.info("Bootstrapped: username=%s (credentials generation=%s, anthropic=%s)",
+                user_id, credentials.generation(), anthropic_key_status)
     return {"bootstrapped": True, "username": user_id}
 
 
@@ -597,8 +659,16 @@ async def chat(request: ChatRequest):
     - error: Error {message, error_type}
     - done: Stream complete {}
     """
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+    if anthropic_key_status == "missing":
+        raise HTTPException(
+            status_code=503,
+            detail="Anthropic API key is not configured for this agent",
+        )
+    if anthropic_key_status == "invalid":
+        raise HTTPException(
+            status_code=502,
+            detail="The configured Anthropic API key is invalid",
+        )
 
     return StreamingResponse(
         tracked_stream_agent_response(
@@ -650,6 +720,10 @@ async def push_credential(update: CredentialUpdate):
     single dict assignment + an encrypted disk write."""
     credentials[update.provider] = update.value
     logger.info(f"Credential pushed: {update.provider} (generation={credentials.generation()})")
+    # The Anthropic key drives chat availability — re-sync it into the
+    # process env and re-validate so /health reflects the new value.
+    if update.provider == "anthropic_api_key":
+        _apply_anthropic_key()
 
 
 @app.get("/v1/credentials/status",
