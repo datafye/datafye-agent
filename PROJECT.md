@@ -34,6 +34,14 @@ At the heart of this service is the Claude Agent SDK's `query()` function. It's 
 
 The SDK gives Claude access to tools — file operations (Read, Write, Edit), shell execution (Bash), search (Glob, Grep), and planning tools. We add the Datafye-specific capabilities through the system prompt and the Bash tool: the agent can run `datafye foundry local provision`, `curl` the REST API, execute Python scripts, and manage git repos.
 
+### The Anthropic Key Is a Credential, Not a Setting
+
+It would be tempting to treat the Anthropic API key as plumbing — a startup env var, set once, assumed present. We deliberately don't. The key is just another **credential**: it lives in the same encrypted credentials store as the user's data-provider keys, under `anthropic_api_key`, and it arrives through the same accounts push channel as everything else.
+
+The Claude Agent SDK runs Claude in a subprocess and that subprocess reads `ANTHROPIC_API_KEY` from the environment. So whenever the key changes — at bootstrap, or on a later credentials push — `_apply_anthropic_key()` syncs the stored value into `os.environ["ANTHROPIC_API_KEY"]` and then validates it against the Anthropic API. The agent tracks `anthropic_key_status` — one of `missing`, `ok`, `invalid`, or `unvalidated` (a network blip the agent treats as a soft pass) — and reports it on `/health`.
+
+The payoff is that the agent **starts and stays manageable with no Anthropic key at all**. It can be bootstrapped, accept credential pushes, answer health probes — everything except chat. `/v1/chat` returns 503 when the key is missing and 502 when it's invalid, so the frontend can show a precise "add an Anthropic key" message instead of the agent failing to boot or crashing mid-stream. This matters because a sandbox might be provisioned before the user has chosen a billing plan or entered a bring-your-own key.
+
 ### The System Prompt
 
 The system prompt (in `prompt.py`) is assembled at runtime from the current state:
@@ -48,12 +56,25 @@ This means the agent always knows what it can and can't do. If the user hasn't c
 
 The Claude Agent SDK supports session resumption. When a user sends a message, we check if there's an existing session for their conversation. If so, we resume it — Claude remembers the entire conversation history, what files it created, what environments are running. This is critical for algo development where a single strategy might take dozens of back-and-forth exchanges to refine.
 
+### Bootstrap: How the Agent Learns Who It Is
+
+A freshly-launched agent is a blank slate. It doesn't know its username, it doesn't have the key to decrypt its own credentials, and it has no Anthropic key to talk to Claude. So it doesn't pretend otherwise — it boots into an **awaiting-bootstrap** holding state. In that state exactly two endpoints answer: `GET /health` (so accounts can see it's alive and not yet bootstrapped) and `POST /bootstrap`. Every user-facing endpoint returns HTTP 503, enforced by a single `require_bootstrapped` FastAPI dependency. Nothing runs against a `None` identity.
+
+The accounts service drives it out of that state. Once the instance is reachable, accounts calls `POST /bootstrap` with an **accounts-signed JWT** in the `Authorization: Bearer` header (`purpose=agent-bootstrap`, verified against the accounts JWKS). The token carries two claims:
+
+- `user_id` — the agent's identity from this moment on.
+- `creds_key` — the Fernet key for the encrypted credentials store. It is `base64url(HMAC-SHA256(K_master, username))`, where `K_master` is an accounts-side secret the agent never sees. The agent receives the *derived* key, not the master secret.
+
+The handler configures auth, opens the credentials store with `creds_key`, syncs the Anthropic key, and leaves the holding state. It's idempotent for the same user — accounts re-pushes after a restart and the agent just re-binds to the same identity — but a bootstrap for a *different* user is rejected with a 409. An agent is one user's agent for life.
+
+Why a push instead of the agent reading its own EC2 `Name` tag from instance metadata (the old model)? Two reasons. First, it keeps accounts as the single source of truth — the same design principle that runs through the whole sandbox plane: the agent *receives*, it never *asks*. Second, it lets accounts hand the agent its credentials-store key without that key ever being derivable from anything on the instance itself. A leaked EBS snapshot is just an encrypted blob; the key lives only in accounts and in the running process's memory.
+
 ### Credentials Management
 
-User credentials (data provider API keys, broker credentials) flow through in two ways:
+User credentials (data provider API keys, broker credentials, and the Anthropic key itself) live in an encrypted on-disk store, opened at bootstrap with the delivered `creds_key`. Updates flow through one channel:
 
-1. **At launch**: Environment variables set when the user's instance starts
-2. **At runtime**: The frontend's Settings modal calls `POST /v1/credentials` to update keys without restarting the service
+- **The accounts push**: The frontend's Settings modal writes to the accounts service; accounts then pushes each changed value to the agent via `POST /v1/credentials/update` (body `{provider, value}`). The store auto-persists on write. The old direct-write `POST /v1/credentials` endpoint is gone — it returns 410 Gone with a pointer to accounts, so any stale caller fails loudly instead of writing values the next push would clobber.
+- **Local-dev seed**: For local development, env vars (`DATAFYE_AGENT_*`) seed the store the first time it is created. In production the store starts empty and accounts fills it in.
 
 The agent's system prompt is rebuilt on every chat request, so credential changes are immediately reflected in what the agent tells the user it can do.
 
@@ -172,59 +193,51 @@ Two surprises from wiring up the broker module that are worth writing down so th
 The agent runs **natively** on the host (not in a Docker container). This was a deliberate decision — the agent uses the Datafye CLI to spin up Datafye environment containers via Docker, and Docker-in-Docker is painful. Since the whole instance is dedicated to one user, there's no isolation benefit from containerizing the agent. The AMI is the packaging.
 
 Two deployment modes:
-- **Hosted**: Pre-baked AMI in a Rumi private cloud. Each user gets a sandbox instance at `{username}.app.datafye.io`, proxied through a jump server with wildcard SSL. Managed by the datafye-accounts service (elastic stop/start based on activity).
-- **Standalone (Marketplace)**: Minimal AMI with a first-boot script. User provides their Anthropic key and DNS via EC2 user data. Everything downloads and installs on first boot.
+- **Hosted**: Pre-baked AMI in a Rumi private cloud. Each user gets a sandbox instance at `{username}.app.datafye.io`, proxied through a jump server with wildcard SSL. Managed by the datafye-accounts service (elastic stop/start based on activity). The AMI carries no user-specific data — identity, credentials, and the Anthropic key are all delivered at runtime by accounts over HTTP (`POST /bootstrap` and `POST /v1/credentials/update`).
+- **Standalone (Marketplace)**: Minimal AMI with a first-boot script. User provides DNS via EC2 user data; everything downloads and installs on first boot.
 
 The agent source is open source — the value is in the Datafye platform, not the glue code. Power users can fork and customize the prompt, add tools, tweak behavior.
 
-## What's Next — Receive-Only Integration with `datafye-accounts`
+## Receive-Only Integration with `datafye-accounts`
 
-The next phase moves the agent from "standalone process the user configures by hand" to "receive-only worker in the Datafye sandbox plane." The design was settled in the 2026-05-13 design session; this section captures it.
+The agent is a **receive-only worker** in the Datafye sandbox plane. The shape of its role: it **receives** credentials and JWTs, it **does** work, it never **asks** accounts for anything. Accounts is the only writer in the relationship. This section captures how that integration is wired.
 
-The shape of the agent's role contracts: it **receives** credentials and JWTs, it **does** work, it never **asks** accounts for anything. Accounts is the only writer in the relationship.
+### Identity bootstrap — by push, not by metadata
 
-### Thing 1: Identity bootstrap from IMDS
+An earlier design had the agent read its own EC2 `Name` tag from the Instance Metadata Service at startup and derive its credentials-store key from the EC2 instance ID. That was scrapped. The agent no longer touches AWS metadata at all — there is no `identity.py`.
 
-At process startup, the agent reads its EC2 `Name` tag via Instance Metadata Service:
+Instead, identity arrives by **push** (see [Bootstrap: How the Agent Learns Who It Is](#bootstrap-how-the-agent-learns-who-it-is) above). Accounts calls `POST /bootstrap` with a signed JWT carrying `user_id` and `creds_key`. The agent has zero identity until that call lands.
 
-```python
-# pseudo
-name_tag = read_imds("/meta-data/tags/instance/Name")        # e.g. "agents-u123456"
-username = name_tag.removeprefix("agents-")                  # "u123456"
-```
+The push model is strictly better than reading IMDS:
 
-The agent stores this on its global state and refuses to start if the tag is missing. The username is the single piece of identity the agent has — no secrets, no shared keys, just a tag that the AwsProvisioner sets at launch time. `AwsProvisioner.launchServiceInstance` always tags the instance with `Name=<instanceName>`, so as long as the provisioner is invoked with `instanceName == username`, the agent picks up its identity from AWS itself.
+- **The credentials-store key never lives on the instance.** With the old instance-ID-derived key, anyone with the instance ID could reconstruct the key. The new key is `HMAC-SHA256(K_master, username)` — `K_master` is an accounts-side secret, so the key is *only* derivable inside accounts. The agent gets the finished key over an authenticated channel and holds it in memory.
+- **No "refuse to start" failure mode.** The old agent crashed if the `Name` tag was missing. The new agent always starts; if no bootstrap has arrived it simply sits in the holding state answering `/health` — which is exactly what accounts needs in order to know it should push.
+- **One trust anchor.** Identity, the credentials-store key, and every later credential all flow through the same accounts-signed channel. There's no second mechanism (IMDS) to reason about or secure.
 
-### Thing 2: Encrypted on-disk credentials store
+### Encrypted on-disk credentials store
 
-The agent doesn't have a Rumi store (it's Python/FastAPI, not a Rumi application). Credentials live in a single binary file with light encryption:
+The agent doesn't have a Rumi store (it's Python/FastAPI, not a Rumi application). Credentials live in a single binary file:
 
 - Path: `~/.datafye/agent/credentials.bin` (mode 0600)
 - Format: msgpack
-- Encryption: `cryptography.fernet`. Key derived deterministically from the EC2 instance ID (`sha256("datafye-agent-creds-v1::" + instance_id)`, base64-urlsafe-encoded). The instance ID comes from IMDS — same call as the identity bootstrap. No key persisted to disk; the key is reconstructable on every agent restart.
-- Threat model: defends against casual file inspection and against leaked EBS snapshots (snapshot doesn't contain the instance ID, so key can't be derived offline). Does not defend against an attacker who has shell on the running instance — at that point they can read IMDS anyway. That's acceptable; encryption-at-rest is one layer of many.
-- Replaces today's `~/.datafye/agent/broker_user.json` plain-JSON file. Existing ConnectTrade user creds fold into this same store as one of the providers.
-- Compute a `credentialsGeneration` UUID (deterministic hash of contents) on load and on update; expose in `/health`.
+- Encryption: `cryptography.fernet`. The Fernet key is the `creds_key` delivered in the bootstrap push — `base64url(HMAC-SHA256(K_master, username))`. It is held in memory only and never persisted to disk.
+- Threat model: defends against casual filesystem inspection and against leaked EBS snapshots (the snapshot is an opaque encrypted blob; the key isn't on it and can't be derived from it). Does not defend against an attacker with shell on the running instance — at that point they can read process memory anyway. That's acceptable; encryption-at-rest is one layer of many.
+- Replaces the old `~/.datafye/agent/broker_user.json` plain-JSON file. On first load the store migrates any existing ConnectTrade user creds out of that file and deletes it.
+- A `generation` value (a short deterministic hash of the contents) is computed on load and on every write, and exposed in `/health`.
 
-### Thing 3: Endpoint changes
+### Endpoint shape
 
-- **New: `POST /v1/credentials/update`** — body `{ provider, value }`. Accounts-only push. Updates in-memory cache + persists to `credentials.bin` atomically. Returns 204.
-- **Update `GET /health`** to include: `credentialsGeneration`, `lastChatActivityAt`, `runningJobs`, `activeProxiedApps`. Accounts polls this for both idle detection and cache-loss recovery (if `credentialsGeneration` differs from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section).
-- **Remove the existing direct-write `POST /v1/credentials`** (or repurpose to return 410 Gone with a "use accounts" message). The frontend stops writing credentials directly to the agent in the new model — all writes go through accounts.
-- **JWT validation middleware** on `/v1/chat`, `/v1/broker/*`. Verify accounts-signed JWT against accounts' JWKS, check `sub == self.username`. Reject otherwise.
+- **`POST /bootstrap`** — accounts-only. Establishes identity + credentials-store key from a signed JWT. Idempotent for the same user, 409 on rebind.
+- **`POST /v1/credentials/update`** — accounts-only push, body `{provider, value}`. Updates the in-memory store and persists to `credentials.bin` atomically. Returns 204. A push to `anthropic_api_key` also re-syncs and re-validates the Anthropic key.
+- **`GET /health`** — reports `bootstrapped`, `anthropic_key_status`, `credentials_generation`, `last_chat_activity_at`, `running_jobs`, `active_proxied_apps`. `username` and `credentials_generation` are `null` until bootstrapped. Accounts polls this for idle detection and cache-loss recovery (if `credentials_generation` drifts from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section).
+- **`POST /v1/credentials`** — removed; returns 410 Gone. The frontend no longer writes credentials directly to the agent; all writes go through accounts.
+- **JWT validation** on `/v1/chat`, `/v1/credentials/status`, and `/v1/broker/*`: verify the accounts-signed JWT against accounts' JWKS and check `sub == the agent's bootstrapped username`. Reject otherwise.
 
 ### Why this shape
 
-- **No agent → accounts calls** means no shared secret to bootstrap, no IAM-signing layer, no fallback mode when JWTs aren't available. Background tasks use the cached credentials, which are kept fresh by accounts' push + the generation-counter recovery mechanism.
-- **The agent never sees its own credentials before they're pushed.** Even on first boot, the agent has an empty cache until accounts (driven by the user's Settings activity) pushes values in. That's by design — accounts is the source of truth.
+- **No agent → accounts calls** means no shared secret to bootstrap a request, no IAM-signing layer, no fallback mode when JWTs aren't available. Background tasks use the cached credentials, kept fresh by accounts' push plus the generation-counter recovery mechanism.
+- **The agent never sees its own credentials before they're pushed.** Even on first boot the store is empty until accounts (driven by the user's Settings activity) pushes values in. That's by design — accounts is the source of truth.
 - **No "stale cache + no user connected" race.** Credentials only change when the user takes action; the user is by definition online during that action; the push lands on the live agent before the user disconnects.
-
-### Implementation order
-
-| Order | Item |
-|---|---|
-| 1 | Thing 1 (IMDS identity) + Thing 2 (credentials store) — can be tested against the existing `gkumar74` sandbox by manually setting the `Name` tag and bootstrapping a few credentials. |
-| 2 | Thing 3 (new endpoint + health changes + JWT middleware) — requires accounts to be able to push, so this lands after `datafye-accounts` Chunks 1 + 4. |
 
 ### Smaller follow-ups already on the list
 

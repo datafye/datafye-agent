@@ -36,14 +36,16 @@ datafye-agent/
 # Install dependencies
 pip install -r requirements.txt
 
-# Required environment variables
-export DATAFYE_AGENT_ANTHROPIC_API_KEY="sk-ant-..."
+# Path environment variables
 export DATAFYE_AGENT_DOCS_DIR="/path/to/datafye-docs"
 export DATAFYE_AGENT_CLI_PATH="/path/to/datafye"
 export DATAFYE_AGENT_WORKSPACE="/path/to/workspace"
 export DATAFYE_AGENT_SAMPLES_DIR="/path/to/datafye-samples"
 
-# Optional: user credentials
+# Local-dev credential seed (production delivers these as credentials).
+# These are folded into the encrypted credentials store the first time it
+# is created — see _credential_env_seed() in main.py.
+export DATAFYE_AGENT_ANTHROPIC_API_KEY="sk-ant-..."
 export DATAFYE_AGENT_MASSIVE_API_KEY="..."
 export DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID="..."
 # ... etc
@@ -54,6 +56,12 @@ python main.py
 
 Service starts on port 18780 by default (`DATAFYE_AGENT_PORT`).
 
+The agent boots into an **awaiting-bootstrap** holding state — only `GET /health`
+and `POST /bootstrap` respond; every user-facing endpoint returns HTTP 503. The
+accounts service drives it out of that state by pushing an accounts-signed
+bootstrap JWT (see [API Endpoints](#api-endpoints) below). For local testing you
+mint a bootstrap token yourself and `POST /bootstrap` it.
+
 ## Deployment
 
 The agent runs **natively** on the host (not in a Docker container). Docker is installed on the instance for Datafye environment containers that the agent manages via the CLI.
@@ -62,7 +70,7 @@ The agent runs **natively** on the host (not in a Docker container). Docker is i
 
 | Mode | Use Case | What's on the Instance |
 |------|----------|----------------------|
-| `hosted` | Rumi cloud sandbox (managed by accounts service) | Agent, CLI, docs, samples pre-installed. No nginx/SSL (jump server proxies). |
+| `hosted` | Rumi cloud sandbox (managed by accounts service) | Agent, CLI, docs, samples pre-installed. No nginx/SSL (jump server proxies). Identity, credentials and the Anthropic key are delivered by the accounts service over HTTP (`POST /bootstrap`) — nothing user-specific is baked into the AMI. |
 | `standalone` | AWS Marketplace / DIY | First-boot script only. Downloads and installs everything on first boot from user data. Includes nginx + SSL. |
 
 ### Installer
@@ -109,14 +117,20 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check with credential status |
-| `/v1/chat` | POST | SSE streaming chat with agent |
-| `/v1/credentials` | POST | Update user credentials at runtime |
-| `/v1/credentials/status` | GET | Check which credentials are configured |
+| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals. Always available, including before bootstrap |
+| `/bootstrap` | POST | Accounts-only. Bootstrap the agent's identity + credentials-store key from an accounts-signed JWT (`Authorization: Bearer`, `purpose=agent-bootstrap`). Idempotent for the same user; 409 on rebind |
+| `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
+| `/v1/credentials` | POST | REMOVED — returns 410 Gone; credential writes go through the accounts service |
+| `/v1/credentials/update` | POST | Accounts-only. Push a single credential `{provider, value}` into the encrypted store; 204 |
+| `/v1/credentials/status` | GET | Check which credentials are configured (JWT-protected) |
 | `/v1/broker/brokers` | GET | List brokers Datafye supports (StocksBroker enum) |
 | `/v1/broker/connections` | GET | List the user's brokerage connections with linked accounts |
 | `/v1/broker/connections` | POST | Create a ConnectTrade OAuth URL for a chosen broker; body `{type, broker}` |
 | `/v1/broker/connections/{id}` | DELETE | Revoke a brokerage connection |
+
+Every endpoint except `/health` and `/bootstrap` is gated by the
+`require_bootstrapped` dependency and returns 503 until the accounts bootstrap
+push lands.
 
 ## SSE Event Types
 
@@ -138,7 +152,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATAFYE_AGENT_ANTHROPIC_API_KEY` | Required | Anthropic API key |
+| `DATAFYE_AGENT_ANTHROPIC_API_KEY` | - | Local-dev seed only. The Anthropic key is a *credential* — in production it lives in the encrypted credentials store and is delivered by accounts via `/v1/credentials/update`. This env var only seeds the store the first time it is created |
 | `DATAFYE_AGENT_MODEL` | `opus` | Claude model |
 | `DATAFYE_AGENT_PORT` | `18780` | HTTP port |
 | `DATAFYE_AGENT_WORKSPACE` | `/home/datafye/workspace` | User workspace directory |
@@ -167,7 +181,9 @@ sudo ./install.sh --mode hosted --ami-cleanup
 - **Per-user instances**: Each user gets their own agent process (not shared)
 - **Open source agent**: Agent source is public on GitHub — the value is in the Datafye platform, not the glue code
 - **Local docs over MCP**: Datafye docs are on disk, not via a docs MCP server - faster and more reliable
-- **Credentials at runtime**: Frontend can update credentials via `/v1/credentials` without restarting
+- **Push bootstrap**: The agent learns its identity and its credentials-store encryption key from an accounts-signed JWT pushed to `POST /bootstrap` — it never reads AWS instance metadata. Accounts is the only writer in the relationship
+- **Anthropic key as a credential**: The Anthropic key is not a startup env var; it lives in the encrypted credentials store and is delivered via the credentials push channel. The agent starts and stays manageable with no key — chat just returns 503/502 until a valid key arrives
+- **Credentials via accounts**: The accounts service pushes credential updates to `/v1/credentials/update`; the old direct-write `/v1/credentials` endpoint is gone
 - **Python-only algos**: No SDK/Java algos - all strategies are pure Python using REST/WebSocket APIs
 - **Conversational config**: Datasets, schemas, and environments are configured through chat, not forms
 
