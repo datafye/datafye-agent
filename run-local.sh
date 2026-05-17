@@ -30,12 +30,10 @@ export DATAFYE_AGENT_CLI_PATH="${DATAFYE_AGENT_CLI_PATH:-datafye}"
 export DATAFYE_AGENT_PORT="${DATAFYE_AGENT_PORT:-18780}"
 export DATAFYE_AGENT_MODEL="${DATAFYE_AGENT_MODEL:-opus}"
 
-# Identity: production reads these from the EC2 instance's Name tag + instance ID
-# via IMDS. Locally there's no IMDS, so we provide explicit env-var defaults.
-# The instance-id value seeds the credentials store's encryption key — keep it
-# stable across runs so the persisted credentials.bin stays decryptable.
-export DATAFYE_AGENT_USERNAME="${DATAFYE_AGENT_USERNAME:-local-dev}"
-export DATAFYE_AGENT_INSTANCE_ID="${DATAFYE_AGENT_INSTANCE_ID:-local-dev-instance}"
+# Identity and the credentials-store key are no longer env-driven — they
+# arrive from the accounts bootstrap push (POST /bootstrap). The agent
+# starts "awaiting bootstrap"; for local dev, POST a bootstrap token to
+# bring it live.
 
 # Where the agent fetches JWKS from to verify inbound JWTs. Production
 # defaults to https://accounts.datafye.io; for local dev point at a

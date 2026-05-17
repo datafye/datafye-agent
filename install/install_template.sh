@@ -606,21 +606,9 @@ ExecStart=${VENV_DIR}/bin/python ${AGENT_CODE_DIR}/main.py
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=${WORKSPACE_DIR}
-
-# Resolve Anthropic key from EC2 user data if not set
-ExecStartPre=/bin/bash -c 'if [ -z "\$DATAFYE_AGENT_ANTHROPIC_API_KEY" ]; then \
-    TOKEN=\$(curl -s --connect-timeout 2 -X PUT "http://169.254.169.254/latest/api/token" \
-        -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true); \
-    if [ -n "\$TOKEN" ]; then \
-        USER_DATA=\$(curl -s --connect-timeout 2 \
-            -H "X-aws-ec2-metadata-token: \$TOKEN" \
-            "http://169.254.169.254/latest/user-data" 2>/dev/null || true); \
-        KEY=\$(echo "\$USER_DATA" | grep -oP "DATAFYE_AGENT_ANTHROPIC_API_KEY=\\K.*" || true); \
-        if [ -n "\$KEY" ]; then \
-            sed -i "s/^DATAFYE_AGENT_ANTHROPIC_API_KEY=.*/DATAFYE_AGENT_ANTHROPIC_API_KEY=\$KEY/" ${ENV_FILE}; \
-        fi; \
-    fi; \
-fi'
+# Identity, the credentials-store key, and the Anthropic key all arrive
+# from the accounts service via the bootstrap push (POST /bootstrap) and
+# the credentials channel — nothing is scraped from EC2 user data.
 
 [Install]
 WantedBy=multi-user.target
