@@ -9,11 +9,11 @@ survives restarts and is encrypted with a per-instance key.
 
 Design notes:
 - Format: msgpack (binary, not human-glanceable on `cat`).
-- Encryption: cryptography.fernet (AES-128-CBC + HMAC-SHA256). Single
-  key derived from sha256("datafye-agent-creds-v1::" + instance_id), so
-  the key is reconstructable on every agent restart without persisting
-  it to disk. Defends against casual filesystem inspection and against
-  leaked EBS snapshots (snapshot doesn't carry the instance ID).
+- Encryption: cryptography.fernet (AES-128-CBC + HMAC-SHA256). The key
+  is supplied by the accounts service in the bootstrap push — it is
+  HMAC(K_master, user_id), held in memory only, never persisted to
+  disk. Defends against casual filesystem inspection and against leaked
+  EBS snapshots (the snapshot doesn't carry the key).
 - File mode 0600 on creation.
 - Dict subclass: writes auto-persist. Code that does `creds["foo"] = "bar"`
   just works; no separate save() call needed.
@@ -23,7 +23,6 @@ Design notes:
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import logging
 import os
@@ -34,8 +33,6 @@ import msgpack
 from cryptography.fernet import Fernet, InvalidToken
 
 logger = logging.getLogger(__name__)
-
-KEY_DERIVATION_SALT = b"datafye-agent-creds-v1::"
 
 DEFAULT_PATH = Path(
     os.environ.get(
@@ -55,9 +52,10 @@ LEGACY_BROKER_FILE = Path(
 )
 
 
-def _derive_key(instance_id: str) -> bytes:
-    raw = hashlib.sha256(KEY_DERIVATION_SALT + instance_id.encode("utf-8")).digest()
-    return base64.urlsafe_b64encode(raw)
+def _as_fernet(creds_key: str | bytes) -> Fernet:
+    """The bootstrap push delivers creds_key already in Fernet form
+    (url-safe-base64 of a 32-byte HMAC). Accept str or bytes."""
+    return Fernet(creds_key.encode("utf-8") if isinstance(creds_key, str) else creds_key)
 
 
 class CredentialsStore(dict):
@@ -69,10 +67,10 @@ class CredentialsStore(dict):
     disk. Concurrent writers aren't expected — the agent serves one user.
     """
 
-    def __init__(self, path: Path, instance_id: str, initial: dict | None = None):
+    def __init__(self, path: Path, creds_key: str | bytes, initial: dict | None = None):
         super().__init__()
         self._path = path
-        self._fernet = Fernet(_derive_key(instance_id))
+        self._fernet = _as_fernet(creds_key)
         if initial:
             super().update(initial)
             self._save()
@@ -127,18 +125,20 @@ class CredentialsStore(dict):
         tmp.replace(self._path)
 
 
-def load(instance_id: str, path: Path = DEFAULT_PATH, env_seed: dict | None = None) -> CredentialsStore:
+def load(creds_key: str | bytes, path: Path = DEFAULT_PATH, env_seed: dict | None = None) -> CredentialsStore:
     """
     Load the credentials store. If the file exists, decrypt + deserialize it
     into the store. Otherwise create an empty store seeded from `env_seed`
     (the legacy env-var-driven credentials from main.py, used for the first
     run before any /v1/credentials/update pushes have happened).
 
+    `creds_key` is the Fernet key delivered in the accounts bootstrap push.
+
     On first load, also migrates the legacy unencrypted broker_user.json
     file in place and deletes it.
     """
     if path.exists():
-        store = _decrypt(path, instance_id)
+        store = _decrypt(path, creds_key)
         logger.info(
             "Loaded credentials from %s (%d entries, generation=%s)",
             path, len(store), store.generation(),
@@ -164,7 +164,7 @@ def load(instance_id: str, path: Path = DEFAULT_PATH, env_seed: dict | None = No
         except OSError:
             logger.warning("Migrated legacy broker file but could not delete %s", LEGACY_BROKER_FILE)
 
-    store = CredentialsStore(path=path, instance_id=instance_id, initial=initial)
+    store = CredentialsStore(path=path, creds_key=creds_key, initial=initial)
     logger.info(
         "Created new credentials store at %s (%d entries seeded, generation=%s)",
         path, len(store), store.generation(),
@@ -172,22 +172,22 @@ def load(instance_id: str, path: Path = DEFAULT_PATH, env_seed: dict | None = No
     return store
 
 
-def _decrypt(path: Path, instance_id: str) -> CredentialsStore:
+def _decrypt(path: Path, creds_key: str | bytes) -> CredentialsStore:
     blob = path.read_bytes()
-    fernet = Fernet(_derive_key(instance_id))
+    fernet = _as_fernet(creds_key)
     try:
         plaintext = fernet.decrypt(blob)
     except InvalidToken as e:
         raise RuntimeError(
-            f"Credentials file {path} cannot be decrypted with this instance's "
-            f"key. The file was likely written on a different instance. "
-            f"Delete it (you'll lose any persisted credentials) or recover the "
-            f"correct instance ID."
+            f"Credentials file {path} cannot be decrypted with the bootstrap "
+            f"key. It was likely written under a different key (K_master "
+            f"rotated, or a different user). Delete it (you'll lose any "
+            f"persisted credentials) — accounts re-pushes credentials anyway."
         ) from e
     contents = msgpack.unpackb(plaintext, raw=False)
     if not isinstance(contents, dict):
         raise RuntimeError(f"Credentials file {path} contained {type(contents).__name__}, expected dict")
-    return CredentialsStore(path=path, instance_id=instance_id, initial=contents)
+    return CredentialsStore(path=path, creds_key=creds_key, initial=contents)
 
 
 def _read_legacy_broker_file() -> dict:

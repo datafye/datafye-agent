@@ -22,7 +22,7 @@ from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -36,7 +36,6 @@ from prompt import build_system_prompt
 import auth
 import broker
 import credentials as credentials_module
-import identity
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -150,14 +149,15 @@ class ChatRequest(BaseModel):
 class HealthResponse(BaseModel):
     """Response model for health endpoint."""
     status: str
+    bootstrapped: bool              # False until the accounts bootstrap push lands
     configured: bool
     workspace: str
     docs_available: bool
     cli_available: bool
     api_mcp_available: bool
     credentials: dict[str, bool]
-    username: str
-    credentials_generation: str
+    username: Optional[str] = None              # None until bootstrapped
+    credentials_generation: Optional[str] = None  # None until bootstrapped
     # Idle signals consumed by accounts' poll loop (Chunk 4):
     last_chat_activity_at: int      # epoch ms; 0 if no chat yet
     running_jobs: int               # count of in-flight chat streams
@@ -177,25 +177,24 @@ class CredentialsUpdate(BaseModel):
     github_token: Optional[str] = None
 
 
-# -- Identity bootstrap -------------------------------------------
-# Read once at module load. Username (e.g. "u123456") is the agent's identity;
-# instance_id seeds the credentials store's encryption key. Refuses to start
-# if neither IMDS (production) nor env vars (local dev) can resolve them.
-AGENT_IDENTITY = identity.bootstrap()
+# -- Bootstrap state ----------------------------------------------
+# The agent's identity and its credentials-store key are NOT known at
+# startup — they arrive from the accounts service via the bootstrap push
+# (POST /bootstrap). Until that lands the agent runs "awaiting bootstrap":
+# /health and /bootstrap respond; every user-facing endpoint returns 503.
+#
+# AGENT_USERNAME — the agent's identity once bootstrapped (None until then).
+# credentials    — the encrypted credentials store, opened with the
+#                  creds_key from the push (None until then).
+AGENT_USERNAME: Optional[str] = None
+credentials: Optional[credentials_module.CredentialsStore] = None
+_bootstrapped: bool = False
 
-# Auth uses the bootstrapped username to enforce JWT.sub == self.username
-# on every request that touches user-scoped surfaces.
-auth.configure(AGENT_IDENTITY.username)
 
-
-# -- Credential state (auto-persisting encrypted store) -------------
-# Loaded from ~/.datafye/agent/credentials.bin if it exists, otherwise
-# created fresh and seeded from the env vars above. The store is a dict
-# subclass — every write transparently re-encrypts and flushes to disk,
-# so existing code that does `credentials["foo"] = "bar"` keeps working.
-credentials = credentials_module.load(
-    instance_id=AGENT_IDENTITY.instance_id,
-    env_seed={
+def _credential_env_seed() -> dict:
+    """Legacy env-var credential seed, applied only when a store is created
+    fresh (local dev). In production, accounts pushes credentials."""
+    return {
         "massive_api_key": MASSIVE_API_KEY,
         "palpha_api_key": PALPHA_API_KEY,
         "hwai_api_key": HWAI_API_KEY,
@@ -205,8 +204,7 @@ credentials = credentials_module.load(
         "connecttrade_user_secret": CONNECTTRADE_USER_SECRET,
         "github_user": GITHUB_USER,
         "github_token": GITHUB_TOKEN,
-    },
-)
+    }
 
 
 def build_mcp_config() -> tuple[dict, list[str]]:
@@ -473,46 +471,111 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# broker router — shares the credentials dict so updates via /v1/credentials stay visible,
-# and lazy-provisioned ConnectTrade user_id/user_secret flow back into it.
-broker.configure(credentials)
-app.include_router(broker.router)
+# -- Bootstrap gate ------------------------------------------------
+
+async def require_bootstrapped() -> None:
+    """FastAPI dependency: 503 until the accounts bootstrap push has
+    established the agent's identity + credentials store. Applied to every
+    user-facing surface so nothing runs against a None identity/store."""
+    if not _bootstrapped:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent is awaiting bootstrap from the accounts service",
+        )
+
+
+# broker router — shares the credentials store (set in /bootstrap) so pushes
+# via /v1/credentials/update stay visible and lazy-provisioned ConnectTrade
+# user creds flow back into it. Gated on bootstrap like all user surfaces.
+app.include_router(broker.router, dependencies=[Depends(require_bootstrapped)])
 
 
 # -- Endpoints -----------------------------------------------------
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check endpoint."""
+    """Health check. Always available — including before bootstrap, so the
+    accounts poll loop can read `bootstrapped` and decide whether to push."""
     import shutil
+    creds = credentials  # None until bootstrapped
     return HealthResponse(
         status="healthy",
+        bootstrapped=_bootstrapped,
         configured=bool(ANTHROPIC_API_KEY),
         workspace=WORKSPACE_DIR,
         docs_available=os.path.isdir(DOCS_DIR),
         cli_available=shutil.which(CLI_PATH) is not None,
         api_mcp_available=check_api_mcp_reachable(DATAFYE_API_MCP_URL),
         credentials={
-            "massive": bool(credentials.get("massive_api_key")),
-            "precision_alpha": bool(credentials.get("palpha_api_key")),
-            "hwai": bool(credentials.get("hwai_api_key")),
+            "massive": bool(creds.get("massive_api_key")),
+            "precision_alpha": bool(creds.get("palpha_api_key")),
+            "hwai": bool(creds.get("hwai_api_key")),
             "connecttrade": all([
-                credentials.get("connecttrade_client_id"),
-                credentials.get("connecttrade_client_secret"),
-                credentials.get("connecttrade_user_id"),
-                credentials.get("connecttrade_user_secret"),
+                creds.get("connecttrade_client_id"),
+                creds.get("connecttrade_client_secret"),
+                creds.get("connecttrade_user_id"),
+                creds.get("connecttrade_user_secret"),
             ]),
-            "github": bool(credentials.get("github_user") and credentials.get("github_token")),
-        },
-        username=AGENT_IDENTITY.username,
-        credentials_generation=credentials.generation(),
+            "github": bool(creds.get("github_user") and creds.get("github_token")),
+        } if creds else {},
+        username=AGENT_USERNAME,
+        credentials_generation=creds.generation() if creds else None,
         last_chat_activity_at=last_chat_activity_at,
         running_jobs=running_jobs,
         active_proxied_apps=active_proxied_apps,
     )
 
 
-@app.post("/v1/chat", dependencies=[Depends(auth.require_self_jwt)])
+@app.post("/bootstrap")
+async def bootstrap(authorization: Optional[str] = Header(default=None)):
+    """Bootstrap the agent — called by the accounts service once the
+    instance is reachable. The Authorization header carries an
+    accounts-signed JWT (purpose=agent-bootstrap) whose claims are the
+    agent's identity (`user_id`) and its credentials-store key
+    (`creds_key`). On success the agent configures auth, opens its
+    encrypted credentials store, and leaves the awaiting-bootstrap state.
+
+    Idempotent for the same user (the reconcile loop re-pushes after a
+    restart); refuses a re-bind to a different user."""
+    global AGENT_USERNAME, credentials, _bootstrapped
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    token = authorization[len("Bearer "):].strip()
+    try:
+        claims = auth.verify_bootstrap_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    user_id = claims.get("user_id")
+    creds_key = claims.get("creds_key")
+    if not user_id or not creds_key:
+        raise HTTPException(status_code=400, detail="Bootstrap token missing user_id or creds_key")
+
+    if _bootstrapped and AGENT_USERNAME != user_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent already bootstrapped for '{AGENT_USERNAME}'; refusing rebind to '{user_id}'",
+        )
+
+    AGENT_USERNAME = user_id
+    auth.configure(user_id)
+    try:
+        credentials = credentials_module.load(
+            creds_key=creds_key,
+            env_seed=_credential_env_seed(),
+        )
+    except Exception as e:
+        logger.error("Bootstrap failed opening credentials store: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Could not open credentials store: {e}")
+    broker.configure(credentials)
+    _bootstrapped = True
+    logger.info("Bootstrapped: username=%s (credentials generation=%s)",
+                user_id, credentials.generation())
+    return {"bootstrapped": True, "username": user_id}
+
+
+@app.post("/v1/chat", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def chat(request: ChatRequest):
     """
     Streaming chat endpoint using Server-Sent Events.
@@ -572,7 +635,8 @@ class CredentialUpdate(BaseModel):
     value: str
 
 
-@app.post("/v1/credentials/update", status_code=204)
+@app.post("/v1/credentials/update", status_code=204,
+          dependencies=[Depends(require_bootstrapped)])
 async def push_credential(update: CredentialUpdate):
     """Push a single credential value from accounts.
 
@@ -588,7 +652,8 @@ async def push_credential(update: CredentialUpdate):
     logger.info(f"Credential pushed: {update.provider} (generation={credentials.generation()})")
 
 
-@app.get("/v1/credentials/status", dependencies=[Depends(auth.require_self_jwt)])
+@app.get("/v1/credentials/status",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def credentials_status():
     """Check which credentials are configured. JWT-protected so a leaked
     sandbox URL can't be probed for which integrations are wired up."""
