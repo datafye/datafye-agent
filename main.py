@@ -146,8 +146,11 @@ INTERNAL_TOOLS = [
     "Bash",
     # Task management
     "Task", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskStop", "TaskOutput",
-    # Planning
-    "EnterPlanMode", "ExitPlanMode", "AskUserQuestion",
+    # Planning (no AskUserQuestion — it's a structured-prompt tool the
+    # Claude Code harness renders interactively; the Datafye workspace has
+    # no handler for it, so a model that used it would silently fail to
+    # surface its question. Without the tool, the model asks inline.)
+    "EnterPlanMode", "ExitPlanMode",
     # Notebook
     "NotebookEdit",
     # Discovery
