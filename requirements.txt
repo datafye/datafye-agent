@@ -10,3 +10,6 @@ msgpack>=1.0.0
 
 # JWT validation against accounts' JWKS (auth.py)
 pyjwt[crypto]>=2.8.0
+
+# Parsing the deployment descriptor YAML for env_status (main.py)
+pyyaml>=6.0

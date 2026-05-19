@@ -128,11 +128,11 @@ def list_conversations() -> list:
     return out
 
 
-def create(first_message: str = "") -> dict:
-    """Create a new conversation; the name is deduced from the first message."""
+def _new_record(conversation_id: str, first_message: str = "") -> dict:
+    """Build a fresh, empty conversation record with the given id."""
     now = _now_ms()
-    record = {
-        "id": "c-" + uuid.uuid4().hex[:12],
+    return {
+        "id": conversation_id,
         "name": deduce_name(first_message),
         "created_at": now,
         "updated_at": now,
@@ -140,8 +140,38 @@ def create(first_message: str = "") -> dict:
         "messages": [],
         "commentary": [],
     }
+
+
+def create(first_message: str = "") -> dict:
+    """Create a new conversation with a freshly-minted id; the name is
+    deduced from the first message.
+
+    LEGACY: in the current architecture the accounts service is the
+    authoritative project registry and mints the id. New chat threads
+    arrive with an accounts-minted conversation_id; use ensure() to
+    materialise the chat-layer record for such an id. This id-minting
+    path is kept only for the now-unused POST /v1/conversations endpoint."""
+    record = _new_record("c-" + uuid.uuid4().hex[:12], first_message)
     _write(record)
     logger.info("Created conversation %s (%s)", record["id"], record["name"])
+    return record
+
+
+def ensure(conversation_id: str) -> dict:
+    """Return the conversation record for `conversation_id`, creating an
+    empty one with that exact id if it does not yet exist.
+
+    Unlike create(), the id is taken as given — never minted — because the
+    accounts service owns the project registry and supplies the id. This
+    is what makes chat against an accounts-minted id always persist:
+    append_message / append_commentary no-op when the file is absent, so
+    the agent calls ensure() first."""
+    existing = _read(conversation_id)
+    if existing is not None:
+        return existing
+    record = _new_record(conversation_id)
+    _write(record)
+    logger.info("Materialised conversation %s for accounts-minted id", conversation_id)
     return record
 
 

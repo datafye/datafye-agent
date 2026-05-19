@@ -37,6 +37,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 import httpx
+import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -102,6 +103,17 @@ GITHUB_ORG = os.getenv("DATAFYE_AGENT_GITHUB_ORG", "datafye")
 DATAFYE_API_MCP_URL = os.getenv(
     "DATAFYE_AGENT_API_MCP_URL",
     "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp",
+)
+
+# Datafye deployment REST API — part of the same datafye-api service the MCP
+# server fronts, but the plain HTTP REST surface (Jersey/Jetty on port 7776).
+# The CLI writes a /etc/hosts entry mapping this hostname to 127.0.0.1 on the
+# agent machine. Used to read the running environment's deployment descriptor
+# (GET /datafye-api/v1/deployment/descriptor) and derive env_status after a
+# chat turn. If no environment is up the agent simply emits nothing.
+DATAFYE_DEPLOYMENT_API_URL = os.getenv(
+    "DATAFYE_AGENT_DEPLOYMENT_API_URL",
+    "http://local-foundry-dev-api.datafye.local:7776",
 )
 
 # MCP servers (optional, for additional tooling)
@@ -380,6 +392,104 @@ def _tool_commentary(tool: str, tool_input: dict) -> Optional[str]:
 
 import time
 
+
+async def _fetch_deployment_state() -> Optional[dict]:
+    """Best-effort snapshot of the running Datafye environment.
+
+    Hits the deployment REST API (GET .../deployment/{descriptor,datasets,
+    symbols}) on the same datafye-api service the MCP server fronts. Returns
+    a dict {descriptor_text, descriptor, datasets, symbols} on success, or
+    None when no environment is up (connection refused / 404 / no descriptor)
+    — the caller treats None as "emit nothing".
+
+    The descriptor is the load-bearing call; datasets and symbols are
+    enrichment and a failure on either is tolerated (left empty)."""
+    base = DATAFYE_DEPLOYMENT_API_URL.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(f"{base}/datafye-api/v1/deployment/descriptor")
+            if resp.status_code != 200:
+                return None
+            descriptor_text = (resp.json() or {}).get("descriptor", "")
+            if not descriptor_text or not descriptor_text.strip():
+                return None
+            try:
+                descriptor = yaml.safe_load(descriptor_text) or {}
+            except yaml.YAMLError as e:
+                logger.warning("Could not parse deployment descriptor YAML: %s", e)
+                return None
+
+            datasets: list = []
+            symbols: dict = {}
+            try:
+                dr = await client.get(f"{base}/datafye-api/v1/deployment/datasets")
+                if dr.status_code == 200:
+                    datasets = (dr.json() or {}).get("datasets", []) or []
+            except httpx.HTTPError:
+                pass
+            try:
+                sr = await client.get(f"{base}/datafye-api/v1/deployment/symbols")
+                if sr.status_code == 200:
+                    symbols = (sr.json() or {}).get("symbols", {}) or {}
+            except httpx.HTTPError:
+                pass
+
+            return {
+                "descriptor_text": descriptor_text,
+                "descriptor": descriptor,
+                "datasets": datasets,
+                "symbols": symbols,
+            }
+    except httpx.HTTPError:
+        # connection refused / timeout — no environment is up. Emit nothing.
+        return None
+    except Exception as e:
+        logger.warning("Could not read deployment state: %s", e)
+        return None
+
+
+def _derive_env_status(state: dict) -> dict:
+    """Derive the frontend-facing env_status payload from a deployment state
+    snapshot (the output of _fetch_deployment_state).
+
+    Shape: {status, env_type, datasets, symbols, broker, mode}
+      - mode     — the descriptor's `mode` ("backtest" | "paper")
+      - env_type — "Foundry" for backtest, "Trading" for paper. Named
+                   `env_type`, not `type`, so it does not collide with the
+                   SSE frame's own `type` discriminator that sse_event sets.
+      - datasets — dataset names (live deployment list if present, else the
+                   descriptor's datasets section)
+      - symbols  — union of tickers across the descriptor's datasets sections
+      - broker   — the descriptor's broker.provider, or None
+    """
+    descriptor = state.get("descriptor") or {}
+    mode = descriptor.get("mode")
+    type_ = {"backtest": "Foundry", "paper": "Trading"}.get(mode, "Foundry")
+
+    descriptor_datasets = descriptor.get("datasets") or []
+    datasets = state.get("datasets") or [
+        d.get("dataset") for d in descriptor_datasets if d.get("dataset")
+    ]
+
+    symbols: list = []
+    for d in descriptor_datasets:
+        tickers = ((d.get("symbols") or {}).get("tickers")) or []
+        for t in tickers:
+            if t not in symbols:
+                symbols.append(t)
+
+    broker = (descriptor.get("broker") or {}).get("provider")
+
+    return {
+        "status": "running",
+        "env_type": type_,
+        "datasets": datasets,
+        "symbols": symbols,
+        "broker": broker,
+        "mode": mode,
+    }
+
+
 async def tracked_stream_agent_response(
     message: str,
     conversation_id: Optional[str],
@@ -433,7 +543,14 @@ async def stream_agent_response(
     # get_sdk_session is read from disk so resume survives an agent restart;
     # the in-memory `sessions` map covers conversations not in the store
     # (a frontend running in local-only fallback mode).
+    #
+    # conversation_id is minted by the accounts service (the authoritative
+    # project registry); the agent's store is the chat layer keyed by it.
+    # ensure() materialises an empty record for that id if one does not
+    # exist yet, so the first chat turn against an accounts-minted id
+    # always persists (append_message no-ops on a missing file).
     if conversation_id:
+        conversations.ensure(conversation_id)
         conversations.append_message(conversation_id, "user", message)
         resume_id = conversations.get_sdk_session(conversation_id) or sessions.get(conversation_id)
         if resume_id:
@@ -526,6 +643,19 @@ async def stream_agent_response(
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
         if conversation_id and assistant_text:
             conversations.append_message(conversation_id, "assistant", assistant_text)
+
+        # Surface the running environment's state to the frontend. The chat
+        # turn may have provisioned, morphed, or torn down an environment, so
+        # we read the deployment descriptor after the SDK loop finishes.
+        # Best-effort: if no environment is up the snapshot is None and we
+        # emit nothing.
+        deployment_state = await _fetch_deployment_state()
+        if deployment_state:
+            # Raw descriptor text so the frontend can relay it to accounts.
+            yield sse_event('descriptor', {'descriptor': deployment_state['descriptor_text']})
+            # Derived environment status for the frontend's env display.
+            yield sse_event('env_status', _derive_env_status(deployment_state))
+
         yield sse_event('done', {})
 
     except Exception as e:
@@ -708,7 +838,8 @@ async def chat(request: ChatRequest):
     - tool_result: Tool result {tool_use_id, content, is_error}
     - commentary: Background activity line for the activity panel {text}
     - result: Final result {text, session_id, duration_ms, cost_usd}
-    - env_status: Environment state change {status, datasets, symbols, broker, mode}
+    - descriptor: Raw deployment-descriptor YAML text {descriptor} (relayed to accounts)
+    - env_status: Environment state {status, env_type, datasets, symbols, broker, mode}
     - scorecard_update: Test results {return, winRate, trades, sharpe, drawdown, profitFactor}
     - chart_data: Chart data push {type, series, indicators}
     - error: Error {message, error_type}
@@ -817,14 +948,27 @@ class RenameConversationRequest(BaseModel):
 @app.get("/v1/conversations",
          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def list_conversations():
-    """List the user's conversations (projects), most-recently-updated first."""
+    """List the user's conversations (projects), most-recently-updated first.
+
+    LEGACY / UNUSED: the accounts service is now the authoritative project
+    registry — the frontend lists projects from accounts, not from the
+    agent. This endpoint is left in place (harmless; it reflects only the
+    agent's local chat-layer files) but is no longer called by the
+    frontend."""
     return {"conversations": conversations.list_conversations()}
 
 
 @app.post("/v1/conversations",
           dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def create_conversation(request: CreateConversationRequest):
-    """Create a conversation. The agent deduces a name from the first message."""
+    """Create a conversation. The agent deduces a name from the first message.
+
+    LEGACY / UNUSED: the accounts service is now the authoritative project
+    registry and mints project ids — the frontend creates projects against
+    accounts, not the agent. This endpoint (and the agent's id-minting) is
+    left in place but is no longer called by the frontend. New chat threads
+    arrive with an accounts-minted conversation_id; stream_agent_response
+    materialises the chat-layer record via conversations.ensure()."""
     return conversations.meta(conversations.create(request.first_message or ""))
 
 

@@ -142,6 +142,7 @@ push lands.
 | `tool_use_start` | Tool invocation started |
 | `tool_result` | Tool execution result |
 | `result` | Final result with metadata |
+| `descriptor` | Raw deployment-descriptor YAML text (relayed to accounts) |
 | `env_status` | Environment state change (for frontend) |
 | `scorecard_update` | Test results (for frontend) |
 | `chart_data` | Chart data push (for frontend) |
@@ -174,6 +175,7 @@ push lands.
 | `DATAFYE_AGENT_CONNECTTRADE_API_URL` | `https://api.connecttrade.com` | ConnectTrade REST base URL |
 | `DATAFYE_AGENT_BROKER_REDIRECT_URL` | `https://developer.datafye.io/broker-callback.html` | OAuth redirect target |
 | `DATAFYE_AGENT_BROKER_STATE_FILE` | `~/.datafye/agent/broker_user.json` | Where the ConnectTrade user_id / user_secret are persisted (TODO: migrate to accounts-manager) |
+| `DATAFYE_AGENT_DEPLOYMENT_API_URL` | `http://local-foundry-dev-api.datafye.local:7776` | Datafye deployment REST API base URL — read after a chat turn to derive `env_status` from the deployment descriptor |
 
 ## Key Design Decisions
 
