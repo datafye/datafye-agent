@@ -28,10 +28,9 @@
 # Usage (version is baked in by publish_installer.sh):
 #   # Hosted mode (sandbox in Rumi cloud)
 #   sudo ./install.sh --mode hosted
-#   sudo ./install.sh --mode hosted --anthropic-key sk-ant-...
 #
 #   # Standalone mode (marketplace/DIY)
-#   sudo ./install.sh --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
+#   sudo ./install.sh --mode standalone --dns agent.mycompany.com
 #
 #   # Upgrade (auto-upgrade downloads latest installer with new version baked in)
 #   # Credentials, mode, and workspace are preserved automatically
@@ -66,7 +65,6 @@ VERSION="__VERSION__"
 VERSION_EXPLICIT=false
 MODE=""
 DNS_NAME=""
-ANTHROPIC_API_KEY=""
 GITHUB_TOKEN=""
 FORCE=false
 AMI_CLEANUP=false
@@ -95,7 +93,6 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --mode)           MODE="$2"; shift 2 ;;
         --dns)            DNS_NAME="$2"; shift 2 ;;
-        --anthropic-key)  ANTHROPIC_API_KEY="$2"; shift 2 ;;
         --version)        VERSION="$2"; VERSION_EXPLICIT=true; shift 2 ;;
         --github-token)   GITHUB_TOKEN="$2"; shift 2 ;;
         --agent-source)   AGENT_SOURCE_DIR="$2"; shift 2 ;;
@@ -114,7 +111,6 @@ Options:
                           hosted     - Rumi cloud sandbox (no nginx, no SSL)
                           standalone - Marketplace/DIY (nginx + SSL)
   --dns <name>          DNS name (standalone mode, e.g., agent.mycompany.com)
-  --anthropic-key <k>   Anthropic API key (can be set later or via EC2 user data)
   --version <v>         Override the baked-in version. Accepts X.Y.Z for
                         released builds or X.Y-SNAPSHOT for internal testing.
                         Passing --version pins the install; auto-upgrade is
@@ -207,9 +203,6 @@ fi
 # ── Preserve existing config on upgrade ───────────────────────────
 if [ "$IS_UPGRADE" = true ] && [ -f "${ENV_FILE}" ]; then
     info "Preserving existing configuration..."
-    if [ -z "$ANTHROPIC_API_KEY" ]; then
-        ANTHROPIC_API_KEY=$(grep -oP '^DATAFYE_AGENT_ANTHROPIC_API_KEY=\K.*' "${ENV_FILE}" || true)
-    fi
     EXISTING_PORT=$(grep -oP '^DATAFYE_AGENT_PORT=\K.*' "${ENV_FILE}" || true)
     if [ -n "$EXISTING_PORT" ]; then
         AGENT_PORT="${EXISTING_PORT}"
@@ -589,7 +582,6 @@ cat > "${ENV_FILE}" << EOF
 DATAFYE_AGENT_VERSION=${VERSION}
 DATAFYE_AGENT_MODE=${MODE}
 DATAFYE_AGENT_PORT=${AGENT_PORT}
-DATAFYE_AGENT_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 DATAFYE_AGENT_WORKSPACE=${WORKSPACE_DIR}
 DATAFYE_AGENT_DOCS_DIR=${DOCS_DIR}
 DATAFYE_AGENT_SAMPLES_DIR=${SAMPLES_DIR}
@@ -808,11 +800,6 @@ if [ "$AMI_CLEANUP" = true ]; then
     # Stop agent if running
     systemctl stop datafye-agent 2>/dev/null || true
 
-    # Clear Anthropic key (will be injected at launch via user data)
-    if [ -f "${ENV_FILE}" ]; then
-        sed -i 's/^DATAFYE_AGENT_ANTHROPIC_API_KEY=.*/DATAFYE_AGENT_ANTHROPIC_API_KEY=/' "${ENV_FILE}"
-    fi
-
     # Clear logs
     journalctl --rotate 2>/dev/null || true
     journalctl --vacuum-time=1s 2>/dev/null || true
@@ -837,27 +824,26 @@ if [ "$AMI_CLEANUP" = true ]; then
 fi
 
 # ── Start agent ──────────────────────────────────────────────────
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-    warn "No Anthropic key provided."
-    warn "Set it in ${ENV_FILE} then run: systemctl start datafye-agent"
-else
-    info "Starting agent..."
-    systemctl start datafye-agent
+# The agent boots into the awaiting-bootstrap state — it starts with no
+# identity or credentials and waits for the accounts service to push them
+# (POST /bootstrap, then the Anthropic key over the credentials channel).
+# So always start it; no key is needed at install time.
+info "Starting agent..."
+systemctl start datafye-agent
 
-    sleep 3
-    if systemctl is-active --quiet datafye-agent; then
-        ok "Agent service is running"
+sleep 3
+if systemctl is-active --quiet datafye-agent; then
+    ok "Agent service is running"
 
-        HEALTH=$(curl -sf --connect-timeout 5 "http://127.0.0.1:${AGENT_PORT}/health" 2>/dev/null || true)
-        if [ -n "$HEALTH" ]; then
-            ok "Agent health check passed"
-        else
-            warn "Agent started but health check not responding yet (may still be initializing)"
-        fi
+    HEALTH=$(curl -sf --connect-timeout 5 "http://127.0.0.1:${AGENT_PORT}/health" 2>/dev/null || true)
+    if [ -n "$HEALTH" ]; then
+        ok "Agent health check passed"
     else
-        error "Agent service failed to start"
-        error "Check logs: journalctl -u datafye-agent"
+        warn "Agent started but health check not responding yet (may still be initializing)"
     fi
+else
+    error "Agent service failed to start"
+    error "Check logs: journalctl -u datafye-agent"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────

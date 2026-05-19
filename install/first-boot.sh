@@ -22,9 +22,12 @@
 # only runs if /opt/datafye/agent/version does not exist (i.e., first boot).
 #
 # Expected EC2 user data (key=value format, one per line):
-#   DATAFYE_AGENT_VERSION=2.0.4          (required)
-#   DATAFYE_AGENT_ANTHROPIC_API_KEY=sk-ant-...  (required)
-#   DATAFYE_AGENT_DNS=agent.mycompany.com       (optional, enables SSL)
+#   DATAFYE_AGENT_VERSION=2.0.4            (required)
+#   DATAFYE_AGENT_DNS=agent.mycompany.com  (optional, enables SSL)
+#
+# The Anthropic key and other credentials are NOT provided via user data.
+# The agent boots awaiting-bootstrap; once its URL is registered with the
+# accounts service, accounts pushes identity and credentials over HTTP.
 #
 
 set -e
@@ -48,22 +51,16 @@ USER_DATA=$(curl -s --connect-timeout 5 \
     "http://169.254.169.254/latest/user-data" 2>/dev/null || true)
 
 if [ -z "$USER_DATA" ]; then
-    log "ERROR: No user data found. Provide DATAFYE_AGENT_VERSION and DATAFYE_AGENT_ANTHROPIC_API_KEY."
+    log "ERROR: No user data found. Provide DATAFYE_AGENT_VERSION."
     exit 1
 fi
 
 # Parse user data
 VERSION=$(echo "$USER_DATA" | grep -oP '^DATAFYE_AGENT_VERSION=\K.*' || true)
-ANTHROPIC_KEY=$(echo "$USER_DATA" | grep -oP '^DATAFYE_AGENT_ANTHROPIC_API_KEY=\K.*' || true)
 DNS_NAME=$(echo "$USER_DATA" | grep -oP '^DATAFYE_AGENT_DNS=\K.*' || true)
 
 if [ -z "$VERSION" ]; then
     log "ERROR: DATAFYE_AGENT_VERSION not found in user data"
-    exit 1
-fi
-
-if [ -z "$ANTHROPIC_KEY" ]; then
-    log "ERROR: DATAFYE_AGENT_ANTHROPIC_API_KEY not found in user data"
     exit 1
 fi
 
@@ -77,7 +74,7 @@ log "Downloading installer from ${INSTALLER_URL}..."
 curl -fsSL "${INSTALLER_URL}" -o /tmp/datafye-agent-install.sh
 chmod +x /tmp/datafye-agent-install.sh
 
-INSTALL_ARGS="--version ${VERSION} --mode standalone --anthropic-key ${ANTHROPIC_KEY}"
+INSTALL_ARGS="--version ${VERSION} --mode standalone"
 if [ -n "$DNS_NAME" ]; then
     INSTALL_ARGS="${INSTALL_ARGS} --dns ${DNS_NAME}"
 fi
