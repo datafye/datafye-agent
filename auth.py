@@ -53,6 +53,13 @@ ACCOUNTS_URL = os.getenv("DATAFYE_AGENT_ACCOUNTS_URL", "https://accounts.datafye
 JWKS_URL = f"{ACCOUNTS_URL}/datafye-accounts-api/v1/auth/jwks"
 EXPECTED_ISSUER = os.getenv("DATAFYE_AGENT_ACCOUNTS_ISSUER", "https://accounts.datafye.io")
 
+# Tolerance applied to time-based JWT claims (iat / nbf / exp) so small
+# clock differences between the accounts host and the agent host don't
+# reject otherwise-valid tokens. Without it, an accounts clock a few
+# seconds ahead makes every freshly-signed bootstrap token's `iat` land
+# in the agent's future -> "token is not yet valid (iat)" 401s.
+_CLOCK_SKEW_LEEWAY_SECONDS = int(os.getenv("DATAFYE_AGENT_JWT_LEEWAY_SECONDS", "60"))
+
 # PyJWKClient lazily fetches JWKS on the first verification, then caches
 # the keys for `lifespan` seconds. On a key-id miss it refetches — handles
 # accounts rotating its signing key without an agent restart.
@@ -88,6 +95,7 @@ def verify_bootstrap_token(token: str) -> dict:
             signing_key.key,
             algorithms=["RS256"],
             issuer=EXPECTED_ISSUER,
+            leeway=_CLOCK_SKEW_LEEWAY_SECONDS,
             options={"verify_aud": False},
         )
     except jwt.PyJWTError as e:
@@ -125,6 +133,7 @@ async def require_self_jwt(authorization: str | None = Header(default=None)) -> 
             signing_key.key,
             algorithms=["RS256"],
             issuer=EXPECTED_ISSUER,
+            leeway=_CLOCK_SKEW_LEEWAY_SECONDS,
             # We don't currently set an audience claim; skip aud verification.
             options={"verify_aud": False},
         )
