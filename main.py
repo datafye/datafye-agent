@@ -50,6 +50,7 @@ from claude_agent_sdk import (
 from prompt import build_system_prompt
 import auth
 import broker
+import conversations
 import credentials as credentials_module
 
 # Configure logging
@@ -359,6 +360,24 @@ def truncate(text: str, limit: int = 150) -> str:
     return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
 
 
+def _tool_commentary(tool: str, tool_input: dict) -> Optional[str]:
+    """A human activity line for a tool call, or None to skip it.
+
+    Only tools that represent meaningful background work — shell commands
+    and Datafye environment calls — become commentary; the file-level
+    tools (Read/Edit/Grep/...) are too granular for the activity panel.
+    """
+    if tool == "Bash":
+        cmd = (tool_input or {}).get("command", "")
+        return f"Running: {truncate(cmd, 90)}" if cmd else "Running a command"
+    if tool.startswith("mcp__datafye-api__"):
+        return "Querying the Datafye environment"
+    if tool.startswith("mcp__"):
+        parts = tool.split("__")
+        return f"Using the {parts[1]} tool" if len(parts) > 1 else None
+    return None
+
+
 import time
 
 async def tracked_stream_agent_response(
@@ -410,10 +429,16 @@ async def stream_agent_response(
         include_partial_messages=True,
     )
 
-    # Resume existing session if available
-    if conversation_id and conversation_id in sessions:
-        options.resume = sessions[conversation_id]
-        logger.info(f"Resuming session for conversation {conversation_id}")
+    # Persist the user's turn and resume the conversation's SDK session.
+    # get_sdk_session is read from disk so resume survives an agent restart;
+    # the in-memory `sessions` map covers conversations not in the store
+    # (a frontend running in local-only fallback mode).
+    if conversation_id:
+        conversations.append_message(conversation_id, "user", message)
+        resume_id = conversations.get_sdk_session(conversation_id) or sessions.get(conversation_id)
+        if resume_id:
+            options.resume = resume_id
+            logger.info(f"Resuming session for conversation {conversation_id}")
 
     logger.info(f"[TRACE] === Starting Agent Query ===")
     logger.info(f"[TRACE] Model: {CLAUDE_MODEL}")
@@ -424,6 +449,7 @@ async def stream_agent_response(
 
     try:
         msg_count = 0
+        assistant_text = ""
 
         async for msg in query(prompt=message, options=options):
             msg_count += 1
@@ -437,6 +463,7 @@ async def stream_agent_response(
                     session_id = data.get('session_id')
                     if conversation_id and session_id:
                         sessions[conversation_id] = session_id
+                        conversations.set_sdk_session(conversation_id, session_id)
                     yield sse_event('init', {'session_id': session_id})
                 else:
                     yield sse_event('system', {'subtype': subtype, 'data': data})
@@ -448,6 +475,7 @@ async def stream_agent_response(
                     if hasattr(block, 'text') and not hasattr(block, 'name'):
                         text = getattr(block, 'text', '')
                         if text:
+                            assistant_text += text
                             yield sse_event('content', {'text': text})
 
                     # Thinking
@@ -458,11 +486,21 @@ async def stream_agent_response(
 
                     # Tool use
                     elif hasattr(block, 'name') and hasattr(block, 'input'):
+                        tool_name = getattr(block, 'name', '')
+                        tool_input = getattr(block, 'input', {})
                         yield sse_event('tool_use_start', {
-                            'tool': getattr(block, 'name', ''),
+                            'tool': tool_name,
                             'id': getattr(block, 'id', ''),
-                            'input': getattr(block, 'input', {})
+                            'input': tool_input,
                         })
+                        # Translate notable tool calls into a human activity
+                        # line for the workspace's commentary panel, and
+                        # persist it as the conversation's audit trail.
+                        note = _tool_commentary(tool_name, tool_input)
+                        if note:
+                            if conversation_id:
+                                conversations.append_commentary(conversation_id, note)
+                            yield sse_event('commentary', {'text': note})
 
                     # Tool result
                     elif hasattr(block, 'tool_use_id'):
@@ -486,6 +524,8 @@ async def stream_agent_response(
                 })
 
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
+        if conversation_id and assistant_text:
+            conversations.append_message(conversation_id, "assistant", assistant_text)
         yield sse_event('done', {})
 
     except Exception as e:
@@ -666,6 +706,7 @@ async def chat(request: ChatRequest):
     - thinking: Agent reasoning {text}
     - tool_use_start: Tool invocation {tool, id, input}
     - tool_result: Tool result {tool_use_id, content, is_error}
+    - commentary: Background activity line for the activity panel {text}
     - result: Final result {text, session_id, duration_ms, cost_usd}
     - env_status: Environment state change {status, datasets, symbols, broker, mode}
     - scorecard_update: Test results {return, winRate, trades, sharpe, drawdown, profitFactor}
@@ -756,6 +797,59 @@ async def credentials_status():
             credentials.get("connecttrade_user_secret"),
         ]),
         "github_personal": bool(credentials.get("github_user") and credentials.get("github_token")),
+    }
+
+
+# -- Conversations (the agent workspace's "projects") --------------
+# A conversation == a project: a named, persistent chat thread that owns
+# its own message history, commentary audit trail, and SDK session.
+
+class CreateConversationRequest(BaseModel):
+    """Create a conversation; `first_message` seeds the deduced name."""
+    first_message: Optional[str] = None
+
+
+class RenameConversationRequest(BaseModel):
+    """Rename a conversation."""
+    name: str
+
+
+@app.get("/v1/conversations",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def list_conversations():
+    """List the user's conversations (projects), most-recently-updated first."""
+    return {"conversations": conversations.list_conversations()}
+
+
+@app.post("/v1/conversations",
+          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def create_conversation(request: CreateConversationRequest):
+    """Create a conversation. The agent deduces a name from the first message."""
+    return conversations.meta(conversations.create(request.first_message or ""))
+
+
+@app.patch("/v1/conversations/{conversation_id}",
+           dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def rename_conversation(conversation_id: str, request: RenameConversationRequest):
+    """Rename a conversation."""
+    record = conversations.rename(conversation_id, request.name)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return conversations.meta(record)
+
+
+@app.get("/v1/conversations/{conversation_id}/history",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def conversation_history(conversation_id: str):
+    """Replay a conversation: its messages and its commentary audit trail."""
+    record = conversations.get(conversation_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return {
+        "id": record["id"],
+        "name": record["name"],
+        "messages": record.get("messages", []),
+        "commentary": record.get("commentary", []),
     }
 
 
