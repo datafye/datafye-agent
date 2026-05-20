@@ -292,6 +292,45 @@ def _apply_anthropic_key() -> None:
     logger.info("Anthropic API key applied (status=%s)", anthropic_key_status)
 
 
+# Maps credentials-store keys to the env-var names the Datafye CLI /
+# deployment descriptors expect via ${VAR} substitution. Each store key
+# maps to one or more env-var aliases — historical renames (Polygon ->
+# Massive, Palpha -> Precision Alpha) are exported under both names so a
+# descriptor written against either resolves. The Anthropic key is handled
+# separately by _apply_anthropic_key because it also validates the key.
+_CREDENTIAL_ENV_MAP = {
+    "massive_api_key":             ["POLYGON_API_KEY", "MASSIVE_API_KEY"],
+    "palpha_api_key":              ["PALPHA_API_KEY", "PRECISION_ALPHA_API_KEY"],
+    "hwai_api_key":                ["HWAI_API_KEY"],
+    "connecttrade_client_id":      ["CONNECTTRADE_CLIENT_ID"],
+    "connecttrade_client_secret":  ["CONNECTTRADE_CLIENT_SECRET"],
+    "connecttrade_user_id":        ["CONNECTTRADE_USER_ID"],
+    "connecttrade_user_secret":    ["CONNECTTRADE_USER_SECRET"],
+    "github_user":                 ["GITHUB_USER"],
+    "github_token":                ["GITHUB_TOKEN"],
+}
+
+
+def _apply_credentials_env() -> None:
+    """Sync the data-provider / broker / GitHub credentials from the
+    encrypted store into the process environment so any subprocess the
+    Claude Agent SDK spawns — and any datafye CLI invocation — inherits
+    them. Deployment descriptors use ${VAR} substitution
+    (e.g. polygon_api_key: ${POLYGON_API_KEY}); without this sync the
+    values were locked inside the agent and the CLI saw blank
+    substitutions. Called after bootstrap and after every
+    /v1/credentials/update push."""
+    if credentials is None:
+        return
+    for store_key, env_names in _CREDENTIAL_ENV_MAP.items():
+        val = credentials.get(store_key)
+        for name in env_names:
+            if val:
+                os.environ[name] = val
+            else:
+                os.environ.pop(name, None)
+
+
 def build_mcp_config() -> tuple[dict, list[str]]:
     """Build MCP servers dict and allowed tools list."""
     mcp_servers = {}
@@ -818,6 +857,7 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=500, detail=f"Could not open credentials store: {e}")
     broker.configure(credentials)
     _apply_anthropic_key()
+    _apply_credentials_env()
     _bootstrapped = True
     logger.info("Bootstrapped: username=%s (credentials generation=%s, anthropic=%s)",
                 user_id, credentials.generation(), anthropic_key_status)
@@ -910,9 +950,13 @@ async def push_credential(update: CredentialUpdate):
     credentials[update.provider] = update.value
     logger.info(f"Credential pushed: {update.provider} (generation={credentials.generation()})")
     # The Anthropic key drives chat availability — re-sync it into the
-    # process env and re-validate so /health reflects the new value.
+    # process env and re-validate so /health reflects the new value. Every
+    # other credential needs to land in the process env too so the CLI's
+    # ${VAR} substitution in deployment descriptors can resolve.
     if update.provider == "anthropic_api_key":
         _apply_anthropic_key()
+    else:
+        _apply_credentials_env()
 
 
 @app.get("/v1/credentials/status",
