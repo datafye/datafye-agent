@@ -19,7 +19,11 @@ Datafye Agent is a dedicated per-user AI backend for algorithmic trading strateg
 datafye-agent/
 ├── main.py          # FastAPI app, endpoints, SSE streaming, session management
 ├── prompt.py        # System prompt builder (assembled from runtime context)
-├── requirements.txt # Python dependencies
+├── auth.py          # JWT validation against accounts' JWKS (with clock-skew leeway)
+├── credentials.py   # Encrypted on-disk credentials store
+├── broker.py        # ConnectTrade broker integration
+├── conversations.py # Per-user on-disk conversation/project store (one JSON file per conversation)
+├── requirements.txt # Python dependencies (incl. pyyaml for env_status descriptor parsing)
 ├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
 ├── install/
 │   ├── install_template.sh   # Installer/upgrader template (--mode hosted|standalone, --ami-cleanup)
@@ -71,7 +75,7 @@ The agent runs **natively** on the host (not in a Docker container). Docker is i
 | Mode | Use Case | What's on the Instance |
 |------|----------|----------------------|
 | `hosted` | Rumi cloud sandbox (managed by accounts service) | Agent, CLI, docs, samples pre-installed. No nginx/SSL (jump server proxies). Identity, credentials and the Anthropic key are delivered by the accounts service over HTTP (`POST /bootstrap`) — nothing user-specific is baked into the AMI. |
-| `standalone` | AWS Marketplace / DIY | First-boot script only. Downloads and installs everything on first boot from user data. Includes nginx + SSL. |
+| `standalone` | AWS Marketplace / DIY | First-boot script only. Downloads and installs everything on first boot from user data. Includes nginx + SSL. The Anthropic key arrives via the accounts credentials channel (no longer baked into EC2 user data or passed with `--anthropic-key`). |
 
 ### Installer
 
@@ -82,7 +86,10 @@ The version is baked into `install.sh` by `publish_installer.sh` — no `--versi
 sudo ./install.sh --mode hosted
 
 # Standalone mode (marketplace)
-sudo ./install.sh --mode standalone --dns agent.mycompany.com --anthropic-key sk-ant-...
+sudo ./install.sh --mode standalone --dns agent.mycompany.com
+# (No --anthropic-key flag: the Anthropic key arrives from accounts over the
+#  credentials channel for both hosted and standalone. The installer always
+#  starts the agent; it boots awaiting-bootstrap.)
 
 # Upgrades happen automatically via the auto-upgrade cron (preserves config, mode, credentials)
 ```
@@ -127,6 +134,10 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/broker/connections` | GET | List the user's brokerage connections with linked accounts |
 | `/v1/broker/connections` | POST | Create a ConnectTrade OAuth URL for a chosen broker; body `{type, broker}` |
 | `/v1/broker/connections/{id}` | DELETE | Revoke a brokerage connection |
+| `/v1/conversations` | GET | List conversations (projects), most-recently-updated first. **LEGACY/UNUSED** — accounts is the authoritative project registry; the frontend lists from accounts |
+| `/v1/conversations` | POST | Create a conversation (agent mints the id, deduces a name). **LEGACY/UNUSED** — accounts mints project ids; new chat threads arrive with an accounts-minted `conversation_id` that `/v1/chat` materialises via `conversations.ensure()` |
+| `/v1/conversations/{id}` | PATCH | Rename a conversation; 404 if absent |
+| `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail |
 
 Every endpoint except `/health` and `/bootstrap` is gated by the
 `require_bootstrapped` dependency and returns 503 until the accounts bootstrap
@@ -141,9 +152,10 @@ push lands.
 | `thinking` | Agent reasoning |
 | `tool_use_start` | Tool invocation started |
 | `tool_result` | Tool execution result |
+| `commentary` | Background-activity line for the workspace activity panel (`{text}`). Emitted for notable tool calls — Bash and MCP — and also appended to the conversation's commentary audit trail |
 | `result` | Final result with metadata |
-| `descriptor` | Raw deployment-descriptor YAML text (relayed to accounts) |
-| `env_status` | Environment state change (for frontend) |
+| `descriptor` | Raw deployment-descriptor YAML text (`{descriptor}`), relayed by the frontend to accounts. Best-effort read of the deployed environment's deployment REST API after a chat turn |
+| `env_status` | Environment state, derived from the descriptor: `{status, env_type, datasets, symbols, broker, mode}`. The environment-type field is keyed **`env_type`** (NOT `type`) so it can't collide with the SSE frame's own `type` discriminator that `sse_event` sets |
 | `scorecard_update` | Test results (for frontend) |
 | `chart_data` | Chart data push (for frontend) |
 | `error` | Error occurred |
@@ -175,7 +187,9 @@ push lands.
 | `DATAFYE_AGENT_CONNECTTRADE_API_URL` | `https://api.connecttrade.com` | ConnectTrade REST base URL |
 | `DATAFYE_AGENT_BROKER_REDIRECT_URL` | `https://developer.datafye.io/broker-callback.html` | OAuth redirect target |
 | `DATAFYE_AGENT_BROKER_STATE_FILE` | `~/.datafye/agent/broker_user.json` | Where the ConnectTrade user_id / user_secret are persisted (TODO: migrate to accounts-manager) |
-| `DATAFYE_AGENT_DEPLOYMENT_API_URL` | `http://local-foundry-dev-api.datafye.local:7776` | Datafye deployment REST API base URL — read after a chat turn to derive `env_status` from the deployment descriptor |
+| `DATAFYE_AGENT_DEPLOYMENT_API_URL` | `http://local-foundry-dev-api.datafye.local:7776` | Datafye deployment REST API base URL — read after a chat turn to derive `descriptor` / `env_status` from the deployment descriptor (`GET .../deployment/{descriptor,datasets,symbols}`) |
+| `DATAFYE_AGENT_CONVERSATIONS_DIR` | `~/.datafye/agent/conversations` | Directory for the on-disk conversation store (one JSON file per conversation) |
+| `DATAFYE_AGENT_JWT_LEEWAY_SECONDS` | `60` | Clock-skew tolerance applied to time-based JWT claims (iat/nbf/exp) when verifying accounts-signed tokens — avoids "token not yet valid (iat)" failures from clock drift |
 
 ## Key Design Decisions
 
@@ -186,6 +200,10 @@ push lands.
 - **Push bootstrap**: The agent learns its identity and its credentials-store encryption key from an accounts-signed JWT pushed to `POST /bootstrap` — it never reads AWS instance metadata. Accounts is the only writer in the relationship
 - **Anthropic key as a credential**: The Anthropic key is not a startup env var; it lives in the encrypted credentials store and is delivered via the credentials push channel. The agent starts and stays manageable with no key — chat just returns 503/502 until a valid key arrives
 - **Credentials via accounts**: The accounts service pushes credential updates to `/v1/credentials/update`; the old direct-write `/v1/credentials` endpoint is gone
+- **Credentials synced to the environment**: `_apply_credentials_env()` exports the data-provider/broker/GitHub credentials from the encrypted store into `os.environ` (under both historical and current names, e.g. `POLYGON_API_KEY`+`MASSIVE_API_KEY`) on bootstrap and after every credentials push, so the Datafye CLI's `${VAR}` substitution in deployment descriptors resolves. (Previously only `ANTHROPIC_API_KEY` was exported.)
+- **Accounts is the project registry**: Accounts mints conversation/project ids; the agent's own `POST`/`GET /v1/conversations` are legacy/unused. New chat threads arrive with an accounts-minted `conversation_id`, and `/v1/chat` materialises a local chat-layer record via `conversations.ensure()`
+- **Persistent conversations**: `conversations.py` stores each conversation as one JSON file (name, message history, commentary audit trail, SDK session id). `/v1/chat` persists user+assistant turns and resumes the SDK session from disk, so chat survives an agent restart
+- **No `AskUserQuestion` tool**: It's the Claude Code harness's structured-prompt tool with no UI handler in the Datafye workspace, so the model's question would silently vanish. Dropped from `INTERNAL_TOOLS`; the model asks inline in chat text instead
 - **Python-only algos**: No SDK/Java algos - all strategies are pure Python using REST/WebSocket APIs
 - **Conversational config**: Datasets, schemas, and environments are configured through chat, not forms
 

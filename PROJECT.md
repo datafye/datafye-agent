@@ -32,7 +32,9 @@ Each user gets their own instance of this service. That's not an accident — al
 
 At the heart of this service is the Claude Agent SDK's `query()` function. It's an async generator that yields a stream of messages as Claude thinks, calls tools, and generates responses. We wrap this in a FastAPI SSE endpoint that the frontend consumes.
 
-The SDK gives Claude access to tools — file operations (Read, Write, Edit), shell execution (Bash), search (Glob, Grep), and planning tools. We add the Datafye-specific capabilities through the system prompt and the Bash tool: the agent can run `datafye foundry local provision`, `curl` the REST API, execute Python scripts, and manage git repos.
+The SDK gives Claude access to tools — file operations (Read, Write, Edit), shell execution (Bash), search (Glob, Grep), and planning tools. We add the Datafye-specific capabilities through the system prompt and the Bash tool: the agent can run `datafye foundry local provision`, `curl` the REST API, execute Python scripts, and manage git repos. The exact allowed set lives in `INTERNAL_TOOLS` in `main.py`.
+
+**One tool we deliberately removed: `AskUserQuestion`.** It's the Claude Code harness's *structured-prompt* tool — in the Claude Code CLI it renders an interactive multiple-choice question. The Datafye workspace has no UI handler for it, so when the model reached for it, the question simply vanished into the void — the user saw the agent go quiet instead of being asked anything. Dropping it from `INTERNAL_TOOLS` forces the model to fall back to asking its question inline as ordinary chat text, which the frontend already renders. The broader lesson: an agent's tool list has to match the *surface it's actually running on*, not the SDK's full menu — a tool with no handler is worse than no tool, because it fails silently.
 
 ### The Anthropic Key Is a Credential, Not a Setting
 
@@ -56,6 +58,37 @@ This means the agent always knows what it can and can't do. If the user hasn't c
 
 The Claude Agent SDK supports session resumption. When a user sends a message, we check if there's an existing session for their conversation. If so, we resume it — Claude remembers the entire conversation history, what files it created, what environments are running. This is critical for algo development where a single strategy might take dozens of back-and-forth exchanges to refine.
 
+Originally that session-id lookup was an in-memory dict, which meant a restarted agent forgot every session — a fresh sandbox boot would start every conversation from scratch even though the SDK's own transcript was still on disk. Now the SDK session id is persisted (see [Conversations: Projects That Survive a Restart](#conversations-projects-that-survive-a-restart)), so `/v1/chat` resumes the right SDK session even across a process restart. The in-memory dict is kept only as a fallback for conversations that have no on-disk record.
+
+### Conversations: Projects That Survive a Restart
+
+What the frontend calls a **project** the agent calls a **conversation**, and `conversations.py` is its little on-disk database — one JSON file per conversation under `~/.datafye/agent/conversations/<id>.json`. Each record holds the human-readable name, the message history (user + assistant turns), a *commentary* log (the audit trail of background activity — see below), and the SDK session id.
+
+Three design choices are worth calling out:
+
+- **Plain JSON, not the encrypted store.** Conversation content isn't a secret key, and the Claude Agent SDK already writes its own transcripts to disk unencrypted — encrypting an *index* of those would buy nothing. Files are mode `0600` and written via temp-file-plus-atomic-rename, so a crash mid-write can't truncate an existing file. (Contrast with `credentials.bin`, which *is* encrypted because it holds Fernet-protected secrets.)
+- **`ensure()` vs `create()` — who mints the id.** This is the load-bearing distinction. The accounts service is now the authoritative project registry: it mints project ids and the frontend creates/lists projects against accounts, not the agent. So a chat turn arrives with an *accounts-minted* `conversation_id` the agent has never seen. `conversations.ensure(id)` lazily materialises a local record for that exact id (never minting its own), which is what makes `append_message`/`append_commentary` actually persist — those helpers no-op when no file exists, so `/v1/chat` calls `ensure()` first. The agent's own `create()` (and the `POST`/`GET /v1/conversations` endpoints that use it) are now **legacy/unused** — left in place because they're harmless, but no longer on the frontend's path.
+- **No per-user namespacing or locking.** The agent serves exactly one user, so there's nobody to collide with; the atomic rename is the only concurrency control needed.
+
+The lesson here is a recurring one in this codebase: **decide who owns identity, then make every other component a follower.** Just as accounts owns the agent's *identity* (bootstrap push) and its *credentials* (credentials push), it now owns the *project registry* too. The agent's job is to materialise local state for ids it's handed, never to invent them — which keeps the agent and accounts from drifting into two competing lists of "what projects exist."
+
+### Commentary: A Live Activity Feed
+
+While Claude works, it calls a lot of tools — reading files, grepping, running shell commands, hitting the Datafye environment. Streaming every one of those to the user would be noise. So `_tool_commentary()` filters: only *meaningful background work* — `Bash` commands and MCP calls — becomes a human-readable commentary line ("Running: datafye foundry local provision ...", "Querying the Datafye environment"). File-level tools (Read/Edit/Grep) are too granular and are skipped.
+
+Each commentary line is both emitted live as a `commentary` SSE event *and* appended to the conversation's on-disk commentary log, so the activity panel can be replayed when a user reopens a project (`GET /v1/conversations/{id}/history` returns both `messages` and `commentary`).
+
+### Reflecting the Environment Back to the Frontend
+
+The agent can spin up a Datafye environment, but the frontend needs to *show* what's running — which datasets, which symbols, backtest vs paper-trading, which broker. Rather than try to track that state by parsing the agent's own tool calls (fragile), we read it from the source of truth: after each chat turn, `_fetch_deployment_state()` makes a best-effort call to the deployed environment's deployment REST API (`GET .../deployment/{descriptor,datasets,symbols}` at `DATAFYE_AGENT_DEPLOYMENT_API_URL`). If no environment is up — connection refused, 404, no descriptor — it returns `None` and the agent simply emits nothing. The `descriptor` call is load-bearing; `datasets` and `symbols` are enrichment and tolerated to fail.
+
+On success the agent emits two SSE events:
+
+- **`descriptor`** — the raw deployment-descriptor YAML text, which the frontend relays verbatim to accounts (accounts keeps the canonical record of what each project deployed).
+- **`env_status`** — a parsed, frontend-friendly summary: `{status, env_type, datasets, symbols, broker, mode}`. `mode` is the descriptor's `mode` (`backtest`/`paper`); `env_type` is the friendly label ("Foundry" for backtest, "Trading" for paper).
+
+There's a gotcha buried in that payload that cost us a confusing afternoon, so it's worth writing down: **the environment-type field is keyed `env_type`, not `type`.** Every SSE frame is `{type: <event-name>, ...payload}` — `sse_event()` sets `type` to the event name (`env_status`, `descriptor`, etc.). If the payload *also* carried a `type` key, the spread would clobber the frame discriminator and the frontend's event router would mis-dispatch the message. Renaming the field to `env_type` sidesteps the collision entirely. The general rule: never put a `type` key in an SSE payload that gets spread into a frame whose discriminator is also `type`.
+
 ### Bootstrap: How the Agent Learns Who It Is
 
 A freshly-launched agent is a blank slate. It doesn't know its username, it doesn't have the key to decrypt its own credentials, and it has no Anthropic key to talk to Claude. So it doesn't pretend otherwise — it boots into an **awaiting-bootstrap** holding state. In that state exactly two endpoints answer: `GET /health` (so accounts can see it's alive and not yet bootstrapped) and `POST /bootstrap`. Every user-facing endpoint returns HTTP 503, enforced by a single `require_bootstrapped` FastAPI dependency. Nothing runs against a `None` identity.
@@ -65,7 +98,7 @@ The accounts service drives it out of that state. Once the instance is reachable
 - `user_id` — the agent's identity from this moment on.
 - `creds_key` — the Fernet key for the encrypted credentials store. It is `base64url(HMAC-SHA256(K_master, username))`, where `K_master` is an accounts-side secret the agent never sees. The agent receives the *derived* key, not the master secret.
 
-The handler configures auth, opens the credentials store with `creds_key`, syncs the Anthropic key, and leaves the holding state. It's idempotent for the same user — accounts re-pushes after a restart and the agent just re-binds to the same identity — but a bootstrap for a *different* user is rejected with a 409. An agent is one user's agent for life.
+The handler configures auth, opens the credentials store with `creds_key`, syncs the Anthropic key, exports the rest of the stored credentials into the process environment (`_apply_credentials_env()`, so the CLI's `${VAR}` substitution resolves), and leaves the holding state. It's idempotent for the same user — accounts re-pushes after a restart and the agent just re-binds to the same identity — but a bootstrap for a *different* user is rejected with a 409. An agent is one user's agent for life.
 
 Why a push instead of the agent reading its own EC2 `Name` tag from instance metadata (the old model)? Two reasons. First, it keeps accounts as the single source of truth — the same design principle that runs through the whole sandbox plane: the agent *receives*, it never *asks*. Second, it lets accounts hand the agent its credentials-store key without that key ever being derivable from anything on the instance itself. A leaked EBS snapshot is just an encrypted blob; the key lives only in accounts and in the running process's memory.
 
@@ -78,12 +111,21 @@ User credentials (data provider API keys, broker credentials, and the Anthropic 
 
 The agent's system prompt is rebuilt on every chat request, so credential changes are immediately reflected in what the agent tells the user it can do.
 
+**Credentials have to escape the agent's memory to be useful.** A subtle but important detail: storing a credential in the encrypted store isn't enough. The Datafye CLI provisions environments from YAML deployment descriptors that use shell-style substitution — `polygon_api_key: ${POLYGON_API_KEY}`. The CLI is a *subprocess* the agent spawns, and it reads those variables from the process environment. If the values only live in the agent's in-memory store, the CLI sees blank substitutions and provisioning silently produces a dataset with no API key.
+
+So `_apply_credentials_env()` walks the store and exports every data-provider, broker, and GitHub credential into `os.environ` — and it does this on bootstrap *and* after every `/v1/credentials/update` push, so a key the user adds mid-session takes effect on the next provision without a restart. Two wrinkles worth knowing:
+
+- **Historical renames are exported under both names.** Polygon became Massive; Palpha became Precision Alpha. A descriptor in the wild might reference either, so the store key `massive_api_key` is exported as *both* `POLYGON_API_KEY` and `MASSIVE_API_KEY`, and `palpha_api_key` as both `PALPHA_API_KEY` and `PRECISION_ALPHA_API_KEY`. The map lives in `_CREDENTIAL_ENV_MAP`.
+- **Unset means unset.** When a credential is absent from the store, `_apply_credentials_env()` *pops* its env vars rather than leaving stale values behind — so revoking a key in Settings actually de-provisions it from the next CLI run.
+
+This generalises the trick the Anthropic key already used (`_apply_anthropic_key()`); the Anthropic key stays on its own path because it additionally *validates* against the Anthropic API, which the others don't.
+
 **ConnectTrade credentials are a special case.** Most credentials are symmetric — one key, one user, done. ConnectTrade has two layers: a *client* identity (who Datafye is, as a ConnectTrade tenant) and a *user* identity (who this particular sandbox's human owner is inside that tenant). They have very different lifetimes:
 
 - **Client creds** (`client_id` / `client_secret`): today these come from env vars (`DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID/_SECRET`). They're the same for every sandbox. TODO: fetch them from the Datafye accounts-manager so we don't have to bake them into AMIs or distribute them through env files.
 - **User creds** (`user_id` / `user_secret`): lazy-provisioned on the first `POST /v1/broker/connections` call by hitting ConnectTrade's `POST /users`, then persisted to `~/.datafye/agent/broker_user.json` (mode `0600`). A single file is fine here because every sandbox is single-user by design — there's nobody else to collide with. TODO: migrate this into accounts-manager per-user storage so a user who blows away their sandbox and gets a new one doesn't end up with an orphaned ConnectTrade user.
 
-The broker module binds the same shared `credentials` dict that the rest of the service uses, so env-provided creds, runtime `/v1/credentials` updates, and lazy-provisioned user creds all converge in one place.
+The broker module binds the same shared `credentials` dict that the rest of the service uses, so env-provided creds, accounts pushes via `/v1/credentials/update`, and lazy-provisioned user creds all converge in one place.
 
 ## Architecture Decisions & Why
 
@@ -196,6 +238,8 @@ Two deployment modes:
 - **Hosted**: Pre-baked AMI in a Rumi private cloud. Each user gets a sandbox instance at `{username}.app.datafye.io`, proxied through a jump server with wildcard SSL. Managed by the datafye-accounts service (elastic stop/start based on activity). The AMI carries no user-specific data — identity, credentials, and the Anthropic key are all delivered at runtime by accounts over HTTP (`POST /bootstrap` and `POST /v1/credentials/update`).
 - **Standalone (Marketplace)**: Minimal AMI with a first-boot script. User provides DNS via EC2 user data; everything downloads and installs on first boot.
 
+The installer no longer takes an `--anthropic-key` flag, and `first-boot.sh` no longer reads an Anthropic key out of EC2 user data. The Anthropic key now arrives the same way every other credential does — over the accounts credentials channel — for *both* hosted and standalone. That collapses what used to be two key-delivery paths into one and lets the installer do something simpler: it just **always starts the agent**, which boots into the awaiting-bootstrap holding state and waits for accounts to push it identity and credentials. There's no longer any "do we have a key to start with?" branch in the install flow. (`pyyaml` was added to `requirements.txt` to parse the deployment descriptor for `env_status`.)
+
 The agent source is open source — the value is in the Datafye platform, not the glue code. Power users can fork and customize the prompt, add tools, tweak behavior.
 
 ## Receive-Only Integration with `datafye-accounts`
@@ -231,7 +275,10 @@ The agent doesn't have a Rumi store (it's Python/FastAPI, not a Rumi application
 - **`POST /v1/credentials/update`** — accounts-only push, body `{provider, value}`. Updates the in-memory store and persists to `credentials.bin` atomically. Returns 204. A push to `anthropic_api_key` also re-syncs and re-validates the Anthropic key.
 - **`GET /health`** — reports `bootstrapped`, `anthropic_key_status`, `credentials_generation`, `last_chat_activity_at`, `running_jobs`, `active_proxied_apps`. `username` and `credentials_generation` are `null` until bootstrapped. Accounts polls this for idle detection and cache-loss recovery (if `credentials_generation` drifts from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section).
 - **`POST /v1/credentials`** — removed; returns 410 Gone. The frontend no longer writes credentials directly to the agent; all writes go through accounts.
+- **`/v1/conversations*`** — the agent's chat-layer conversation store (history replay via `GET /v1/conversations/{id}/history`). The id-minting `POST`/list `GET` are legacy/unused now that accounts is the authoritative project registry; the agent materialises a local record for an accounts-minted id via `conversations.ensure()` on the first chat turn.
 - **JWT validation** on `/v1/chat`, `/v1/credentials/status`, and `/v1/broker/*`: verify the accounts-signed JWT against accounts' JWKS and check `sub == the agent's bootstrapped username`. Reject otherwise.
+
+**Clock skew bit us at bootstrap.** The very first JWT an agent ever sees is the bootstrap token, minted by accounts moments before. If the accounts host's clock runs even a few seconds ahead of the agent's, that token's `iat` (issued-at) lands in the agent's *future*, and PyJWT rejects it with "token is not yet valid (iat)" — a 401 that makes a perfectly correct bootstrap fail intermittently and undebuggably. The fix is to pass `leeway=_CLOCK_SKEW_LEEWAY_SECONDS` (default 60s, env `DATAFYE_AGENT_JWT_LEEWAY_SECONDS`) to *both* `jwt.decode` calls in `auth.py` (`verify_bootstrap_token` and `require_self_jwt`), so small clock differences on any time-based claim (iat/nbf/exp) are tolerated. Lesson: any time you verify a freshly-minted token on a *different* host from the one that signed it, budget for clock skew — distributed clocks are never exactly equal.
 
 ### Why this shape
 
