@@ -98,10 +98,15 @@ strategy takes shape. Prefer short bullet points over prose.
 
 _PROJECT_MD_TEMPLATE = """# {name}
 
-A plain-language description of this trading strategy. Maintain this file as the
-strategy develops: the idea in everyday words, the data it relies on, how the
-logic works, the results seen so far, and lessons learned. Keep it readable and
-engaging, not a dry spec.
+A plain-language story of this trading strategy, written for the user to read.
+Maintain it as the strategy develops. Cover, in everyday words:
+- The idea: what this strategy is trying to capture, and the intuition behind it.
+- The data: which datasets, schemas, and symbols it relies on, and why.
+- How it works: the logic, in plain terms (use an analogy where it helps).
+- Results: what testing has shown so far, honestly.
+- Lessons: what worked, what didn't, and the pitfalls to avoid next time.
+
+Keep it engaging and readable, not a dry spec.
 """
 
 _MEMORY_INDEX_TEMPLATE = """# Strategy Memory

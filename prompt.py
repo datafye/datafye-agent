@@ -30,8 +30,11 @@ def build_system_prompt(
     samples_dir: str,
     credential_summary: str,
     algo_id: str | None = None,
+    memory_context: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
+
+    memory_block = f"\n{memory_context}\n" if memory_context else ""
 
     algo_context = ""
     if algo_id:
@@ -120,7 +123,9 @@ CAPABILITIES:
    Grep to manage the code. Two files in this folder are your durable memory for
    the strategy — keep them current as it evolves:
    - CLAUDE.md: your concise working memory (idea, data in use, decisions, status).
-   - PROJECT.md: a plain-language description of the strategy for the user.
+   - PROJECT.md: a plain-language, engaging story of the strategy for the user —
+     the idea and intuition, the data it uses, how it works (analogies welcome),
+     results so far, and lessons learned. Not a dry spec. Update it as you go.
 
 7. ENVIRONMENT MANAGEMENT
    You manage Datafye foundry and trading environments for the user via the CLI.
@@ -155,7 +160,7 @@ If the user needs a dataset whose provider key is not configured, tell them to a
 in Settings (gear icon in the top right). Do not ask them to paste API keys in chat.
 
 {algo_context}
-
+{memory_block}
 WORKSPACE: {workspace_dir}
 
 FORMATTING:

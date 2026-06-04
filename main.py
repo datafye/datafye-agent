@@ -53,6 +53,7 @@ import auth
 import broker
 import conversations
 import credentials as credentials_module
+import memory
 import skills
 
 # Configure logging
@@ -119,6 +120,14 @@ DATAFYE_DEPLOYMENT_API_URL = os.getenv(
 
 # MCP servers (optional, for additional tooling)
 MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
+
+# The agent runs a single, explicit memory model (see memory.py + conversations.py):
+# global notes/index under the state root, per-strategy CLAUDE.md + memory/ in each
+# strategy folder. The claude CLI that the SDK spawns has its OWN auto-memory feature,
+# which is ON by default and would maintain a second, uncontrolled store. Disable it
+# so there is one coherent memory system. The SDK subprocess inherits this env var.
+# Overridable by pre-setting it in the environment.
+os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 
 
 def check_api_mcp_reachable(url: str, timeout: float = 2.0) -> bool:
@@ -582,6 +591,9 @@ async def stream_agent_response(
         samples_dir=SAMPLES_DIR,
         credential_summary=get_credential_summary(),
         algo_id=algo_id,
+        # Cross-session memory: global notes/index + this strategy's memory index.
+        # Per-strategy CLAUDE.md is auto-loaded by the SDK (project source).
+        memory_context=memory.build_memory_context(cwd if conversation_id else None),
     )
 
     options = ClaudeAgentOptions(
@@ -748,6 +760,11 @@ async def lifespan(app: FastAPI):
     skills.ensure_user_plugin()
     loaded_plugins = [p["path"] for p in skills.build_plugins()]
     logger.info(f"  Skill plugins: {loaded_plugins or 'none'}")
+
+    # Memory: scaffold the global (cross-strategy) memory store. Per-strategy
+    # memory is scaffolded per strategy folder by conversations.ensure().
+    memory.ensure_global_memory()
+    logger.info(f"  Global memory: {memory.GLOBAL_DIR}")
 
     if check_api_mcp_reachable(DATAFYE_API_MCP_URL):
         logger.info(f"  Datafye API MCP: reachable at {DATAFYE_API_MCP_URL}")
