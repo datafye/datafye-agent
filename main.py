@@ -53,6 +53,7 @@ import auth
 import broker
 import conversations
 import credentials as credentials_module
+import skills
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -561,11 +562,23 @@ async def stream_agent_response(
     """Stream responses from Claude Agent SDK with structured SSE events."""
     global anthropic_key_status
 
+    # Each strategy is its own folder, and that folder is the cwd + workspace
+    # for its chat turns: the agent's files, its per-strategy CLAUDE.md memory,
+    # and its per-strategy .claude/skills all live there. ensure() materialises
+    # the folder for an accounts-minted id (the accounts service is the
+    # authoritative project registry; it mints the id, the agent follows).
+    # Conversation-less (legacy/fallback) requests use the shared workspace.
+    if conversation_id:
+        conversations.ensure(conversation_id)
+        cwd = str(conversations.strategy_dir(conversation_id))
+    else:
+        cwd = WORKSPACE_DIR
+
     mcp_servers, allowed_tools = build_mcp_config()
     system_prompt = build_system_prompt(
         docs_dir=DOCS_DIR,
         cli_path=CLI_PATH,
-        workspace_dir=WORKSPACE_DIR,
+        workspace_dir=cwd,
         samples_dir=SAMPLES_DIR,
         credential_summary=get_credential_summary(),
         algo_id=algo_id,
@@ -573,26 +586,26 @@ async def stream_agent_response(
 
     options = ClaudeAgentOptions(
         model=CLAUDE_MODEL,
-        cwd=WORKSPACE_DIR,
+        cwd=cwd,
         system_prompt=system_prompt,
         permission_mode="bypassPermissions",
         mcp_servers=mcp_servers if mcp_servers else None,
         allowed_tools=allowed_tools,
+        # System (read-only) + user-global skills, as local plugins. Rebuilt
+        # per turn so a skill the agent authors mid-session is live next turn.
+        plugins=skills.build_plugins(),
+        # Load the strategy folder's own context: its CLAUDE.md (per-strategy
+        # memory) and its .claude/skills (per-strategy user skills). "project"
+        # is the cwd's .claude; we deliberately do NOT load "user"/"local".
+        setting_sources=["project"],
         include_partial_messages=True,
     )
 
-    # Persist the user's turn and resume the conversation's SDK session.
+    # Persist the user's turn and resume the strategy's SDK session.
     # get_sdk_session is read from disk so resume survives an agent restart;
-    # the in-memory `sessions` map covers conversations not in the store
+    # the in-memory `sessions` map covers strategies not in the store
     # (a frontend running in local-only fallback mode).
-    #
-    # conversation_id is minted by the accounts service (the authoritative
-    # project registry); the agent's store is the chat layer keyed by it.
-    # ensure() materialises an empty record for that id if one does not
-    # exist yet, so the first chat turn against an accounts-minted id
-    # always persists (append_message no-ops on a missing file).
     if conversation_id:
-        conversations.ensure(conversation_id)
         conversations.append_message(conversation_id, "user", message)
         resume_id = conversations.get_sdk_session(conversation_id) or sessions.get(conversation_id)
         if resume_id:
@@ -728,6 +741,13 @@ async def lifespan(app: FastAPI):
     samples_available = os.path.isdir(SAMPLES_DIR)
     logger.info(f"  Docs available: {docs_available}")
     logger.info(f"  Samples dir: {SAMPLES_DIR} (available: {samples_available})")
+
+    # Skills: scaffold the writable user-skill plugin and report which plugin
+    # dirs the SDK will load (system + user-global). Per-strategy skills are
+    # wired in once the strategy folder becomes the cwd.
+    skills.ensure_user_plugin()
+    loaded_plugins = [p["path"] for p in skills.build_plugins()]
+    logger.info(f"  Skill plugins: {loaded_plugins or 'none'}")
 
     if check_api_mcp_reachable(DATAFYE_API_MCP_URL):
         logger.info(f"  Datafye API MCP: reachable at {DATAFYE_API_MCP_URL}")

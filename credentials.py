@@ -46,12 +46,14 @@ from typing import Any
 import msgpack
 from cryptography.fernet import Fernet, InvalidToken
 
+import paths
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PATH = Path(
     os.environ.get(
         "DATAFYE_AGENT_CREDENTIALS_FILE",
-        os.path.expanduser("~/.datafye/agent/credentials.bin"),
+        paths.state_path("credentials.bin"),
     )
 )
 
@@ -61,7 +63,7 @@ DEFAULT_PATH = Path(
 LEGACY_BROKER_FILE = Path(
     os.environ.get(
         "DATAFYE_AGENT_BROKER_STATE_FILE",
-        os.path.expanduser("~/.datafye/agent/broker_user.json"),
+        paths.state_path("broker_user.json"),
     )
 )
 

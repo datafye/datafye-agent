@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "datafye",
+  "version": "0.1.0",
+  "description": "Datafye's built-in algo-development skills: provisioning data/trading environments, backtesting strategies, and connecting brokers. Installer-managed and read-only; updated with each agent release.",
+  "author": {
+    "name": "Datafye",
+    "email": "support@datafye.io"
+  },
+  "skills": [
+    "./skills"
+  ]
+}

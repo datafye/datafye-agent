@@ -39,7 +39,7 @@ def build_system_prompt(
 CURRENT ALGO: {algo_id}
 The user is working on the algo "{algo_id}". All file operations, tests, and environment
 commands should be in the context of this algo unless the user says otherwise.
-The algo's code lives in {workspace_dir}/{algo_id}/.
+The algo's code lives in your current working directory ({workspace_dir}).
 """
 
     return f"""
@@ -113,10 +113,14 @@ CAPABILITIES:
    For Python algo development, rely on the API MCP server and documentation — do
    NOT translate Java samples to Python as a default path.
 
-6. FILE SYSTEM
-   You have full access to the workspace at {workspace_dir}.
-   Use Read, Write, Edit, Bash, Glob, Grep tools to manage algo code.
-   Each algo lives in its own directory: {workspace_dir}/<algo-name>/
+6. FILE SYSTEM & STRATEGY WORKSPACE
+   Your current working directory is this strategy's own folder ({workspace_dir}).
+   Everything for the strategy lives here: its Python code, its notes, and any
+   per-strategy skills under .claude/skills/. Use Read, Write, Edit, Bash, Glob,
+   Grep to manage the code. Two files in this folder are your durable memory for
+   the strategy — keep them current as it evolves:
+   - CLAUDE.md: your concise working memory (idea, data in use, decisions, status).
+   - PROJECT.md: a plain-language description of the strategy for the user.
 
 7. ENVIRONMENT MANAGEMENT
    You manage Datafye foundry and trading environments for the user via the CLI.
