@@ -18,11 +18,16 @@ Datafye Agent is a dedicated per-user AI backend for algorithmic trading strateg
 ```
 datafye-agent/
 ├── main.py          # FastAPI app, endpoints, SSE streaming, session management
-├── prompt.py        # System prompt builder (assembled from runtime context)
+├── prompt.py        # System prompt builder (assembled from runtime context, incl. memory + skills blocks)
 ├── auth.py          # JWT validation against accounts' JWKS (with clock-skew leeway)
 ├── credentials.py   # Encrypted on-disk credentials store
 ├── broker.py        # ConnectTrade broker integration
-├── conversations.py # Per-user on-disk conversation/project store (one JSON file per conversation)
+├── conversations.py # Per-user strategy store — one FOLDER per strategy (meta.json + CLAUDE.md + PROJECT.md + memory/ + .claude/skills/)
+├── memory.py        # Cross-session memory: global store + the memory-protocol block injected into the prompt
+├── skills.py        # Skill plugin wiring (system + user-global plugins) and GET /v1/skills listing
+├── paths.py         # Single agent state-root (DATAFYE_AGENT_STATE_DIR) all per-user state derives from
+├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
+├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
 ├── requirements.txt # Python dependencies (incl. pyyaml for env_status descriptor parsing)
 ├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
 ├── install/
@@ -45,6 +50,9 @@ export DATAFYE_AGENT_DOCS_DIR="/path/to/datafye-docs"
 export DATAFYE_AGENT_CLI_PATH="/path/to/datafye"
 export DATAFYE_AGENT_WORKSPACE="/path/to/workspace"
 export DATAFYE_AGENT_SAMPLES_DIR="/path/to/datafye-samples"
+# Optional: relocate ALL writable state (credentials, strategies, user skills,
+# global memory) under one root — handy to keep local runs out of ~/.datafye
+export DATAFYE_AGENT_STATE_DIR="/path/to/scratch/agent-state"
 
 # Local-dev credential seed (production delivers these as credentials).
 # These are folded into the encrypted credentials store the first time it
@@ -133,6 +141,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/broker/brokers` | GET | List brokers Datafye supports (StocksBroker enum) |
 | `/v1/broker/connections` | GET | List the user's brokerage connections with linked accounts |
 | `/v1/broker/connections` | POST | Create a ConnectTrade OAuth URL for a chosen broker; body `{type, broker}` |
+| `/v1/skills` | GET | List skills available to the agent across all tiers: `system` (predefined, read-only), `user-global` (agent-authored, reusable), `user-strategy` (per-strategy; pass `?conversation_id=`). JWT-protected. Execution is chat-driven ("use the `<name>` skill"), no separate run endpoint |
 | `/v1/broker/connections/{id}` | DELETE | Revoke a brokerage connection |
 | `/v1/conversations` | GET | List conversations (projects), most-recently-updated first. **LEGACY/UNUSED** — accounts is the authoritative project registry; the frontend lists from accounts |
 | `/v1/conversations` | POST | Create a conversation (agent mints the id, deduces a name). **LEGACY/UNUSED** — accounts mints project ids; new chat threads arrive with an accounts-minted `conversation_id` that `/v1/chat` materialises via `conversations.ensure()` |
@@ -188,7 +197,11 @@ push lands.
 | `DATAFYE_AGENT_BROKER_REDIRECT_URL` | `https://developer.datafye.io/broker-callback.html` | OAuth redirect target |
 | `DATAFYE_AGENT_BROKER_STATE_FILE` | `~/.datafye/agent/broker_user.json` | Where the ConnectTrade user_id / user_secret are persisted (TODO: migrate to accounts-manager) |
 | `DATAFYE_AGENT_DEPLOYMENT_API_URL` | `http://local-foundry-dev-api.datafye.local:7776` | Datafye deployment REST API base URL — read after a chat turn to derive `descriptor` / `env_status` from the deployment descriptor (`GET .../deployment/{descriptor,datasets,symbols}`) |
-| `DATAFYE_AGENT_CONVERSATIONS_DIR` | `~/.datafye/agent/conversations` | Directory for the on-disk conversation store (one JSON file per conversation) |
+| `DATAFYE_AGENT_STATE_DIR` | `~/.datafye/agent` | Single root for ALL per-user writable state (credentials, strategies, user-skill plugin, global memory). Relocate everything with one var — used by local tests to avoid polluting `~/.datafye`. Each narrower var below still overrides when set |
+| `DATAFYE_AGENT_STRATEGIES_DIR` | `<state>/strategies` | Base dir holding one FOLDER per strategy (`DATAFYE_AGENT_CONVERSATIONS_DIR` still honored for back-compat; legacy `<id>.json` files migrate into folders on load) |
+| `DATAFYE_AGENT_SYSTEM_PLUGIN_DIR` | `<app>/plugins/datafye` | Read-only system-skill plugin (ships with the app clone) |
+| `DATAFYE_AGENT_USER_PLUGIN_DIR` | `<state>/plugins/user` | Writable user-global skill plugin (agent authors skills here) |
+| `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | `1` (set by the agent) | Disables the `claude` CLI's own auto-memory so the agent runs ONE explicit memory model (see Key Design Decisions). Not a `DATAFYE_` var; `os.environ.setdefault` in main.py, overridable |
 | `DATAFYE_AGENT_JWT_LEEWAY_SECONDS` | `60` | Clock-skew tolerance applied to time-based JWT claims (iat/nbf/exp) when verifying accounts-signed tokens — avoids "token not yet valid (iat)" failures from clock drift |
 
 ## Key Design Decisions
@@ -204,6 +217,9 @@ push lands.
 - **Accounts is the project registry**: Accounts mints conversation/project ids; the agent's own `POST`/`GET /v1/conversations` are legacy/unused. New chat threads arrive with an accounts-minted `conversation_id`, and `/v1/chat` materialises a local chat-layer record via `conversations.ensure()`
 - **Persistent conversations**: `conversations.py` stores each conversation as one JSON file (name, message history, commentary audit trail, SDK session id). `/v1/chat` persists user+assistant turns and resumes the SDK session from disk, so chat survives an agent restart
 - **No `AskUserQuestion` tool**: It's the Claude Code harness's structured-prompt tool with no UI handler in the Datafye workspace, so the model's question would silently vanish. Dropped from `INTERNAL_TOOLS`; the model asks inline in chat text instead
+- **Strategy = folder**: each conversation/strategy is a directory under `<state>/strategies/<id>/` holding `meta.json` + scaffolded `CLAUDE.md` (per-strategy memory), `PROJECT.md` (plain-language strategy narrative), `memory/`, and `.claude/skills/`. That folder is the chat turn's **cwd/workspace**, so the strategy's code, memory, and skills live together and survive a restart. `conversations.ensure()` materialises the folder for an accounts-minted id; legacy `<id>.json` records migrate into folders on load
+- **Skills, three tiers**: the native `Skill` tool is enabled, with skills discovered from local plugins + project source. **System** skills ship read-only in `plugins/datafye` (installer/app-clone managed); **user-global** skills the agent authors into `<state>/plugins/user`; **per-strategy** skills in the strategy's `.claude/skills` (loaded via `setting_sources=["project"]`). The `author-skill` system skill teaches scope-aware authoring. Listing via `GET /v1/skills`; execution is chat-driven. We keep the engine-native mechanism for quality (Claude is post-trained for it) — the `SKILL.md` artifacts are engine-portable if we ever hand-roll the loader for another engine
+- **Convention-based memory (one model)**: durable facts are plain markdown the agent writes/reads, guided by a protocol in the system prompt — **global** (cross-strategy, `<state>/memory` + `CLAUDE.md`) and **per-strategy** (in the strategy folder). Only the always-on `MEMORY.md` indexes + the small `CLAUDE.md` notes are injected; memory bodies are read on demand. The CLI's own auto-memory is **disabled** (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) because it has no global tier, is git-repo-scoped, and stores under `~/.claude` — it would be a second, uncontrolled store
 - **Python-only algos**: No SDK/Java algos - all strategies are pure Python using REST/WebSocket APIs
 - **Conversational config**: Datasets, schemas, and environments are configured through chat, not forms
 

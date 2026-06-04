@@ -62,6 +62,8 @@ Originally that session-id lookup was an in-memory dict, which meant a restarted
 
 ### Conversations: Projects That Survive a Restart
 
+> **Superseded** — a conversation is now a *folder*, not a single JSON file. See [Strategies, Skills, and Memory](#strategies-skills-and-memory) below. The `ensure()`/`create()` identity story in this section still holds; only the on-disk shape changed (`<state>/strategies/<id>/meta.json` plus scaffolded files, with legacy `<id>.json` records migrated in on load).
+
 What the frontend calls a **project** the agent calls a **conversation**, and `conversations.py` is its little on-disk database — one JSON file per conversation under `~/.datafye/agent/conversations/<id>.json`. Each record holds the human-readable name, the message history (user + assistant turns), a *commentary* log (the audit trail of background activity — see below), and the SDK session id.
 
 Three design choices are worth calling out:
@@ -71,6 +73,26 @@ Three design choices are worth calling out:
 - **No per-user namespacing or locking.** The agent serves exactly one user, so there's nobody to collide with; the atomic rename is the only concurrency control needed.
 
 The lesson here is a recurring one in this codebase: **decide who owns identity, then make every other component a follower.** Just as accounts owns the agent's *identity* (bootstrap push) and its *credentials* (credentials push), it now owns the *project registry* too. The agent's job is to materialise local state for ids it's handed, never to invent them — which keeps the agent and accounts from drifting into two competing lists of "what projects exist."
+
+## Strategies, Skills, and Memory
+
+Three capabilities turn the agent from a stateless chat endpoint into a workspace that *remembers* and *learns*. They share one idea — **progressive disclosure**: keep a tiny always-on index in context, fetch the detail on demand.
+
+### A strategy is a folder
+
+What the frontend calls a project, the agent stores as a **directory** — `<state>/strategies/<id>/` — and that directory *is* the working directory for the strategy's chat turns. Inside live the algo's code, a `meta.json` (history + SDK session id), a `CLAUDE.md` (the agent's concise working memory for this strategy, auto-loaded by the engine as project memory), a `PROJECT.md` (a plain-language story of the strategy for the user), a `memory/` folder, and a `.claude/skills/` folder. Everything about one strategy sits in one place and survives a restart. `conversations.ensure(id)` materialises the folder for an accounts-minted id; old single-file conversations migrate into folders on first load. The lesson echoes the rest of the codebase: decide who owns identity (accounts mints the id), then make every other component a follower — the agent just creates a folder for whatever id it's handed.
+
+### Skills in three tiers
+
+The agent has *skills* — named, reusable procedures the model invokes via the native `Skill` tool — owned at three levels. **System** skills ship read-only inside the repo (`plugins/datafye`) and upgrade with the agent. **User-global** skills the agent authors for the user and reuses across every strategy. **Per-strategy** skills live in a strategy's `.claude/skills`. The first two are delivered as local plugins (`--plugin-dir`); the third via the engine's `project` setting-source. A meta-skill, `author-skill`, teaches the agent to write a new skill into the right scope, so "make me a skill that sets up my momentum strategy" just works; `GET /v1/skills` lists them, and running one is a normal chat turn.
+
+We deliberately leaned on the engine's native skill machinery instead of hand-rolling it: Claude is post-trained to use the `Skill` tool well, and quality comes first. But the `SKILL.md` files are plain markdown — engine-agnostic *artifacts* — so if the agent ever runs on a different model engine, only the *loader* changes, not the skills. A wrinkle worth remembering: the `claude` CLI ships its own bundled developer skills (`update-config`, `loop`, …) that surface alongside ours, and the blunt switches to hide them (`--bare`, `--disable-slash-commands`) also kill *our* skills or the `Skill` tool itself — so we leave the bundled ones be (harmless for a developer audience).
+
+### Memory that survives sessions
+
+The agent keeps durable facts as plain markdown it writes and reads itself — no database, no special tool. Two scopes: **global** (cross-strategy: the user's preferences and reusable lessons) and **per-strategy**. The mechanism is pure convention, driven by a protocol in the system prompt: only the one-line `MEMORY.md` *indexes* (and the small `CLAUDE.md` notes) are always in context; the detailed memory files are read on demand when an index line looks relevant. That keeps the per-turn cost flat (~450 tokens, mostly the fixed protocol) even as the store grows.
+
+The interesting decision was *not* to use the CLI's own auto-memory. It sounds like leaving sophistication on the table — until you look: auto-memory is scoped per-git-repository with **no global tier** (so a "2% stop on everything" preference learned in one strategy is invisible in the next), it stores under `~/.claude`, and its "recall" is just the first 200 lines of a `MEMORY.md` prefix — the *same* index-plus-on-demand shape we built. So we run one explicit model we control (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) that fits our two-scope, folder-per-strategy layout. The honest limitation: *whether* to remember and *what* to fetch are both model judgments guided by the protocol, not a guaranteed retrieval engine — a future RAG layer over the same markdown files is the planned upgrade for scale.
 
 ### Commentary: A Live Activity Feed
 
