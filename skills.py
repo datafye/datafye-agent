@@ -116,3 +116,55 @@ def build_plugins() -> list[dict]:
         else:
             logger.warning("Skipping plugin dir without manifest: %s", path)
     return plugins
+
+
+def user_global_skills_dir() -> Path:
+    """Directory the agent writes user-global (cross-strategy) skills into."""
+    return USER_PLUGIN_DIR / "skills"
+
+
+def _read_frontmatter(skill_md: Path) -> dict:
+    """Parse the YAML frontmatter (name/description) at the top of a SKILL.md."""
+    try:
+        text = skill_md.read_text()
+    except OSError:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)  # ['', frontmatter, body]
+    if len(parts) < 3:
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(parts[1]) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _scan_skills(skills_root: Path, scope: str) -> list[dict]:
+    """List <skills_root>/<name>/SKILL.md entries as {name, description, scope}."""
+    out: list[dict] = []
+    if not skills_root.is_dir():
+        return out
+    for child in sorted(skills_root.iterdir()):
+        md = child / "SKILL.md"
+        if child.is_dir() and md.is_file():
+            fm = _read_frontmatter(md)
+            out.append({
+                "name": fm.get("name") or child.name,
+                "description": (fm.get("description") or "").strip(),
+                "scope": scope,
+            })
+    return out
+
+
+def list_skills(strategy_cwd: str | None = None) -> list[dict]:
+    """All skills available to the agent, across the three tiers: system
+    (predefined), user-global (agent-authored, reusable), and user-strategy
+    (this strategy only — included when strategy_cwd is given)."""
+    result = _scan_skills(SYSTEM_PLUGIN_DIR / "skills", "system")
+    result += _scan_skills(user_global_skills_dir(), "user-global")
+    if strategy_cwd:
+        result += _scan_skills(Path(strategy_cwd) / ".claude" / "skills", "user-strategy")
+    return result

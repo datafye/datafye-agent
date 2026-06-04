@@ -594,6 +594,8 @@ async def stream_agent_response(
         # Cross-session memory: global notes/index + this strategy's memory index.
         # Per-strategy CLAUDE.md is auto-loaded by the SDK (project source).
         memory_context=memory.build_memory_context(cwd if conversation_id else None),
+        # Where to write user-authored skills (the author-skill skill uses this).
+        skills_dir=str(skills.user_global_skills_dir()),
     )
 
     options = ClaudeAgentOptions(
@@ -944,6 +946,20 @@ async def chat(request: ChatRequest):
         ),
         media_type="text/event-stream"
     )
+
+
+@app.get("/v1/skills", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def get_skills(conversation_id: Optional[str] = None):
+    """List the skills available to the agent, across all tiers:
+      - system: predefined, read-only (shipped with the agent)
+      - user-global: agent-authored, reusable across strategies
+      - user-strategy: specific to one strategy (included when conversation_id is given)
+
+    The frontend uses this to show a skill list; "running" a skill is a normal
+    chat turn (e.g. "use the <name> skill"), which the model services via the
+    Skill tool — there is no separate execution endpoint."""
+    cwd = str(conversations.strategy_dir(conversation_id)) if conversation_id else None
+    return {"skills": skills.list_skills(cwd)}
 
 
 @app.post("/v1/credentials")

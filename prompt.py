@@ -31,10 +31,23 @@ def build_system_prompt(
     credential_summary: str,
     algo_id: str | None = None,
     memory_context: str = "",
+    skills_dir: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
 
     memory_block = f"\n{memory_context}\n" if memory_context else ""
+
+    skills_block = ""
+    if skills_dir:
+        skills_block = f"""
+SKILLS:
+You have reusable skills (surfaced to you as available skills you can invoke). Some are
+built-in Datafye skills; you can also create new ones for the user with the `author-skill`
+skill. When you author a user skill, place it by scope:
+- Reusable across all the user's strategies: {skills_dir}/<skill-name>/SKILL.md
+- Specific to THIS strategy only: ./.claude/skills/<skill-name>/SKILL.md (in this strategy folder)
+A newly created skill becomes available on the next message.
+"""
 
     algo_context = ""
     if algo_id:
@@ -161,6 +174,7 @@ in Settings (gear icon in the top right). Do not ask them to paste API keys in c
 
 {algo_context}
 {memory_block}
+{skills_block}
 WORKSPACE: {workspace_dir}
 
 FORMATTING:
