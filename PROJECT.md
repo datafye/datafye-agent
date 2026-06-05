@@ -1,5 +1,7 @@
 # Datafye Agent
 
+> **TODOs** for this project live in `gtm/datafye/TODO.md` (GTM is the single source of truth for open work).
+
 ## What Is This?
 
 This is the brain behind Datafye's AI-powered algo development experience. When a user sits down in the Datafye Agent App (the frontend) and says "I want to build a strategy that buys stocks when their 10-day moving average crosses above the 50-day," this backend is what turns that sentence into a working, testable trading algorithm.
