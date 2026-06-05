@@ -852,6 +852,24 @@ async def health():
     )
 
 
+BOM_PATH = os.getenv("DATAFYE_AGENT_BOM_PATH", "/opt/datafye/agent/bom.json")
+
+
+@app.get("/v1/bom")
+async def bom():
+    """Dependency bill-of-materials — the Datafye version this agent is built
+    against. Datafye versions all components (platform, samples, CLI, docs)
+    together, so it's a single version. Unauthenticated like /health (version
+    numbers aren't sensitive); rendered on the Yukti agent surface."""
+    try:
+        with open(BOM_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"agent_version": os.getenv("DATAFYE_AGENT_VERSION", "dev"), "dependencies": {}, "note": "bom.json not present"}
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=500, detail=f"could not read BOM: {e}")
+
+
 @app.post("/bootstrap")
 async def bootstrap(authorization: Optional[str] = Header(default=None)):
     """Bootstrap the agent — called by the accounts service once the

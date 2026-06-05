@@ -133,6 +133,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals. Always available, including before bootstrap |
+| `/v1/bom` | GET | Dependency bill-of-materials — the single Datafye version this agent is built against (platform/samples/CLI/docs share one version). Reads `bom.json`; unauthenticated like `/health`; rendered on the Yukti agent surface |
 | `/bootstrap` | POST | Accounts-only. Bootstrap the agent's identity + credentials-store key from an accounts-signed JWT (`Authorization: Bearer`, `purpose=agent-bootstrap`). Idempotent for the same user; 409 on rebind |
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
 | `/v1/credentials` | POST | REMOVED — returns 410 Gone; credential writes go through the accounts service |

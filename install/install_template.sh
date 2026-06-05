@@ -594,6 +594,20 @@ chmod 600 "${ENV_FILE}"
 echo "${VERSION}" > "${INSTALL_DIR}/version"
 ok "Config: ${ENV_FILE}"
 
+# Dependency BOM — served by the agent at GET /v1/bom and shown on the Yukti
+# agent surface. Datafye versions all components together, so a single version
+# covers platform, samples, CLI, and docs.
+cat > "${INSTALL_DIR}/bom.json" << EOF
+{
+  "agent_version": "${VERSION}",
+  "built_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "dependencies": {
+    "datafye": {"version": "${VERSION}", "covers": "platform, samples, CLI, docs (Datafye versions all components on one number)"}
+  }
+}
+EOF
+ok "BOM: ${INSTALL_DIR}/bom.json"
+
 # ── Write systemd service ────────────────────────────────────────
 cat > /etc/systemd/system/datafye-agent.service << EOF
 [Unit]
