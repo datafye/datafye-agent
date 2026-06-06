@@ -424,21 +424,34 @@ def truncate(text: str, limit: int = 150) -> str:
     return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
 
 
-def _tool_commentary(tool: str, tool_input: dict) -> Optional[str]:
-    """A human activity line for a tool call, or None to skip it.
+def _tool_commentary(tool: str, tool_input: dict):
+    """A sanitized, high-level activity line for a tool call as
+    (text, level), or None to skip it.
 
-    Only tools that represent meaningful background work — shell commands
-    and Datafye environment calls — become commentary; the file-level
-    tools (Read/Edit/Grep/...) are too granular for the activity panel.
+    Deliberately generic — NO file paths, commands, or source identifiers are
+    surfaced. The activity panel exists to signal that the agent is working;
+    it is not a debug log. Levels drive the panel's colour-coding: "muted"
+    (routine, dim scrolling), "notable" (environment work, emphasised),
+    "error" (a step failed). The same shape is used across the agents.
     """
+    if tool in ("Read", "NotebookRead"):
+        return ("Reading reference material", "muted")
+    if tool in ("Grep", "Glob"):
+        return ("Searching for relevant details", "muted")
+    if tool in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
+        return ("Updating a file in the workspace", "muted")
     if tool == "Bash":
-        cmd = (tool_input or {}).get("command", "")
-        return f"Running: {truncate(cmd, 90)}" if cmd else "Running a command"
+        return ("Running a workspace command", "muted")
+    if tool in ("WebFetch", "WebSearch"):
+        return ("Looking something up online", "muted")
+    if tool == "Task":
+        return ("Working through a sub-task", "muted")
+    if tool == "TodoWrite":
+        return ("Planning the next steps", "muted")
     if tool.startswith("mcp__datafye-api__"):
-        return "Querying the Datafye environment"
+        return ("Working in the Datafye environment", "notable")
     if tool.startswith("mcp__"):
-        parts = tool.split("__")
-        return f"Using the {parts[1]} tool" if len(parts) > 1 else None
+        return ("Using a connected tool", "notable")
     return None
 
 
@@ -684,17 +697,26 @@ async def stream_agent_response(
                         # persist it as the conversation's audit trail.
                         note = _tool_commentary(tool_name, tool_input)
                         if note:
-                            if conversation_id:
-                                conversations.append_commentary(conversation_id, note)
-                            yield sse_event('commentary', {'text': note})
+                            text, level = note
+                            # Persist only the meaningful trail (env/error),
+                            # not every routine read/search.
+                            if conversation_id and level != 'muted':
+                                conversations.append_commentary(conversation_id, text)
+                            yield sse_event('commentary', {'text': text, 'kind': level})
 
                     # Tool result
                     elif hasattr(block, 'tool_use_id'):
+                        is_err = bool(getattr(block, 'is_error', False))
                         yield sse_event('tool_result', {
                             'tool_use_id': getattr(block, 'tool_use_id', ''),
                             'content': str(getattr(block, 'content', '') or ''),
                             'is_error': getattr(block, 'is_error', False)
                         })
+                        if is_err:
+                            err_text = 'A step reported an error'
+                            if conversation_id:
+                                conversations.append_commentary(conversation_id, err_text)
+                            yield sse_event('commentary', {'text': err_text, 'kind': 'error'})
 
             # Stream events
             elif hasattr(msg, 'event'):
