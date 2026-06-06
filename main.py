@@ -707,6 +707,8 @@ async def stream_agent_response(
                     'session_id': getattr(msg, 'session_id', None),
                     'duration_ms': getattr(msg, 'duration_ms', None),
                     'cost_usd': getattr(msg, 'total_cost_usd', None),
+                    'usage': getattr(msg, 'usage', None),
+                    'num_turns': getattr(msg, 'num_turns', None),
                 })
 
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
