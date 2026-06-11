@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -1137,6 +1137,18 @@ async def conversation_history(conversation_id: str):
         "messages": record.get("messages", []),
         "commentary": record.get("commentary", []),
     }
+
+
+@app.delete("/v1/conversations/{conversation_id}",
+            dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def delete_conversation(conversation_id: str):
+    """Permanently delete a strategy: the agent-side folder (meta, algo code,
+    per-strategy memory + skills). 404 if the agent never materialised it.
+    Accounts deletes its project registry record separately, so a strategy that
+    exists in accounts but never here still deletes cleanly there."""
+    if not conversations.delete(conversation_id):
+        raise HTTPException(status_code=404, detail="No such conversation")
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":

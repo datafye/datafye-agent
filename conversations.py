@@ -280,6 +280,28 @@ def rename(conversation_id: str, name: str) -> Optional[dict]:
     return record
 
 
+def delete(conversation_id: str) -> bool:
+    """Permanently remove a strategy: its folder and everything in it (meta,
+    algo code, per-strategy memory + skills). Returns False if there was no such
+    strategy. nvx-accounts stays the authoritative registry and deletes its own
+    project record separately."""
+    base = _BASE_DIR.resolve()
+    try:
+        resolved = strategy_dir(conversation_id).resolve()
+    except Exception:
+        return False
+    # safety: never rmtree anything outside the strategies base (guards a
+    # malformed/hostile id like ".." even though accounts mints clean ids).
+    if resolved == base or base not in resolved.parents:
+        logger.warning("Refusing to delete strategy outside base: %s", conversation_id)
+        return False
+    if not resolved.exists():
+        return False
+    shutil.rmtree(resolved, ignore_errors=True)
+    logger.info("Deleted strategy %s", conversation_id)
+    return True
+
+
 def append_message(conversation_id: str, role: str, content: str) -> None:
     """Append a user/assistant turn. No-op if the strategy does not exist
     (e.g. a frontend running in local-only fallback mode)."""
