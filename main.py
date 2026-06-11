@@ -1208,6 +1208,25 @@ async def delete_conversation(conversation_id: str):
     return Response(status_code=204)
 
 
+# Fail fast at startup if a load-bearing route is missing (e.g. a mis-applied
+# edit clobbered its decorator). Otherwise the agent would serve /health 200
+# while silently 404'ing /bootstrap, masking a broken agent as "Running". A
+# missing route now crashes startup loudly.
+_REQUIRED_ROUTES = {
+    ("GET", "/health"),
+    ("POST", "/bootstrap"),
+    ("POST", "/v1/chat"),
+}
+_present_routes = {
+    (_m, getattr(_r, "path", None))
+    for _r in app.routes
+    for _m in (getattr(_r, "methods", None) or ())
+}
+_missing_routes = sorted(f"{_m} {_p}" for (_m, _p) in _REQUIRED_ROUTES if (_m, _p) not in _present_routes)
+if _missing_routes:
+    raise RuntimeError(f"Required agent routes are not registered: {_missing_routes}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
