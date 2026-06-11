@@ -424,6 +424,49 @@ def truncate(text: str, limit: int = 150) -> str:
     return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
 
 
+# A short, cheap model used only to summarize a strategy's first message into a
+# title — never the main reasoning model.
+TITLE_MODEL = os.getenv("DATAFYE_AGENT_TITLE_MODEL", "claude-haiku-4-5")
+_TITLE_PROMPT = (
+    "Generate a short, specific title (3 to 6 words, Title Case, no quotes, no "
+    "trailing punctuation) summarizing this request. Reply with ONLY the title.\n\nRequest: "
+)
+
+
+async def generate_title(first_message: str) -> Optional[str]:
+    """Summarize the user's first message into a short strategy title via a
+    cheap model call (direct Anthropic API, the key is already in the env).
+    Returns None on any failure, in which case the caller keeps the provisional
+    first-few-words name."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    msg = (first_message or "").strip()
+    if not key or not msg:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": TITLE_MODEL,
+                    "max_tokens": 24,
+                    "messages": [{"role": "user", "content": _TITLE_PROMPT + msg[:2000]}],
+                },
+            )
+        resp.raise_for_status()
+        parts = resp.json().get("content", [])
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        title = text.strip().strip('"“”\'').rstrip(".").strip()
+        return title[:60] or None
+    except Exception as e:
+        logger.warning("Title generation failed: %s", e)
+        return None
+
+
 def _tool_commentary(tool: str, tool_input: dict):
     """A sanitized, high-level activity line for a tool call as
     (text, level), or None to skip it.
@@ -632,7 +675,12 @@ async def stream_agent_response(
     # get_sdk_session is read from disk so resume survives an agent restart;
     # the in-memory `sessions` map covers strategies not in the store
     # (a frontend running in local-only fallback mode).
+    # Detect the first turn of a new conversation (no prior messages) BEFORE we
+    # append this one — used below to summarize the first ask into a title.
+    is_first_turn = False
     if conversation_id:
+        _existing = conversations.get(conversation_id)
+        is_first_turn = not (_existing and _existing.get("messages"))
         conversations.append_message(conversation_id, "user", message)
         resume_id = conversations.get_sdk_session(conversation_id) or sessions.get(conversation_id)
         if resume_id:
@@ -748,6 +796,15 @@ async def stream_agent_response(
             yield sse_event('descriptor', {'descriptor': deployment_state['descriptor_text']})
             # Derived environment status for the frontend's env display.
             yield sse_event('env_status', _derive_env_status(deployment_state))
+
+        # First turn of a new conversation: replace the provisional first-few-
+        # words name with an LLM-summarized title. The app adopts it (sidebar +
+        # accounts registry). Best-effort — a failure keeps the provisional name.
+        if conversation_id and is_first_turn:
+            title = await generate_title(message)
+            if title:
+                conversations.rename(conversation_id, title)
+                yield sse_event('title', {'conversation_id': conversation_id, 'name': title})
 
         yield sse_event('done', {})
 
