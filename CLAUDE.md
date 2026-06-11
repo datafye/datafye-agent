@@ -147,6 +147,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/conversations` | GET | List conversations (projects), most-recently-updated first. **LEGACY/UNUSED** — accounts is the authoritative project registry; the frontend lists from accounts |
 | `/v1/conversations` | POST | Create a conversation (agent mints the id, deduces a name). **LEGACY/UNUSED** — accounts mints project ids; new chat threads arrive with an accounts-minted `conversation_id` that `/v1/chat` materialises via `conversations.ensure()` |
 | `/v1/conversations/{id}` | PATCH | Rename a conversation; 404 if absent |
+| `/v1/conversations/{id}` | DELETE | Permanently delete a strategy's agent-side folder via `conversations.delete()` (path-safety guard refuses anything outside the strategies base); 204 on success, 404 if the agent never materialised it. Accounts deletes its own project record separately |
 | `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail |
 
 Every endpoint except `/health` and `/bootstrap` is gated by the
@@ -158,6 +159,7 @@ push lands.
 | Event | Description |
 |-------|-------------|
 | `init` | Session initialized |
+| `title` | Summary-generated strategy title (`{conversation_id, name}`). Emitted once on the first turn of a new conversation after `generate_title()` summarizes the first message and renames the strategy; Yukti adopts it over the provisional `deduce_name` |
 | `content` | Text content chunk |
 | `thinking` | Agent reasoning |
 | `tool_use_start` | Tool invocation started |
@@ -177,6 +179,7 @@ push lands.
 |----------|---------|-------------|
 | `DATAFYE_AGENT_ANTHROPIC_API_KEY` | - | Local-dev seed only. The Anthropic key is a *credential* — in production it lives in the encrypted credentials store and is delivered by accounts via `/v1/credentials/update`. This env var only seeds the store the first time it is created |
 | `DATAFYE_AGENT_MODEL` | `opus` | Claude model |
+| `DATAFYE_AGENT_TITLE_MODEL` | `claude-haiku-4-5` | Cheap model used only by `generate_title()` to summarize a new strategy's first message into a title (direct Anthropic `/v1/messages` httpx call, never the main reasoning model) |
 | `DATAFYE_AGENT_PORT` | `18780` | HTTP port |
 | `DATAFYE_AGENT_WORKSPACE` | `/home/datafye/workspace` | User workspace directory |
 | `DATAFYE_AGENT_DOCS_DIR` | `/home/datafye/docs` | Path to Datafye docs |
@@ -215,6 +218,8 @@ push lands.
 - **Anthropic key as a credential**: The Anthropic key is not a startup env var; it lives in the encrypted credentials store and is delivered via the credentials push channel. The agent starts and stays manageable with no key — chat just returns 503/502 until a valid key arrives
 - **Credentials via accounts**: The accounts service pushes credential updates to `/v1/credentials/update`; the old direct-write `/v1/credentials` endpoint is gone
 - **Credentials synced to the environment**: `_apply_credentials_env()` exports the data-provider/broker/GitHub credentials from the encrypted store into `os.environ` (under both historical and current names, e.g. `POLYGON_API_KEY`+`MASSIVE_API_KEY`) on bootstrap and after every credentials push, so the Datafye CLI's `${VAR}` substitution in deployment descriptors resolves. (Previously only `ANTHROPIC_API_KEY` was exported.)
+- **Summary-generated strategy titles**: on the first turn of a new conversation, `generate_title()` makes one cheap direct Anthropic call (haiku, `DATAFYE_AGENT_TITLE_MODEL`) to summarize the first message, renames the strategy, and emits a `title` SSE event that Yukti adopts. It's best-effort — any failure (no key, API error) returns None and the provisional `deduce_name` first-few-words name stays. This is the one place the agent calls the model directly rather than through the Agent SDK
+- **Startup route guard**: a module-level check at the bottom of `main.py` asserts that `/health`, `/bootstrap`, and `/v1/chat` are registered, and raises `RuntimeError` at import/boot if any is missing. Otherwise a mis-applied edit that clobbered a route decorator would let the agent serve `/health` 200 while silently 404'ing `/bootstrap`, masking a broken agent as "Running" — a missing load-bearing route now crashes startup loudly
 - **Accounts is the project registry**: Accounts mints conversation/project ids; the agent's own `POST`/`GET /v1/conversations` are legacy/unused. New chat threads arrive with an accounts-minted `conversation_id`, and `/v1/chat` materialises a local chat-layer record via `conversations.ensure()`
 - **Persistent conversations**: `conversations.py` stores each conversation as one JSON file (name, message history, commentary audit trail, SDK session id). `/v1/chat` persists user+assistant turns and resumes the SDK session from disk, so chat survives an agent restart
 - **No `AskUserQuestion` tool**: It's the Claude Code harness's structured-prompt tool with no UI handler in the Datafye workspace, so the model's question would silently vanish. Dropped from `INTERNAL_TOOLS`; the model asks inline in chat text instead
