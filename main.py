@@ -467,6 +467,148 @@ async def generate_title(first_message: str) -> Optional[str]:
         return None
 
 
+# -- Lifecycle stage classification --------------------------------
+# Cheap, best-effort, post-stream — mirrors generate_title (haiku, direct
+# Anthropic call). Classifies where the strategy build is in its lifecycle so
+# the workspace stepper can advance. On any failure the stepper keeps its value.
+_STAGE_PROMPT = (
+    "You classify where an algorithmic-trading-strategy build is in its "
+    "lifecycle. The stages, in order:\n"
+    "- Idea: capturing the strategy hypothesis / goal.\n"
+    "- Design: choosing signals, entry/exit, and risk rules.\n"
+    "- Build: implementing the algo.\n"
+    "- Backtest: validating + refining against historical data.\n"
+    "- Validate: paper-trading against live data.\n"
+    "- Deploy: live (real-money) trading.\n"
+    "Given the prior stage and the latest exchange, reply with ONLY the single "
+    "stage word that best describes where the work is NOW (it may stay the same, "
+    "advance, or move back).\n\n"
+)
+
+
+async def classify_stage(prior_stage: str, user_message: str, assistant_text: str) -> Optional[str]:
+    """Return the strategy's current lifecycle stage (one of conversations.STAGES)
+    or None on any failure (caller keeps the prior stage)."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    try:
+        convo = (f"Prior stage: {prior_stage}\n"
+                 f"User: {(user_message or '')[:1500]}\n"
+                 f"Assistant: {(assistant_text or '')[:1500]}")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": TITLE_MODEL,
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": _STAGE_PROMPT + convo}],
+                },
+            )
+        resp.raise_for_status()
+        parts = resp.json().get("content", [])
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        word = text.strip().strip('".').split()[0] if text.strip() else ""
+        for s in conversations.STAGES:
+            if s.lower() == word.lower():
+                return s
+        return None
+    except Exception as e:
+        logger.warning("Stage classification failed: %s", e)
+        return None
+
+
+# -- Usage tracking ------------------------------------------------
+# Per (stage × model) token/cost/tool usage. Accumulated into the strategy's
+# meta (drives the workspace telemetry, survives reload via /history) AND
+# reported to accounts (billing + the hosted-tier quota meter). The accounts
+# report forwards the user's own JWT, so it writes as self-or-admin — no new
+# secret.
+
+def _usage_get(u, key):
+    """Read a token field from the SDK usage object (dict or attr-bearing)."""
+    if u is None:
+        return None
+    if isinstance(u, dict):
+        return u.get(key)
+    return getattr(u, key, None)
+
+
+def _usage_delta(metrics: dict, tool_calls: int) -> dict:
+    """Build the turn's usage delta from the stashed ResultMessage metrics."""
+    u = metrics.get("usage")
+
+    def g(*keys):
+        for k in keys:
+            v = _usage_get(u, k)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    cost = metrics.get("cost_usd") or 0.0
+    try:
+        cost_micros = int(round(float(cost) * 1_000_000))
+    except (TypeError, ValueError):
+        cost_micros = 0
+    return {
+        "tokens_in": g("input_tokens"),
+        "tokens_out": g("output_tokens"),
+        "cache_read": g("cache_read_input_tokens"),
+        "cache_create": g("cache_creation_input_tokens"),
+        "cost_micros": cost_micros,
+        "tool_calls": int(tool_calls or 0),
+        "turns": int(metrics.get("num_turns") or 0),
+    }
+
+
+def _model_label(model: str) -> str:
+    """The model id to attribute usage to (the configured DATAFYE_AGENT_MODEL —
+    an alias like 'opus' or a full id); the frontend prettifies it."""
+    return (model or "").strip() or "unknown"
+
+
+def _turn_index(conversation_id: str) -> int:
+    """A stable per-conversation turn number (count of assistant messages),
+    used with the session id to form the idempotency key."""
+    rec = conversations.get(conversation_id) or {}
+    msgs = rec.get("messages") or []
+    return sum(1 for m in msgs if (m or {}).get("role") == "assistant")
+
+
+async def _report_usage_to_accounts(conversation_id: str, stage: str, model: str,
+                                    delta: dict, idem: str, auth_token: Optional[str]) -> None:
+    """Best-effort: POST the turn's usage delta to accounts, forwarding the
+    user's JWT. Meta accumulation already happened, so a failure here only misses
+    the billing roll-up — never the workspace display, never the turn."""
+    if not auth_token or not AGENT_USERNAME:
+        return  # no forwarded identity (e.g. a self-hosted local run) — meta-only
+    # Only accounts-registered strategies carry usage there (accounts mints
+    # "proj-" ids; a legacy "c-" id is agent-local and not in the registry).
+    if not conversation_id.startswith("proj-"):
+        return
+    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+           f"{AGENT_USERNAME}/projects/{conversation_id}/usage")
+    body = {"idempotency_key": idem, "stage": stage, "model": model}
+    body.update(delta)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=body,
+                                     headers={"Authorization": f"Bearer {auth_token}"})
+            if resp.status_code >= 400:
+                logger.warning("Usage report to accounts returned %s for %s",
+                               resp.status_code, conversation_id)
+    except Exception as e:
+        logger.warning("Usage report to accounts failed for %s: %s", conversation_id, e)
+
+
 def _tool_commentary(tool: str, tool_input: dict):
     """A sanitized, high-level activity line for a tool call as
     (text, level), or None to skip it.
@@ -484,6 +626,9 @@ def _tool_commentary(tool: str, tool_input: dict):
     if tool in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
         return ("Updating a file in the workspace", "muted")
     if tool == "Bash":
+        cmd = ((tool_input or {}).get("command") or "").lower()
+        if any(k in cmd for k in ("backtest", "paper", "validate", "test", "pytest")):
+            return ("Running the backtest", "check")
         return ("Running a workspace command", "muted")
     if tool in ("WebFetch", "WebSearch"):
         return ("Looking something up online", "muted")
@@ -492,7 +637,12 @@ def _tool_commentary(tool: str, tool_input: dict):
     if tool == "TodoWrite":
         return ("Planning the next steps", "muted")
     if tool.startswith("mcp__datafye-api__"):
-        return ("Working in the Datafye environment", "notable")
+        op = tool.split("mcp__datafye-api__", 1)[1].lower()
+        if any(k in op for k in ("backtest", "validate", "paper", "test")):
+            return ("Validating against market data", "check")
+        if any(k in op for k in ("provision", "deploy", "create", "morph")):
+            return ("Setting up the trading environment", "notable")
+        return ("Working in the Datafye environment", "muted")
     if tool.startswith("mcp__"):
         return ("Using a connected tool", "notable")
     return None
@@ -602,6 +752,7 @@ async def tracked_stream_agent_response(
     message: str,
     conversation_id: Optional[str],
     algo_id: Optional[str],
+    auth_token: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Wraps stream_agent_response with running_jobs + lastChatActivityAt
     bookkeeping. Increments running_jobs at stream start, decrements at end
@@ -611,7 +762,7 @@ async def tracked_stream_agent_response(
     last_chat_activity_at = int(time.time() * 1000)
     running_jobs += 1
     try:
-        async for event in stream_agent_response(message, conversation_id, algo_id):
+        async for event in stream_agent_response(message, conversation_id, algo_id, auth_token):
             yield event
     finally:
         running_jobs -= 1
@@ -623,6 +774,7 @@ async def stream_agent_response(
     message: str,
     conversation_id: Optional[str],
     algo_id: Optional[str],
+    auth_token: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Stream responses from Claude Agent SDK with structured SSE events."""
     global anthropic_key_status
@@ -697,6 +849,8 @@ async def stream_agent_response(
     try:
         msg_count = 0
         assistant_text = ""
+        tool_calls_this_turn = 0
+        result_metrics = None  # stashed from ResultMessage; reported after stage classification
 
         async for msg in query(prompt=message, options=options):
             msg_count += 1
@@ -735,6 +889,7 @@ async def stream_agent_response(
                     elif hasattr(block, 'name') and hasattr(block, 'input'):
                         tool_name = getattr(block, 'name', '')
                         tool_input = getattr(block, 'input', {})
+                        tool_calls_this_turn += 1
                         yield sse_event('tool_use_start', {
                             'tool': tool_name,
                             'id': getattr(block, 'id', ''),
@@ -746,10 +901,11 @@ async def stream_agent_response(
                         note = _tool_commentary(tool_name, tool_input)
                         if note:
                             text, level = note
-                            # Persist only the meaningful trail (env/error),
-                            # not every routine read/search.
-                            if conversation_id and level != 'muted':
-                                conversations.append_commentary(conversation_id, text)
+                            # Persist every level (the Work panel is the
+                            # auditable side-mirror — it replays the ground-level
+                            # detail, not just milestones; the store is capped).
+                            if conversation_id:
+                                conversations.append_commentary(conversation_id, text, level)
                             yield sse_event('commentary', {'text': text, 'kind': level})
 
                     # Tool result
@@ -763,7 +919,7 @@ async def stream_agent_response(
                         if is_err:
                             err_text = 'A step reported an error'
                             if conversation_id:
-                                conversations.append_commentary(conversation_id, err_text)
+                                conversations.append_commentary(conversation_id, err_text, 'error')
                             yield sse_event('commentary', {'text': err_text, 'kind': 'error'})
 
             # Stream events
@@ -780,6 +936,14 @@ async def stream_agent_response(
                     'usage': getattr(msg, 'usage', None),
                     'num_turns': getattr(msg, 'num_turns', None),
                 })
+                # Stash the turn's usage; reported AFTER stage classification so
+                # the delta is attributed to the stage this turn landed in.
+                result_metrics = {
+                    'session_id': getattr(msg, 'session_id', None),
+                    'cost_usd': getattr(msg, 'total_cost_usd', None),
+                    'usage': getattr(msg, 'usage', None),
+                    'num_turns': getattr(msg, 'num_turns', None),
+                }
 
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
         if conversation_id and assistant_text:
@@ -805,6 +969,41 @@ async def stream_agent_response(
             if title:
                 conversations.rename(conversation_id, title)
                 yield sse_event('title', {'conversation_id': conversation_id, 'name': title})
+
+        # Track the strategy lifecycle stage for the workspace stepper. Cheap,
+        # best-effort, post-stream. Emit only when known.
+        if conversation_id:
+            rec = conversations.get(conversation_id) or {}
+            stage = await classify_stage(rec.get("stage") or "Idea", message, assistant_text)
+            if stage:
+                updated = conversations.set_stage(conversation_id, stage) or {}
+                yield sse_event('stage', {
+                    'conversation_id': conversation_id,
+                    'stage': updated.get('stage', stage),
+                    'maxStage': updated.get('maxStage', stage),
+                })
+
+        # Record + report this turn's usage, attributed to the stage it landed
+        # in and the model that ran it. Drives the workspace telemetry (meta,
+        # replayed by /history) and the accounts billing/quota roll-up
+        # (best-effort, forwarding the user's JWT). Never breaks the turn.
+        if conversation_id and result_metrics:
+            try:
+                delta = _usage_delta(result_metrics, tool_calls_this_turn)
+                stage_now = (conversations.get(conversation_id) or {}).get('stage', 'Idea')
+                model_id = _model_label(CLAUDE_MODEL)
+                idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
+                updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
+                if updated_usage is not None:
+                    yield sse_event('usage', {
+                        'conversation_id': conversation_id,
+                        'usage': updated_usage,
+                        'stage': stage_now,
+                        'model': model_id,
+                    })
+                await _report_usage_to_accounts(conversation_id, stage_now, model_id, delta, idem, auth_token)
+            except Exception as e:
+                logger.warning("Usage tracking failed for %s: %s", conversation_id, e)
 
         yield sse_event('done', {})
 
@@ -1003,7 +1202,7 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
 
 
 @app.post("/v1/chat", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, authorization: Optional[str] = Header(default=None)):
     """
     Streaming chat endpoint using Server-Sent Events.
 
@@ -1037,11 +1236,17 @@ async def chat(request: ChatRequest):
             detail="The configured Anthropic API key is invalid",
         )
 
+    # The caller's own JWT (already verified by require_self_jwt) — forwarded
+    # verbatim when reporting usage to accounts, so the billing write runs as
+    # the user (self-or-admin), no new credential.
+    auth_token = (authorization[len("Bearer "):].strip()
+                  if authorization and authorization.startswith("Bearer ") else None)
     return StreamingResponse(
         tracked_stream_agent_response(
             message=request.message,
             conversation_id=request.conversation_id,
             algo_id=request.algo_id,
+            auth_token=auth_token,
         ),
         media_type="text/event-stream"
     )
@@ -1193,6 +1398,11 @@ async def conversation_history(conversation_id: str):
         "name": record["name"],
         "messages": record.get("messages", []),
         "commentary": record.get("commentary", []),
+        # Lifecycle stage + per-(stage × model) usage, so the stepper + the
+        # telemetry footer survive a reload.
+        "stage": record.get("stage", "Idea"),
+        "maxStage": record.get("maxStage", "Idea"),
+        "usage": conversations.usage_public(record),
     }
 
 

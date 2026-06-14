@@ -166,6 +166,8 @@ push lands.
 | `tool_result` | Tool execution result |
 | `commentary` | Background-activity line for the workspace activity panel (`{text}`). Emitted for notable tool calls — Bash and MCP — and also appended to the conversation's commentary audit trail |
 | `result` | Final result with metadata |
+| `stage` | Build-lifecycle stage the turn landed in (`Idea→Design→Build→Backtest→Validate→Deploy`), classified post-stream by `classify_stage()` (cheap haiku). `{conversation_id, stage, maxStage}`. Drives the workspace stepper |
+| `usage` | Per-`(stage × model)` token/cost/tool usage, emitted at turn-end after attribution: `{conversation_id, usage, stage, model}` where `usage` = cumulative `{totals, by_stage_model, updated_at}`. Drives the telemetry footer + stepper badges; also reported to accounts (`POST …/projects/{id}/usage`, JWT-forwarded, idempotency-keyed) for billing + the hosted-tier quota meter |
 | `descriptor` | Raw deployment-descriptor YAML text (`{descriptor}`), relayed by the frontend to accounts. Best-effort read of the deployed environment's deployment REST API after a chat turn |
 | `env_status` | Environment state, derived from the descriptor: `{status, env_type, datasets, symbols, broker, mode}`. The environment-type field is keyed **`env_type`** (NOT `type`) so it can't collide with the SSE frame's own `type` discriminator that `sse_event` sets |
 | `scorecard_update` | Test results (for frontend) |

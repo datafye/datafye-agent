@@ -212,6 +212,30 @@ def list_conversations() -> list:
     return out
 
 
+# The strategy lifecycle stages, in order. `maxStage` is promoted by index so
+# it only ever advances; the current `stage` may move freely (incl. backward).
+# Trading vocabulary: Backtest = refine-on-historical-data, Validate = paper-
+# trade on live data, Deploy = live (real-money) trading.
+STAGES = ["Idea", "Design", "Build", "Backtest", "Validate", "Deploy"]
+
+# The per-turn usage fields we accumulate, kept as a tuple so the meta record,
+# the totals roll-up, and the accounts report all stay in lockstep.
+_USAGE_FIELDS = ("tokens_in", "tokens_out", "cache_read", "cache_create",
+                 "cost_micros", "tool_calls", "turns")
+
+# How many recent idempotency keys to remember per strategy (bounds the meta).
+_MAX_USAGE_KEYS = 200
+
+
+def _empty_usage() -> dict:
+    return {
+        "totals": {f: 0 for f in _USAGE_FIELDS},
+        "by_stage_model": {},
+        "updated_at": 0,
+        "applied_keys": [],
+    }
+
+
 def _new_record(conversation_id: str, first_message: str = "") -> dict:
     """Build a fresh, empty strategy record with the given id."""
     now = _now_ms()
@@ -223,7 +247,91 @@ def _new_record(conversation_id: str, first_message: str = "") -> dict:
         "sdk_session_id": None,
         "messages": [],
         "commentary": [],
+        # Lifecycle stage for the workspace stepper. `stage` = where the strategy
+        # is now; `maxStage` = furthest reached (high-water mark, never regresses).
+        "stage": "Idea",
+        "maxStage": "Idea",
+        # Token/cost/tool usage, accumulated one turn-delta at a time, tracked
+        # per (stage × model). Drives the workspace telemetry (survives reload
+        # via /history) and mirrors what the agent reports to accounts (billing +
+        # the hosted-tier quota meter). `applied_keys` is a capped idempotency
+        # ledger so a re-applied turn can't double-count.
+        "usage": _empty_usage(),
     }
+
+
+def _stage_index(stage: str) -> int:
+    try:
+        return STAGES.index(stage)
+    except ValueError:
+        return 0
+
+
+def set_stage(conversation_id: str, stage: str) -> Optional[dict]:
+    """Set the strategy's current lifecycle stage, promoting the `maxStage`
+    high-water mark if this advances past it. Ignores an unknown stage. Returns
+    the updated record (or None if the strategy does not exist)."""
+    record = _read(conversation_id)
+    if record is None:
+        return None
+    if stage in STAGES:
+        record["stage"] = stage
+        prev_max = record.get("maxStage") or record.get("stage") or STAGES[0]
+        if _stage_index(stage) > _stage_index(prev_max):
+            record["maxStage"] = stage
+        elif "maxStage" not in record:
+            record["maxStage"] = prev_max
+        record["updated_at"] = _now_ms()
+        _write(record)
+    return record
+
+
+def usage_public(record: dict) -> dict:
+    """The display-facing view of a record's usage: totals + the per-(stage ×
+    model) breakdown, with the internal idempotency ledger stripped."""
+    usage = (record or {}).get("usage") or _empty_usage()
+    return {
+        "totals": dict(usage.get("totals") or {}),
+        "by_stage_model": dict(usage.get("by_stage_model") or {}),
+        "updated_at": usage.get("updated_at", 0),
+    }
+
+
+def add_usage(conversation_id: str, stage: str, model: str, delta: dict,
+              idempotency_key: Optional[str] = None) -> Optional[dict]:
+    """Add one turn's usage delta into the (stage × model) breakdown and the
+    roll-up totals — at most once per `idempotency_key`. Returns the updated
+    usage view (or None if the strategy does not exist)."""
+    record = _read(conversation_id)
+    if record is None:
+        return None
+    usage = record.get("usage") or _empty_usage()
+    keys = usage.setdefault("applied_keys", [])
+    if idempotency_key and idempotency_key in keys:
+        return usage_public(record)
+
+    stage = stage or "unknown"
+    model = model or "unknown"
+    cell_key = stage + "|" + model
+    cells = usage.setdefault("by_stage_model", {})
+    cell = cells.get(cell_key) or {"stage": stage, "model": model}
+    totals = usage.setdefault("totals", {f: 0 for f in _USAGE_FIELDS})
+    now = _now_ms()
+    for f in _USAGE_FIELDS:
+        d = int(delta.get(f, 0) or 0)
+        cell[f] = int(cell.get(f, 0)) + d
+        totals[f] = int(totals.get(f, 0)) + d
+    cell["updated_at"] = now
+    cells[cell_key] = cell
+    usage["updated_at"] = now
+    if idempotency_key:
+        keys.append(idempotency_key)
+        if len(keys) > _MAX_USAGE_KEYS:
+            del keys[: len(keys) - _MAX_USAGE_KEYS]
+    record["usage"] = usage
+    record["updated_at"] = now
+    _write(record)
+    return usage_public(record)
 
 
 def create(first_message: str = "") -> dict:
@@ -315,13 +423,21 @@ def append_message(conversation_id: str, role: str, content: str) -> None:
     _write(record)
 
 
+_MAX_COMMENTARY = 400
+
+
 def append_commentary(conversation_id: str, text: str, kind: Optional[str] = None) -> dict:
     """Append one activity-log entry and return it (so the caller can also emit
-    it live over SSE). Persists only if the strategy exists."""
+    it live over SSE). Persists only if the strategy exists. The trail is the
+    Work panel's auditable side-mirror, so it keeps every level (not just
+    milestones); capped to the most recent entries to bound growth."""
     entry = {"text": text, "kind": kind, "at": _now_ms()}
     record = _read(conversation_id)
     if record is not None:
-        record.setdefault("commentary", []).append(entry)
+        trail = record.setdefault("commentary", [])
+        trail.append(entry)
+        if len(trail) > _MAX_COMMENTARY:
+            del trail[: len(trail) - _MAX_COMMENTARY]
         record["updated_at"] = _now_ms()
         _write(record)
     return entry
