@@ -79,6 +79,11 @@ def configure(username: str) -> None:
                 username, JWKS_URL, EXPECTED_ISSUER)
 
 
+def username() -> str | None:
+    """The agent's bootstrapped username, or None before bootstrap."""
+    return _AGENT_USERNAME
+
+
 def verify_bootstrap_token(token: str) -> dict:
     """Verify an accounts-signed agent-bootstrap token and return its claims.
 

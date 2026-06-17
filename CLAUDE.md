@@ -191,10 +191,10 @@ push lands.
 | `DATAFYE_AGENT_MASSIVE_API_KEY` | - | Massive (Polygon) API key |
 | `DATAFYE_AGENT_PALPHA_API_KEY` | - | Precision Alpha API key |
 | `DATAFYE_AGENT_HWAI_API_KEY` | - | HWAI API key |
-| `DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID` | - | ConnectTrade client ID |
-| `DATAFYE_AGENT_CONNECTTRADE_CLIENT_SECRET` | - | ConnectTrade client secret |
-| `DATAFYE_AGENT_CONNECTTRADE_USER_ID` | - | ConnectTrade user ID |
-| `DATAFYE_AGENT_CONNECTTRADE_USER_SECRET` | - | ConnectTrade user secret |
+| `DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID` | - | ConnectTrade client ID — **local-dev seed only**; in production accounts pushes it as the `connecttrade_client_id` credential (see Broker-Credential Foundation) |
+| `DATAFYE_AGENT_CONNECTTRADE_CLIENT_SECRET` | - | ConnectTrade client secret — local-dev seed only; pushed by accounts as `connecttrade_client_secret` in production |
+| `DATAFYE_AGENT_CONNECTTRADE_USER_ID` | - | ConnectTrade user ID — minted by the agent on first broker-link and written back to accounts; this env var only seeds local dev |
+| `DATAFYE_AGENT_CONNECTTRADE_USER_SECRET` | - | ConnectTrade user secret — minted + written back like the user id |
 | `DATAFYE_AGENT_GITHUB_USER` | - | Personal GitHub username (optional) |
 | `DATAFYE_AGENT_GITHUB_TOKEN` | - | Personal GitHub token (optional) |
 | `DATAFYE_AGENT_GITHUB_ORG` | `datafye` | GitHub org for algo repos |
