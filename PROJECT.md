@@ -1,6 +1,6 @@
 # Datafye Agent
 
-> **TODOs** for this project live in `gtm/datafye/TODO.md` (GTM is the single source of truth for open work).
+> **Tracking:** Datafye open work lives in **Linear** (GTM project, team Datafye: https://linear.app/datafye). The `gtm/datafye/TODO.md` file is retired — moved to Linear 2026-06-24.
 
 ## What Is This?
 
