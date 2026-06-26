@@ -538,17 +538,31 @@ sed -i "/${HOSTS_MARKER_START}/,/${HOSTS_MARKER_END}/d" /etc/hosts
 # Remove any trailing blank lines the sed may have left behind
 sed -i -e :a -e '/^\s*$/{$d;N;ba' -e '}' /etc/hosts
 
-# Append the managed block
+# Append the managed block. The rumi.local hostnames are the Rumi foundry
+# services the launched environment binds and the agent talks to for Java-based
+# streaming, REST, and the per-dataset feeds/aggs; the datafye.local hostnames
+# are the local foundry deployment's API/admin/monitor/MCP endpoints.
 cat >> /etc/hosts <<EOF
 
 ${HOSTS_MARKER_START}
+127.0.0.1   solace.rumi.local
+127.0.0.1   api.rest.rumi.local
+127.0.0.1   api.stream.rumi.local
+127.0.0.1   synthetic.feed.rumi.local
+127.0.0.1   synthetic.agg.rumi.local
+127.0.0.1   synthetic.history.rumi.local
+127.0.0.1   synthetic.reference.rumi.local
+127.0.0.1   sip.feed.rumi.local
+127.0.0.1   sip.agg.rumi.local
+127.0.0.1   crypto.feed.rumi.local
+127.0.0.1   crypto.agg.rumi.local
 127.0.0.1   local-foundry-dev-api.datafye.local
 127.0.0.1   local-foundry-dev-admin.datafye.local
 127.0.0.1   local-foundry-dev-monitor.datafye.local
 127.0.0.1   local-foundry-dev-mcp-api.datafye.local
 ${HOSTS_MARKER_END}
 EOF
-ok "/etc/hosts configured (datafye.local hostnames → 127.0.0.1)"
+ok "/etc/hosts configured (rumi.local + datafye.local hostnames → 127.0.0.1)"
 
 # ── Step: Provision / upgrade local Datafye foundry environment ──
 # Skip in --ami-cleanup mode: foundry provisioning pulls docker images,
