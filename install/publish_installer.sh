@@ -30,6 +30,7 @@
 # Published files:
 #   downloads_root/datafye/agent/<version>/install.sh
 #   downloads_root/datafye/agent/<version>/upgrade-check.sh
+#   downloads_root/datafye/agent/<version>/version.txt       (the version string)
 #   downloads_root/datafye/agent/latest -> <version>         (symlink)
 #
 
@@ -62,6 +63,7 @@ Options:
 Published structure:
   <root>/datafye/agent/<version>/install.sh
   <root>/datafye/agent/<version>/upgrade-check.sh
+  <root>/datafye/agent/<version>/version.txt   (polled by upgrade-check.sh)
   <root>/datafye/agent/latest -> <version>   (symlink)
 EOF
 }
@@ -112,6 +114,7 @@ publish_version() {
         info "[DRY RUN] Would create directory: $target_dir"
         info "[DRY RUN] Would publish: install.sh (with version baked in)"
         info "[DRY RUN] Would publish: upgrade-check.sh"
+        info "[DRY RUN] Would publish: version.txt (${version})"
     else
         mkdir -p "$target_dir"
 
@@ -123,6 +126,14 @@ publish_version() {
         cp "${SCRIPT_DIR}/upgrade-check.sh" "$target_dir/upgrade-check.sh"
         chmod +x "$target_dir/upgrade-check.sh"
         ok "Published: $target_dir/upgrade-check.sh"
+
+        # version.txt — the plain version string upgrade-check.sh polls at
+        # .../agent/latest/version.txt to decide whether to auto-upgrade.
+        # Without it the poll 404s, LATEST_VERSION is empty, and no instance
+        # ever upgrades. The 'latest' symlink makes latest/version.txt resolve
+        # to this file.
+        printf '%s\n' "${version}" > "$target_dir/version.txt"
+        ok "Published: $target_dir/version.txt"
     fi
 }
 
