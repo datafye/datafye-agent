@@ -32,6 +32,7 @@ import json
 import os
 import logging
 import socket
+import time
 from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
@@ -177,7 +178,11 @@ sessions: dict[str, str] = {}
 # activeProxiedApps: list of agent-managed app routes currently registered with
 #   the accounts service. Empty for v1 — placeholder for the future feature
 #   where the agent can stand up Jupyter etc. and ask accounts to proxy them.
-last_chat_activity_at: int = 0
+# Seeded to boot time (not 0) so the accounts idle-monitor — which skips
+# last_chat_activity_at == 0 as "never active" — also idle-stops an agent that
+# was provisioned but never chatted with: idle is measured from boot, so an
+# unused agent goes Dormant after the threshold (and auto-wakes invisibly).
+last_chat_activity_at: int = int(time.time() * 1000)
 running_jobs: int = 0
 active_proxied_apps: list[str] = []
 
@@ -644,9 +649,6 @@ def _tool_commentary(tool: str, tool_input: dict):
     if tool.startswith("mcp__"):
         return ("Using a connected tool", "notable")
     return None
-
-
-import time
 
 
 async def _fetch_deployment_state() -> Optional[dict]:
