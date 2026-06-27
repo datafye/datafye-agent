@@ -154,8 +154,6 @@ INTERNAL_TOOLS = [
     "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS",
     # Execution
     "Bash",
-    # Task management
-    "Task", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskStop", "TaskOutput",
     # Planning (no AskUserQuestion — it's a structured-prompt tool the
     # Claude Code harness renders interactively; the Datafye workspace has
     # no handler for it, so a model that used it would silently fail to
