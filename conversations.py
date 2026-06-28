@@ -212,11 +212,40 @@ def list_conversations() -> list:
     return out
 
 
-# The strategy lifecycle stages, in order. `maxStage` is promoted by index so
-# it only ever advances; the current `stage` may move freely (incl. backward).
-# Trading vocabulary: Backtest = refine-on-historical-data, Validate = paper-
-# trade on live data, Deploy = live (real-money) trading.
-STAGES = ["Idea", "Design", "Build", "Backtest", "Validate", "Deploy"]
+# A project's lifecycle is a *track* — an ordered list of stages — that the agent
+# chooses from the project's inferred intent (see main.classify_lifecycle). Chat
+# and research have no build track (empty => the workspace shows no stepper).
+# "Explore" is the common opening stage: a project starts from intent/discovery,
+# not necessarily a pre-formed idea. Trading vocabulary on the tail: Backtest =
+# refine-on-historical-data, Validate = paper-trade on live data, Deploy = live
+# (real-money) trading; a non-trading build ends at Ship instead.
+TRACK_TRADING = ["Explore", "Design", "Build", "Backtest", "Validate", "Deploy"]
+TRACK_BUILD = ["Explore", "Design", "Build", "Ship"]   # non-trading build (dashboard / tool)
+
+# Standard tracks per known intent. Open vocabulary: an intent not listed here
+# resolves via track_for_intent()'s fallback ([]), and the agent may override
+# with a track it composes for a novel build intent.
+TRACKS = {
+    "algo": TRACK_TRADING,
+    "signal": TRACK_TRADING,    # same lifecycle; the artifact is a signal generator
+    "dashboard": TRACK_BUILD,
+    "app": TRACK_BUILD,
+    "tool": TRACK_BUILD,
+    "analysis": [],
+    "research": [],
+    "chat": [],
+}
+DEFAULT_INTENT = "chat"
+
+# Back-compat alias: the full trading track is what "STAGES" used to be.
+STAGES = TRACK_TRADING
+
+
+def track_for_intent(intent: str) -> list:
+    """The ordered stage track for an intent. Known intents map to a standard
+    track; an unknown intent yields no track ([]) unless the agent supplies a
+    composed one. Chat/research are intentionally trackless (no stepper)."""
+    return list(TRACKS.get((intent or "").strip().lower(), []))
 
 # The per-turn usage fields we accumulate, kept as a tuple so the meta record,
 # the totals roll-up, and the accounts report all stay in lockstep.
@@ -247,10 +276,13 @@ def _new_record(conversation_id: str, first_message: str = "") -> dict:
         "sdk_session_id": None,
         "messages": [],
         "commentary": [],
-        # Lifecycle stage for the workspace stepper. `stage` = where the strategy
-        # is now; `maxStage` = furthest reached (high-water mark, never regresses).
-        "stage": "Idea",
-        "maxStage": "Idea",
+        # Lifecycle: the agent infers `intent` and the `track` (ordered stages)
+        # for this project. `stage` = where it is now; `maxStage` = furthest
+        # reached (never regresses). An empty track (chat/research) => no stepper.
+        "intent": DEFAULT_INTENT,
+        "track": [],
+        "stage": "",
+        "maxStage": "",
         # Token/cost/tool usage, accumulated one turn-delta at a time, tracked
         # per (stage × model). Drives the workspace telemetry (survives reload
         # via /history) and mirrors what the agent reports to accounts (billing +
@@ -260,29 +292,56 @@ def _new_record(conversation_id: str, first_message: str = "") -> dict:
     }
 
 
-def _stage_index(stage: str) -> int:
+def _stage_index(stage: str, track: list) -> int:
     try:
-        return STAGES.index(stage)
+        return (track or STAGES).index(stage)
     except ValueError:
         return 0
 
 
 def set_stage(conversation_id: str, stage: str) -> Optional[dict]:
-    """Set the strategy's current lifecycle stage, promoting the `maxStage`
-    high-water mark if this advances past it. Ignores an unknown stage. Returns
-    the updated record (or None if the strategy does not exist)."""
+    """Set the project's current lifecycle stage *within its track*, promoting
+    the `maxStage` high-water mark if this advances past it. Ignores a stage not
+    in the project's track. Returns the updated record (or None)."""
     record = _read(conversation_id)
     if record is None:
         return None
-    if stage in STAGES:
+    track = record.get("track") or []
+    if stage and stage in track:
         record["stage"] = stage
-        prev_max = record.get("maxStage") or record.get("stage") or STAGES[0]
-        if _stage_index(stage) > _stage_index(prev_max):
+        prev_max = record.get("maxStage") or record.get("stage") or (track[0] if track else "")
+        if _stage_index(stage, track) > _stage_index(prev_max, track):
             record["maxStage"] = stage
-        elif "maxStage" not in record:
+        elif not record.get("maxStage"):
             record["maxStage"] = prev_max
         record["updated_at"] = _now_ms()
         _write(record)
+    return record
+
+
+def set_intent_track(conversation_id: str, intent: str, track: list,
+                     stage: Optional[str] = None) -> Optional[dict]:
+    """Set the project's inferred `intent` and lifecycle `track` (and optionally
+    the current `stage`), keeping `stage`/`maxStage` consistent with the new
+    track. Returns the updated record (or None)."""
+    record = _read(conversation_id)
+    if record is None:
+        return None
+    record["intent"] = intent or DEFAULT_INTENT
+    record["track"] = list(track or [])
+    cur = stage if stage is not None else record.get("stage", "")
+    if cur and cur in record["track"]:
+        record["stage"] = cur
+    elif record["track"]:
+        record["stage"] = record["track"][0]
+    else:
+        record["stage"] = ""
+    mx = record.get("maxStage", "")
+    if not (mx and mx in record["track"]) or \
+            _stage_index(record["stage"], record["track"]) > _stage_index(mx, record["track"]):
+        record["maxStage"] = record["stage"]
+    record["updated_at"] = _now_ms()
+    _write(record)
     return record
 
 
