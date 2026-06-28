@@ -36,7 +36,7 @@ At the heart of this service is the Claude Agent SDK's `query()` function. It's 
 
 The SDK gives Claude access to tools — file operations (Read, Write, Edit), shell execution (Bash), search (Glob, Grep), and planning tools. We add the Datafye-specific capabilities through the system prompt and the Bash tool: the agent can run `datafye foundry local provision`, `curl` the REST API, execute Python scripts, and manage git repos. The exact allowed set lives in `INTERNAL_TOOLS` in `main.py`.
 
-**One tool we deliberately removed: `AskUserQuestion`.** It's the Claude Code harness's *structured-prompt* tool — in the Claude Code CLI it renders an interactive multiple-choice question. The Datafye workspace has no UI handler for it, so when the model reached for it, the question simply vanished into the void — the user saw the agent go quiet instead of being asked anything. Dropping it from `INTERNAL_TOOLS` forces the model to fall back to asking its question inline as ordinary chat text, which the frontend already renders. The broader lesson: an agent's tool list has to match the *surface it's actually running on*, not the SDK's full menu — a tool with no handler is worse than no tool, because it fails silently.
+**One tool we deliberately removed: `AskUserQuestion`.** It's the Claude Code harness's *structured-prompt* tool — in the Claude Code CLI it renders an interactive multiple-choice question. The Datafye workspace has no UI handler for it, so when the model reached for it, the question simply vanished into the void — the user saw the agent go quiet instead of being asked anything. Dropping it from `INTERNAL_TOOLS` forces the model to fall back to asking its question inline as ordinary chat text, which the frontend already renders. The broader lesson: an agent's tool list has to match the *surface it's actually running on*, not the SDK's full menu — a tool with no handler is worse than no tool, because it fails silently. For the same reason we also dropped the harness-only `Task` family (`Task`/`TaskCreate`/`TaskUpdate`/`TaskList`/`TaskGet`/`TaskStop`/`TaskOutput`) from `INTERNAL_TOOLS` — they have no backend handler in this agent, so offering them only invites the model to call into a dead end.
 
 ### The Anthropic Key Is a Credential, Not a Setting
 
@@ -198,9 +198,41 @@ Here's what a typical session looks like from the agent's perspective:
 5. **Agent provisions environment**: Runs `datafye foundry local provision -x descriptor.yaml`
 6. **Agent writes algo code**: Creates Python files in the workspace
 7. **Agent tests**: Downloads historical data, runs the algo, collects results
-8. **Agent presents results**: Returns, win rate, trade count — the frontend shows these in the scorecard and charts
+8. **Agent presents results**: Returns, win rate, trade count — the agent also renders these inline in the conversation as a **scorecard table** (for both Backtest and Validate/paper results), and the frontend shows them in the scorecard panel and charts
 9. **Iteration**: User says "try a shorter lookback period" → agent modifies and re-tests
 10. **Simulated trading**: If broker is configured, agent provisions a trading environment
+
+### The lifecycle stepper is intent-aware (the agent owns it)
+
+The workspace shows a progress stepper for the project, but there is **no single
+global pipeline**. We used to ship one hard-coded six-stage list
+(`Idea→Design→Build→Backtest→Validate→Deploy`) and force every project through it —
+which is nonsense for a project that's just a dashboard or a quick research chat. A
+dashboard has nothing to backtest; a "what does this indicator mean?" chat has no
+build at all.
+
+So the lifecycle became **per-project and agent-driven**. After each turn,
+`classify_lifecycle()` (a cheap haiku call) reads the conversation and returns
+`{intent, track, stage}`: it infers the project's *intent* (algo, signal,
+dashboard, app, tool, chat, research…), maps that to a *track* — the ordered list
+of stages that intent actually goes through — and reports which *stage* the turn
+landed in. The frontend just renders whatever track it's handed.
+
+The built-in tracks (`conversations.py`):
+- **algo / signal** → `Explore → Design → Build → Backtest → Validate → Deploy`
+  (for a signal, "Deploy" means *publish* rather than go-live trade)
+- **dashboard / app / tool** → `Explore → Design → Build → Ship`
+- **chat / research** → no stepper at all
+
+The first stage is **Explore** (renamed from "Idea"). The intent vocabulary is
+*open*: faced with a novel build intent the agent can compose its own track around
+the common `Explore → Design → Build` spine plus an artifact-appropriate tail. The
+project record now persists `intent` + `track` next to `stage`/`maxStage`, and both
+the `stage` SSE event and `/history` replay carry them so the frontend always knows
+which steps to draw. The old `STAGES` constant survives only as a back-compat alias
+for the algo track. The lesson: a "lifecycle" that's right for one artifact type is
+wrong for the next — let the agent that understands the project decide its shape,
+and keep the UI a dumb renderer of whatever it's told.
 
 ## Broker Integration
 
@@ -301,7 +333,7 @@ The agent doesn't have a Rumi store (it's Python/FastAPI, not a Rumi application
 
 - **`POST /bootstrap`** — accounts-only. Establishes identity + credentials-store key from a signed JWT. Idempotent for the same user, 409 on rebind.
 - **`POST /v1/credentials/update`** — accounts-only push, body `{provider, value}`. Updates the in-memory store and persists to `credentials.bin` atomically. Returns 204. A push to `anthropic_api_key` also re-syncs and re-validates the Anthropic key.
-- **`GET /health`** — reports `bootstrapped`, `anthropic_key_status`, `credentials_generation`, `last_chat_activity_at`, `running_jobs`, `active_proxied_apps`. `username` and `credentials_generation` are `null` until bootstrapped. Accounts polls this for idle detection and cache-loss recovery (if `credentials_generation` drifts from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section).
+- **`GET /health`** — reports `bootstrapped`, `anthropic_key_status`, `credentials_generation`, `last_chat_activity_at`, `running_jobs`, `active_proxied_apps`. `username` and `credentials_generation` are `null` until bootstrapped. Accounts polls this for idle detection and cache-loss recovery (if `credentials_generation` drifts from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section). `last_chat_activity_at` is **seeded to boot time, not 0**: the accounts idle-monitor treats `0` as "never active" and skips it, so a provisioned-but-never-chatted agent would otherwise live forever; seeding to boot makes its idle clock start ticking immediately.
 - **`POST /v1/credentials`** — removed; returns 410 Gone. The frontend no longer writes credentials directly to the agent; all writes go through accounts.
 - **`/v1/conversations*`** — the agent's chat-layer conversation store (history replay via `GET /v1/conversations/{id}/history`). The id-minting `POST`/list `GET` are legacy/unused now that accounts is the authoritative project registry; the agent materialises a local record for an accounts-minted id via `conversations.ensure()` on the first chat turn. `DELETE /v1/conversations/{id}` permanently removes the strategy's agent-side folder via `conversations.delete()` (204, or 404 if the agent never materialised it) — guarded by a path-safety check that refuses to `rmtree` anything resolving outside the strategies base, so a malformed or hostile id like `..` can't escape. Accounts deletes its own project-registry record separately.
 - **JWT validation** on `/v1/chat`, `/v1/credentials/status`, and `/v1/broker/*`: verify the accounts-signed JWT against accounts' JWKS and check `sub == the agent's bootstrapped username`. Reject otherwise.

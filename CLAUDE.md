@@ -148,7 +148,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/conversations` | POST | Create a conversation (agent mints the id, deduces a name). **LEGACY/UNUSED** — accounts mints project ids; new chat threads arrive with an accounts-minted `conversation_id` that `/v1/chat` materialises via `conversations.ensure()` |
 | `/v1/conversations/{id}` | PATCH | Rename a conversation; 404 if absent |
 | `/v1/conversations/{id}` | DELETE | Permanently delete a strategy's agent-side folder via `conversations.delete()` (path-safety guard refuses anything outside the strategies base); 204 on success, 404 if the agent never materialised it. Accounts deletes its own project record separately |
-| `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail |
+| `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail; also returns the project's `intent` + `track` (+ `stage`/`maxStage`) so the frontend can rehydrate the right stepper |
 
 Every endpoint except `/health` and `/bootstrap` is gated by the
 `require_bootstrapped` dependency and returns 503 until the accounts bootstrap
@@ -166,7 +166,7 @@ push lands.
 | `tool_result` | Tool execution result |
 | `commentary` | Background-activity line for the workspace activity panel (`{text}`). Emitted for notable tool calls — Bash and MCP — and also appended to the conversation's commentary audit trail |
 | `result` | Final result with metadata |
-| `stage` | Build-lifecycle stage the turn landed in (`Idea→Design→Build→Backtest→Validate→Deploy`), classified post-stream by `classify_stage()` (cheap haiku). `{conversation_id, stage, maxStage}`. Drives the workspace stepper |
+| `stage` | Intent-aware lifecycle position the turn landed in, classified post-stream by `classify_lifecycle()` (cheap haiku). `{conversation_id, intent, track, stage, maxStage}` where `track` is the ordered stage list for the project's `intent` and `stage` is the current step within it. Drives the workspace stepper (frontend renders whatever `track` it's given). See **Project lifecycle** below |
 | `usage` | Per-`(stage × model)` token/cost/tool usage, emitted at turn-end after attribution: `{conversation_id, usage, stage, model}` where `usage` = cumulative `{totals, by_stage_model, updated_at}`. Drives the telemetry footer + stepper badges; also reported to accounts (`POST …/projects/{id}/usage`, JWT-forwarded, idempotency-keyed) for billing + the hosted-tier quota meter |
 | `descriptor` | Raw deployment-descriptor YAML text (`{descriptor}`), relayed by the frontend to accounts. Best-effort read of the deployed environment's deployment REST API after a chat turn |
 | `env_status` | Environment state, derived from the descriptor: `{status, env_type, datasets, symbols, broker, mode}`. The environment-type field is keyed **`env_type`** (NOT `type`) so it can't collide with the SSE frame's own `type` discriminator that `sse_event` sets |
@@ -174,6 +174,25 @@ push lands.
 | `chart_data` | Chart data push (for frontend) |
 | `error` | Error occurred |
 | `done` | Stream complete |
+
+## Project lifecycle (intent-aware tracks)
+
+The lifecycle is **agent-driven and per-project**, not one fixed global pipeline.
+`classify_lifecycle()` (cheap haiku, post-stream) infers the project's **intent**
+and returns `{intent, track, stage}`; the agent owns each project's lifecycle and
+reports it, while the frontend renders whatever track it is handed.
+
+- **Tracks** (`conversations.py`): per-intent ordered stage lists.
+  - `algo` / `signal` → `[Explore, Design, Build, Backtest, Validate, Deploy]`
+  - `dashboard` / `app` / `tool` → `[Explore, Design, Build, Ship]`
+  - `chat` / `research` → `[]` (no stepper)
+- The first stage was renamed **Idea → Explore**. The intent vocabulary is open —
+  the agent can compose a track for a novel build intent (common
+  `Explore→Design→Build` spine + an artifact-dependent tail). For `signal`,
+  "Deploy" means *publish* (vs an algo's deploy).
+- Project records carry `intent` + `track` alongside `stage`/`maxStage`; helpers
+  `set_intent_track` / `track_for_intent` manage them. `STAGES` remains as a
+  back-compat alias for the trading (`algo`) track.
 
 ## Environment Variables
 
@@ -225,6 +244,7 @@ push lands.
 - **Accounts is the project registry**: Accounts mints conversation/project ids; the agent's own `POST`/`GET /v1/conversations` are legacy/unused. New chat threads arrive with an accounts-minted `conversation_id`, and `/v1/chat` materialises a local chat-layer record via `conversations.ensure()`
 - **Persistent conversations**: `conversations.py` stores each conversation as one JSON file (name, message history, commentary audit trail, SDK session id). `/v1/chat` persists user+assistant turns and resumes the SDK session from disk, so chat survives an agent restart
 - **No `AskUserQuestion` tool**: It's the Claude Code harness's structured-prompt tool with no UI handler in the Datafye workspace, so the model's question would silently vanish. Dropped from `INTERNAL_TOOLS`; the model asks inline in chat text instead
+- **No `Task` family in `INTERNAL_TOOLS`**: the `Task`/`TaskCreate`/`TaskUpdate`/`TaskList`/`TaskGet`/`TaskStop`/`TaskOutput` tools are harness-only with no backend handler in this agent, so they're removed from `INTERNAL_TOOLS` (which feeds `allowed_tools`) to avoid offering the model dead tools
 - **Strategy = folder**: each conversation/strategy is a directory under `<state>/strategies/<id>/` holding `meta.json` + scaffolded `CLAUDE.md` (per-strategy memory), `PROJECT.md` (plain-language strategy narrative), `memory/`, and `.claude/skills/`. That folder is the chat turn's **cwd/workspace**, so the strategy's code, memory, and skills live together and survive a restart. `conversations.ensure()` materialises the folder for an accounts-minted id; legacy `<id>.json` records migrate into folders on load
 - **Skills, three tiers**: the native `Skill` tool is enabled, with skills discovered from local plugins + project source. **System** skills ship read-only in `plugins/datafye` (installer/app-clone managed); **user-global** skills the agent authors into `<state>/plugins/user`; **per-strategy** skills in the strategy's `.claude/skills` (loaded via `setting_sources=["project"]`). The `author-skill` system skill teaches scope-aware authoring. Listing via `GET /v1/skills`; execution is chat-driven. We keep the engine-native mechanism for quality (Claude is post-trained for it) — the `SKILL.md` artifacts are engine-portable if we ever hand-roll the loader for another engine
 - **Convention-based memory (one model)**: durable facts are plain markdown the agent writes/reads, guided by a protocol in the system prompt — **global** (cross-strategy, `<state>/memory` + `CLAUDE.md`) and **per-strategy** (in the strategy folder). Only the always-on `MEMORY.md` indexes + the small `CLAUDE.md` notes are injected; memory bodies are read on demand. The CLI's own auto-memory is **disabled** (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) because it has no global tier, is git-repo-scoped, and stores under `~/.claude` — it would be a second, uncontrolled store
