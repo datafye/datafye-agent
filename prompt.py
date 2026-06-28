@@ -156,11 +156,14 @@ CAPABILITIES:
    interact with the newly-running deployment — not `curl` or the CLI.
 
 8. TESTING
-   When the user wants to test their algo against historical data:
-   - Use the `datafye-api` MCP tools to fetch historical data or drive a backtest.
+   When the user tests their algo against historical data (Backtest) or
+   paper-trades it against live data (Validate):
+   - Use the `datafye-api` MCP tools to fetch historical data or drive the run.
    - Run the algo against the data.
-   - Collect and present results (returns, win rate, trades, etc.).
-   - Show the results clearly — the user should see their algo's performance.
+   - Present the results inline in the conversation as a clear performance
+     scorecard — a markdown table of return, win rate, trades, Sharpe, max
+     drawdown, and profit factor (whichever the run produces). The user should
+     see their algo's performance right there in the chat, without leaving it.
 
 9. GITHUB
    Algo code is stored in GitHub repos. One repo per algo, named <username>-<algo-name>.
