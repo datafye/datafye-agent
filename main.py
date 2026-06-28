@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -825,6 +825,9 @@ async def stream_agent_response(
         memory_context=memory.build_memory_context(cwd if conversation_id else None),
         # Where to write user-authored skills (the author-skill skill uses this).
         skills_dir=str(skills.user_global_skills_dir()),
+        # Index of the user's uploaded context files (name/type/size); bodies are
+        # read on demand from uploads/ — never inlined into the prompt.
+        files_context=conversations.build_files_context(conversation_id),
     )
 
     options = ClaudeAgentOptions(
@@ -1444,6 +1447,52 @@ async def delete_conversation(conversation_id: str):
     exists in accounts but never here still deletes cleanly there."""
     if not conversations.delete(conversation_id):
         raise HTTPException(status_code=404, detail="No such conversation")
+    return Response(status_code=204)
+
+
+# -- Uploaded project files (per-project agent context) ------------
+# The user uploads files (data, specs, examples, a CSV of trades, ...) into a
+# project; they are stored in the project folder's uploads/ dir, the agent is
+# made aware of them via a small index injected into the prompt, and it reads
+# them on demand with its existing Read/Glob/Grep tools (see conversations.py
+# and prompt.build_system_prompt). Never inline whole files into the prompt.
+
+# Per-file upload size cap, to keep one upload from filling the instance disk.
+MAX_UPLOAD_MB = int(os.environ.get("DATAFYE_AGENT_MAX_UPLOAD_MB", "25"))
+
+
+@app.get("/v1/conversations/{conversation_id}/files",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def list_conversation_files(conversation_id: str):
+    """List a project's uploaded context files (name, type, size, modified)."""
+    return {"files": conversations.list_files(conversation_id)}
+
+
+@app.post("/v1/conversations/{conversation_id}/files",
+          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def upload_conversation_file(conversation_id: str, file: UploadFile = File(...)):
+    """Upload one file into a project as agent context. Stored in the project
+    folder's uploads/ dir (durable, per-project isolated); the agent reads it on
+    demand. A same-named file is overwritten."""
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (limit {MAX_UPLOAD_MB} MB)",
+        )
+    conversations.ensure(conversation_id)
+    entry = conversations.save_file(conversation_id, file.filename, data)
+    if entry is None:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return entry
+
+
+@app.delete("/v1/conversations/{conversation_id}/files/{filename}",
+            dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def delete_conversation_file(conversation_id: str, filename: str):
+    """Remove one uploaded file from a project. 404 if absent."""
+    if not conversations.delete_file(conversation_id, filename):
+        raise HTTPException(status_code=404, detail="No such file")
     return Response(status_code=204)
 
 
