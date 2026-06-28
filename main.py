@@ -474,29 +474,39 @@ async def generate_title(first_message: str) -> Optional[str]:
 # Cheap, best-effort, post-stream — mirrors generate_title (haiku, direct
 # Anthropic call). Classifies where the strategy build is in its lifecycle so
 # the workspace stepper can advance. On any failure the stepper keeps its value.
-_STAGE_PROMPT = (
-    "You classify where an algorithmic-trading-strategy build is in its "
-    "lifecycle. The stages, in order:\n"
-    "- Idea: capturing the strategy hypothesis / goal.\n"
-    "- Design: choosing signals, entry/exit, and risk rules.\n"
-    "- Build: implementing the algo.\n"
-    "- Backtest: validating + refining against historical data.\n"
-    "- Validate: paper-trading against live data.\n"
-    "- Deploy: live (real-money) trading.\n"
-    "Given the prior stage and the latest exchange, reply with ONLY the single "
-    "stage word that best describes where the work is NOW (it may stay the same, "
-    "advance, or move back).\n\n"
+_LIFECYCLE_PROMPT = (
+    "You classify what a user is doing in an AI quant workspace and where it is "
+    "in its lifecycle, so the UI can show the right workflow.\n\n"
+    "1) INTENT — what the user is doing. Common intents:\n"
+    "   - chat: a general question or discussion (no artifact).\n"
+    "   - research: one-off data analysis / exploration (a report, not a deployable artifact).\n"
+    "   - signal: building a reusable trading-signal generator.\n"
+    "   - algo: building a full trading strategy.\n"
+    "   - dashboard: building an analytics dashboard or other non-trading tool.\n"
+    "   Intents are NOT limited to this list — if the user is clearly doing\n"
+    "   something else, name it in one lower-case word.\n\n"
+    "2) TRACK — the ordered lifecycle stages for this intent:\n"
+    "   - chat / research: [] (no build lifecycle).\n"
+    "   - algo / signal: [\"Explore\",\"Design\",\"Build\",\"Backtest\",\"Validate\",\"Deploy\"].\n"
+    "   - dashboard / other non-trading build: [\"Explore\",\"Design\",\"Build\",\"Ship\"].\n"
+    "   - a novel build intent: compose a sensible ordered track, starting with \"Explore\".\n\n"
+    "3) STAGE — the ONE stage in the track the work is at NOW (\"\" if the track is empty).\n\n"
+    "Reply with ONLY a JSON object: "
+    "{\"intent\":\"...\",\"track\":[...],\"stage\":\"...\"}.\n\n"
 )
 
 
-async def classify_stage(prior_stage: str, user_message: str, assistant_text: str) -> Optional[str]:
-    """Return the strategy's current lifecycle stage (one of conversations.STAGES)
-    or None on any failure (caller keeps the prior stage)."""
+async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str) -> Optional[dict]:
+    """Classify the project's intent + lifecycle track + current stage, returning
+    {"intent","track","stage"} or None on any failure (caller keeps prior). The
+    agent owns the lifecycle: it infers the intent and the ordered track for it
+    (open vocabulary), and the frontend renders whatever track it is given."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
     try:
-        convo = (f"Prior stage: {prior_stage}\n"
+        convo = (f"Prior intent: {(prior or {}).get('intent') or 'chat'}\n"
+                 f"Prior stage: {(prior or {}).get('stage') or ''}\n"
                  f"User: {(user_message or '')[:1500]}\n"
                  f"Assistant: {(assistant_text or '')[:1500]}")
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -509,20 +519,31 @@ async def classify_stage(prior_stage: str, user_message: str, assistant_text: st
                 },
                 json={
                     "model": TITLE_MODEL,
-                    "max_tokens": 8,
-                    "messages": [{"role": "user", "content": _STAGE_PROMPT + convo}],
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": _LIFECYCLE_PROMPT + convo}],
                 },
             )
         resp.raise_for_status()
         parts = resp.json().get("content", [])
-        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-        word = text.strip().strip('".').split()[0] if text.strip() else ""
-        for s in conversations.STAGES:
-            if s.lower() == word.lower():
-                return s
-        return None
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            i, j = text.find("{"), text.rfind("}")
+            data = json.loads(text[i:j + 1]) if (i >= 0 and j > i) else None
+        if not isinstance(data, dict):
+            return None
+        intent = str(data.get("intent") or conversations.DEFAULT_INTENT).strip().lower()
+        track = data.get("track")
+        if not isinstance(track, list):
+            track = conversations.track_for_intent(intent)
+        track = [str(s).strip() for s in track if str(s).strip()]
+        stage = str(data.get("stage") or "").strip()
+        if stage and stage not in track:
+            stage = track[0] if track else ""
+        return {"intent": intent, "track": track, "stage": stage}
     except Exception as e:
-        logger.warning("Stage classification failed: %s", e)
+        logger.warning("Lifecycle classification failed: %s", e)
         return None
 
 
@@ -970,17 +991,22 @@ async def stream_agent_response(
                 conversations.rename(conversation_id, title)
                 yield sse_event('title', {'conversation_id': conversation_id, 'name': title})
 
-        # Track the strategy lifecycle stage for the workspace stepper. Cheap,
-        # best-effort, post-stream. Emit only when known.
+        # Classify what the user is doing (intent), the lifecycle track for it,
+        # and the current stage — so the workspace shows the right workflow.
+        # Cheap, best-effort, post-stream. The agent owns the track; the frontend
+        # renders whatever it is given (empty track => no stepper).
         if conversation_id:
             rec = conversations.get(conversation_id) or {}
-            stage = await classify_stage(rec.get("stage") or "Idea", message, assistant_text)
-            if stage:
-                updated = conversations.set_stage(conversation_id, stage) or {}
+            life = await classify_lifecycle(rec, message, assistant_text)
+            if life:
+                updated = conversations.set_intent_track(
+                    conversation_id, life['intent'], life['track'], life['stage']) or {}
                 yield sse_event('stage', {
                     'conversation_id': conversation_id,
-                    'stage': updated.get('stage', stage),
-                    'maxStage': updated.get('maxStage', stage),
+                    'intent': updated.get('intent', life['intent']),
+                    'track': updated.get('track', life['track']),
+                    'stage': updated.get('stage', life['stage']),
+                    'maxStage': updated.get('maxStage', life['stage']),
                 })
 
         # Record + report this turn's usage, attributed to the stage it landed
@@ -990,7 +1016,7 @@ async def stream_agent_response(
         if conversation_id and result_metrics:
             try:
                 delta = _usage_delta(result_metrics, tool_calls_this_turn)
-                stage_now = (conversations.get(conversation_id) or {}).get('stage', 'Idea')
+                stage_now = (conversations.get(conversation_id) or {}).get('stage', '')
                 model_id = _model_label(CLAUDE_MODEL)
                 idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
                 updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
@@ -1398,10 +1424,13 @@ async def conversation_history(conversation_id: str):
         "name": record["name"],
         "messages": record.get("messages", []),
         "commentary": record.get("commentary", []),
-        # Lifecycle stage + per-(stage × model) usage, so the stepper + the
-        # telemetry footer survive a reload.
-        "stage": record.get("stage", "Idea"),
-        "maxStage": record.get("maxStage", "Idea"),
+        # Lifecycle (intent + track + stage) + per-(stage × model) usage, so the
+        # stepper + telemetry footer survive a reload. The frontend renders the
+        # agent-supplied track (empty => no stepper).
+        "intent": record.get("intent", conversations.DEFAULT_INTENT),
+        "track": record.get("track", []),
+        "stage": record.get("stage", ""),
+        "maxStage": record.get("maxStage", ""),
         "usage": conversations.usage_public(record),
     }
 
