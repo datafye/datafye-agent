@@ -32,10 +32,13 @@ def build_system_prompt(
     algo_id: str | None = None,
     memory_context: str = "",
     skills_dir: str = "",
+    files_context: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
 
     memory_block = f"\n{memory_context}\n" if memory_context else ""
+
+    files_block = f"\n{files_context}\n" if files_context else ""
 
     skills_block = ""
     if skills_dir:
@@ -177,6 +180,7 @@ in Settings (gear icon in the top right). Do not ask them to paste API keys in c
 
 {algo_context}
 {memory_block}
+{files_block}
 {skills_block}
 WORKSPACE: {workspace_dir}
 

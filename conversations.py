@@ -469,6 +469,142 @@ def delete(conversation_id: str) -> bool:
     return True
 
 
+# --- Uploaded files (per-project agent context) -------------------------
+# Files the user uploads to a project live in <strategy>/uploads/. That folder
+# is inside the strategy folder, so it is durable (survives restart) and
+# per-project isolated, and it sits under the chat turn's cwd — so the agent's
+# existing Read/Glob/Grep tools read them with no new tool. We never inline a
+# file's contents into the prompt: only a small INDEX (name/type/size) is
+# injected (build_files_context), and the agent reads bodies on demand.
+
+_UPLOADS_DIRNAME = "uploads"
+
+
+def uploads_dir(conversation_id: str) -> Path:
+    """The directory holding a project's uploaded context files."""
+    return strategy_dir(conversation_id) / _UPLOADS_DIRNAME
+
+
+def safe_upload_name(filename: str) -> Optional[str]:
+    """Reduce a client-supplied filename to a safe basename, or None if it is
+    not a usable name. Guards against path traversal (`..`, absolute paths,
+    separators) — accounts mints clean ids, but uploads come straight from the
+    browser, so the name is untrusted."""
+    name = os.path.basename((filename or "").strip().replace("\\", "/"))
+    if not name or name in (".", "..") or name.startswith(".."):
+        return None
+    return name[:255]
+
+
+def _ext_type(name: str) -> str:
+    """A short lowercase type token for the index (file extension, no dot)."""
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+    return ext or "file"
+
+
+def _file_entry(p: Path) -> dict:
+    """The listing/index view of one uploaded file."""
+    st = p.stat()
+    return {
+        "name": p.name,
+        "type": _ext_type(p.name),
+        "size": st.st_size,
+        "modified_at": int(st.st_mtime * 1000),
+    }
+
+
+def list_files(conversation_id: str) -> list:
+    """The project's uploaded files, name-sorted. Empty if none/absent."""
+    d = uploads_dir(conversation_id)
+    if not d.exists():
+        return []
+    out = []
+    for child in sorted(d.iterdir()):
+        if child.is_file():
+            try:
+                out.append(_file_entry(child))
+            except OSError as e:
+                logger.warning("Skipping unreadable upload %s: %s", child.name, e)
+    return out
+
+
+def save_file(conversation_id: str, filename: str, data: bytes) -> Optional[dict]:
+    """Write an uploaded file into the project's uploads/ folder (creating it),
+    overwriting a same-named file. Returns the file's listing entry, or None if
+    the filename is unusable. The caller ensures the strategy folder exists."""
+    name = safe_upload_name(filename)
+    if name is None:
+        return None
+    d = uploads_dir(conversation_id)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_bytes(data)
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    tmp.replace(p)
+    logger.info("Stored upload %s (%d bytes) for strategy %s", name, len(data), conversation_id)
+    return _file_entry(p)
+
+
+def delete_file(conversation_id: str, filename: str) -> bool:
+    """Remove one uploaded file. Path-safety-guarded (never escapes uploads/).
+    Returns False if the name is unusable or the file does not exist."""
+    name = safe_upload_name(filename)
+    if name is None:
+        return False
+    base = uploads_dir(conversation_id).resolve()
+    try:
+        resolved = (uploads_dir(conversation_id) / name).resolve()
+    except Exception:
+        return False
+    if base not in resolved.parents:
+        logger.warning("Refusing to delete upload outside uploads dir: %s", filename)
+        return False
+    if not resolved.is_file():
+        return False
+    resolved.unlink()
+    logger.info("Deleted upload %s for strategy %s", name, conversation_id)
+    return True
+
+
+def _human_size(n: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    size = float(n)
+    for u in units:
+        if size < 1024 or u == units[-1]:
+            return (f"{int(size)} {u}" if u == "B" else f"{size:.1f} {u}")
+        size /= 1024
+    return f"{n} B"
+
+
+def build_files_context(conversation_id: Optional[str]) -> str:
+    """Render the always-on UPLOADED FILES block for the system prompt: a small
+    index (name / type / size) the agent reads on demand. Empty string when the
+    project has no uploads (so no block is added). Never inlines file bodies."""
+    if not conversation_id:
+        return ""
+    files = list_files(conversation_id)
+    if not files:
+        return ""
+    d = uploads_dir(conversation_id)
+    lines = "\n".join(
+        f"- {f['name']} ({f['type']}, {_human_size(f['size'])})" for f in files
+    )
+    return f"""UPLOADED FILES:
+The user has uploaded files to this project as context. They live in {d}
+(inside your working directory). The index below lists what is available — when
+a file is relevant to the user's request, Read it (or Glob/Grep it) on demand;
+do not assume its contents from the name. For a large file, read ranges or grep
+rather than the whole file, to keep context small. Do not inline a whole file
+unless the user asks. When the user refers to "the file I uploaded" or "this
+CSV/spec/data", look here first.
+
+{lines}"""
+
+
 def append_message(conversation_id: str, role: str, content: str) -> None:
     """Append a user/assistant turn. No-op if the strategy does not exist
     (e.g. a frontend running in local-only fallback mode)."""
