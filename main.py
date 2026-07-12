@@ -436,11 +436,14 @@ _TITLE_PROMPT = (
 )
 
 
-async def generate_title(first_message: str) -> Optional[str]:
+async def generate_title(first_message: str, usage_sink: Optional[list] = None) -> Optional[str]:
     """Summarize the user's first message into a short strategy title via a
     cheap model call (direct Anthropic API, the key is already in the env).
     Returns None on any failure, in which case the caller keeps the provisional
-    first-few-words name."""
+    first-few-words name. If `usage_sink` is given, this call's token usage is
+    appended (attributed to the sidecar model) so it's counted in the turn's
+    per-model roll-up -- it runs outside the agent SDK session, so it does NOT
+    appear in ResultMessage.model_usage."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     msg = (first_message or "").strip()
     if not key or not msg:
@@ -461,7 +464,10 @@ async def generate_title(first_message: str) -> Optional[str]:
                 },
             )
         resp.raise_for_status()
-        parts = resp.json().get("content", [])
+        data = resp.json()
+        if usage_sink is not None and data.get("usage"):
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"]})
+        parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
         title = text.strip().strip('"“”\'').rstrip(".").strip()
         return title[:60] or None
@@ -496,11 +502,15 @@ _LIFECYCLE_PROMPT = (
 )
 
 
-async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str) -> Optional[dict]:
+async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str,
+                             usage_sink: Optional[list] = None) -> Optional[dict]:
     """Classify the project's intent + lifecycle track + current stage, returning
     {"intent","track","stage"} or None on any failure (caller keeps prior). The
     agent owns the lifecycle: it infers the intent and the ordered track for it
-    (open vocabulary), and the frontend renders whatever track it is given."""
+    (open vocabulary), and the frontend renders whatever track it is given. If
+    `usage_sink` is given, this call's token usage is appended (attributed to the
+    sidecar model) -- it runs outside the agent SDK session, so it's not in
+    ResultMessage.model_usage."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
@@ -524,7 +534,10 @@ async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str
                 },
             )
         resp.raise_for_status()
-        parts = resp.json().get("content", [])
+        payload = resp.json()
+        if usage_sink is not None and payload.get("usage"):
+            usage_sink.append({"model": TITLE_MODEL, "usage": payload["usage"]})
+        parts = payload.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
         try:
             data = json.loads(text)
@@ -591,6 +604,58 @@ def _usage_delta(metrics: dict, tool_calls: int) -> dict:
         "tool_calls": int(tool_calls or 0),
         "turns": int(metrics.get("num_turns") or 0),
     }
+
+
+def _usage_delta_from_model_entry(entry: dict) -> dict:
+    """Build a usage delta from one model's `ResultMessage.model_usage` entry.
+
+    `model_usage` is the CLI's `modelUsage` map (model id -> per-model totals)
+    passed through verbatim, so keys are camelCase and the figures are
+    CUMULATIVE for the whole turn across every internal step of the agentic
+    loop -- unlike the flat `usage`, which reflects only the final model call.
+    Each entry carries this model's own `costUSD` (its slice of
+    total_cost_usd). tool_calls/turns are turn-level; the caller adds them to
+    the primary model only.
+    """
+    def n(*keys):
+        for k in keys:
+            v = _usage_get(entry, k)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    cost = (_usage_get(entry, "costUSD")
+            or _usage_get(entry, "cost_usd")
+            or _usage_get(entry, "cost") or 0.0)
+    try:
+        cost_micros = int(round(float(cost) * 1_000_000))
+    except (TypeError, ValueError):
+        cost_micros = 0
+    return {
+        "tokens_in": n("inputTokens", "input_tokens"),
+        "tokens_out": n("outputTokens", "output_tokens"),
+        "cache_read": n("cacheReadInputTokens", "cache_read_input_tokens"),
+        "cache_create": n("cacheCreationInputTokens", "cache_creation_input_tokens"),
+        "cost_micros": cost_micros,
+        "tool_calls": 0,
+        "turns": 0,
+    }
+
+
+# The token/cost fields folded into a turn's roll-up. tool_calls/turns are
+# excluded -- they aren't token spend, and the per-turn reply badge is about
+# "how much did this answer cost".
+_TURN_USAGE_FIELDS = ("tokens_in", "tokens_out", "cache_read", "cache_create", "cost_micros")
+
+
+def _accumulate_turn_usage(acc: dict, delta: dict) -> None:
+    """Sum one (stage × model or sidecar) delta into the whole-turn roll-up that
+    gets tagged onto the final reply (all work done + the reply)."""
+    for k in _TURN_USAGE_FIELDS:
+        acc[k] = int(acc.get(k, 0)) + int(delta.get(k, 0) or 0)
 
 
 def _model_label(model: str) -> str:
@@ -966,6 +1031,10 @@ async def stream_agent_response(
                     'session_id': getattr(msg, 'session_id', None),
                     'cost_usd': getattr(msg, 'total_cost_usd', None),
                     'usage': getattr(msg, 'usage', None),
+                    # Per-model, whole-turn-CUMULATIVE usage (the CLI's modelUsage
+                    # map). Preferred over the flat `usage`, which reflects only
+                    # the final model call and so undercounts multi-step turns.
+                    'model_usage': getattr(msg, 'model_usage', None),
                     'num_turns': getattr(msg, 'num_turns', None),
                 }
 
@@ -985,11 +1054,16 @@ async def stream_agent_response(
             # Derived environment status for the frontend's env display.
             yield sse_event('env_status', _derive_env_status(deployment_state))
 
+        # Collect the two cheap Haiku sidecars' token usage so it's counted in
+        # the turn's per-model roll-up (they run outside the SDK session, so
+        # they're absent from ResultMessage.model_usage).
+        sidecar_usage: list = []
+
         # First turn of a new conversation: replace the provisional first-few-
         # words name with an LLM-summarized title. The app adopts it (sidebar +
         # accounts registry). Best-effort — a failure keeps the provisional name.
         if conversation_id and is_first_turn:
-            title = await generate_title(message)
+            title = await generate_title(message, sidecar_usage)
             if title:
                 conversations.rename(conversation_id, title)
                 yield sse_event('title', {'conversation_id': conversation_id, 'name': title})
@@ -1000,7 +1074,7 @@ async def stream_agent_response(
         # renders whatever it is given (empty track => no stepper).
         if conversation_id:
             rec = conversations.get(conversation_id) or {}
-            life = await classify_lifecycle(rec, message, assistant_text)
+            life = await classify_lifecycle(rec, message, assistant_text, sidecar_usage)
             if life:
                 updated = conversations.set_intent_track(
                     conversation_id, life['intent'], life['track'], life['stage']) or {}
@@ -1018,19 +1092,80 @@ async def stream_agent_response(
         # (best-effort, forwarding the user's JWT). Never breaks the turn.
         if conversation_id and result_metrics:
             try:
-                delta = _usage_delta(result_metrics, tool_calls_this_turn)
                 stage_now = (conversations.get(conversation_id) or {}).get('stage', '')
-                model_id = _model_label(CLAUDE_MODEL)
-                idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
-                updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
+                base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
+                model_usage = result_metrics.get('model_usage')
+                updated_usage = None
+                # Whole-turn roll-up (across every model + the Haiku sidecars),
+                # tagged onto the final reply so the accounts Conversation view
+                # can show tokens/cost per turn = all work done + the reply.
+                turn_usage = {k: 0 for k in _TURN_USAGE_FIELDS}
+
+                if isinstance(model_usage, dict) and model_usage:
+                    # Preferred path: per-model, whole-turn-CUMULATIVE usage --
+                    # every token type (incl. cache read/create) summed across
+                    # the whole agentic loop, plus each model's own cost. One
+                    # delta per (stage × model), idempotency-keyed per model so a
+                    # multi-model turn (e.g. Opus main loop + an internal Haiku)
+                    # lands in the right cells without double-counting on retry.
+                    primary = _model_label(CLAUDE_MODEL)
+                    attributed_extras = False
+                    for model_id, entry in model_usage.items():
+                        delta = _usage_delta_from_model_entry(entry if isinstance(entry, dict) else {})
+                        # tool_calls + turns are turn-level, not per-model -- add
+                        # them once, to the primary model (or the first model if
+                        # the configured one didn't run this turn).
+                        if not attributed_extras and (model_id == primary or primary not in model_usage):
+                            delta['tool_calls'] = int(tool_calls_this_turn or 0)
+                            delta['turns'] = int(result_metrics.get('num_turns') or 0)
+                            attributed_extras = True
+                        idem = f"{base_idem}:{model_id}"
+                        _accumulate_turn_usage(turn_usage, delta)
+                        updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
+                        await _report_usage_to_accounts(conversation_id, stage_now, model_id, delta, idem, auth_token)
+                    logger.info("[usage] %s: turn attributed across %d model(s): %s",
+                                conversation_id, len(model_usage), list(model_usage.keys()))
+                else:
+                    # Fallback (CLI emitted no modelUsage): the flat single-usage
+                    # read + total cost, attributed to the configured model. This
+                    # undercounts multi-step turns -- kept only so usage tracking
+                    # degrades gracefully rather than vanishing.
+                    delta = _usage_delta(result_metrics, tool_calls_this_turn)
+                    model_id = _model_label(CLAUDE_MODEL)
+                    idem = f"{base_idem}:{model_id}"
+                    _accumulate_turn_usage(turn_usage, delta)
+                    updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
+                    await _report_usage_to_accounts(conversation_id, stage_now, model_id, delta, idem, auth_token)
+
+                # Fold in the Haiku sidecars (title + lifecycle classification).
+                # They bill separately from the SDK session, so they're not in
+                # model_usage. Tokens are captured; cost is 0 (the direct API
+                # response carries no cost) -- negligible, derived later if wanted.
+                for i, sc in enumerate(sidecar_usage):
+                    sc_model = _model_label(sc.get('model') or TITLE_MODEL)
+                    sc_delta = _usage_delta_from_model_entry(sc.get('usage') or {})
+                    sc_idem = f"{base_idem}:sidecar:{i}:{sc_model}"
+                    _accumulate_turn_usage(turn_usage, sc_delta)
+                    updated_usage = conversations.add_usage(conversation_id, stage_now, sc_model, sc_delta, sc_idem)
+                    await _report_usage_to_accounts(conversation_id, stage_now, sc_model, sc_delta, sc_idem, auth_token)
+
+                # Tag the final reply with this whole turn's usage (all work +
+                # the reply). Best-effort; the reply message exists only if the
+                # turn produced trailing text. Additive field on the message ->
+                # passes through /history for the accounts Conversation view.
+                if assistant_text:
+                    conversations.set_last_message_usage(conversation_id, turn_usage)
+
+                # Hand the frontend the authoritative cumulative usage so its
+                # status bar + per-(stage × model) stepper badges reconcile to
+                # the agent's figures (no client-side arithmetic drift).
                 if updated_usage is not None:
                     yield sse_event('usage', {
                         'conversation_id': conversation_id,
                         'usage': updated_usage,
                         'stage': stage_now,
-                        'model': model_id,
+                        'model': _model_label(CLAUDE_MODEL),
                     })
-                await _report_usage_to_accounts(conversation_id, stage_now, model_id, delta, idem, auth_token)
             except Exception as e:
                 logger.warning("Usage tracking failed for %s: %s", conversation_id, e)
 
