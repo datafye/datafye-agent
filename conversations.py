@@ -635,21 +635,16 @@ def set_last_message_usage(conversation_id: str, usage: dict) -> None:
             return
 
 
-_MAX_COMMENTARY = 400
-
-
 def append_commentary(conversation_id: str, text: str, kind: Optional[str] = None) -> dict:
     """Append one activity-log entry and return it (so the caller can also emit
-    it live over SSE). Persists only if the strategy exists. The trail is the
-    Work panel's auditable side-mirror, so it keeps every level (not just
-    milestones); capped to the most recent entries to bound growth."""
+    it live over SSE). Persists only if the strategy exists. The full activity
+    trail is retained (no cap): it is the analytics record of the work, paired
+    with the conversation by timestamp, and accounts persists it per project. The
+    Work panel replays it all."""
     entry = {"text": text, "kind": kind, "at": _now_ms()}
     record = _read(conversation_id)
     if record is not None:
-        trail = record.setdefault("commentary", [])
-        trail.append(entry)
-        if len(trail) > _MAX_COMMENTARY:
-            del trail[: len(trail) - _MAX_COMMENTARY]
+        record.setdefault("commentary", []).append(entry)
         record["updated_at"] = _now_ms()
         _write(record)
     return entry
