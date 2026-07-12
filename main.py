@@ -937,7 +937,13 @@ async def stream_agent_response(
 
     try:
         msg_count = 0
-        assistant_text = ""
+        # Text the model writes BETWEEN tool calls is work-narration (its running
+        # account of what it's doing) -> routed to the Work panel as detail
+        # commentary. The final trailing burst (after the last tool) is its
+        # message to the user -> the Conversation. We buffer the current burst and
+        # route it on flush (at the next tool, or at turn end).
+        pending_burst = ""       # current, unrouted text burst
+        conversation_text = ""   # the final reply -> Conversation + persisted
         tool_calls_this_turn = 0
         result_metrics = None  # stashed from ResultMessage; reported after stage classification
 
@@ -965,8 +971,8 @@ async def stream_agent_response(
                     if hasattr(block, 'text') and not hasattr(block, 'name'):
                         text = getattr(block, 'text', '')
                         if text:
-                            assistant_text += text
-                            yield sse_event('content', {'text': text})
+                            # Buffer; routed on flush (Work panel vs Conversation).
+                            pending_burst += text
 
                     # Thinking
                     elif hasattr(block, 'thinking'):
@@ -976,6 +982,15 @@ async def stream_agent_response(
 
                     # Tool use
                     elif hasattr(block, 'name') and hasattr(block, 'input'):
+                        # The text just before this tool is the model narrating
+                        # what it's about to do -- work-narration, not a message to
+                        # the user. Route it to the Work panel (detail commentary).
+                        burst = pending_burst.strip()
+                        pending_burst = ""
+                        if burst:
+                            if conversation_id:
+                                conversations.append_commentary(conversation_id, burst, "muted")
+                            yield sse_event('commentary', {'text': burst, 'kind': 'muted'})
                         tool_name = getattr(block, 'name', '')
                         tool_input = getattr(block, 'input', {})
                         tool_calls_this_turn += 1
@@ -1017,6 +1032,14 @@ async def stream_agent_response(
 
             # Result
             elif isinstance(msg, ResultMessage):
+                # The final trailing burst (no tool followed it) is the reply ->
+                # the Conversation. Emitted once here, after the work is done.
+                conversation_text = pending_burst.strip()
+                pending_burst = ""
+                if conversation_text:
+                    yield sse_event('content', {'text': conversation_text})
+                    if conversation_id:
+                        conversations.append_message(conversation_id, "assistant", conversation_text)
                 yield sse_event('result', {
                     'text': getattr(msg, 'result', ''),
                     'session_id': getattr(msg, 'session_id', None),
@@ -1039,8 +1062,6 @@ async def stream_agent_response(
                 }
 
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
-        if conversation_id and assistant_text:
-            conversations.append_message(conversation_id, "assistant", assistant_text)
 
         # Surface the running environment's state to the frontend. The chat
         # turn may have provisioned, morphed, or torn down an environment, so
@@ -1074,7 +1095,7 @@ async def stream_agent_response(
         # renders whatever it is given (empty track => no stepper).
         if conversation_id:
             rec = conversations.get(conversation_id) or {}
-            life = await classify_lifecycle(rec, message, assistant_text, sidecar_usage)
+            life = await classify_lifecycle(rec, message, conversation_text, sidecar_usage)
             if life:
                 updated = conversations.set_intent_track(
                     conversation_id, life['intent'], life['track'], life['stage']) or {}
@@ -1153,7 +1174,7 @@ async def stream_agent_response(
                 # the reply). Best-effort; the reply message exists only if the
                 # turn produced trailing text. Additive field on the message ->
                 # passes through /history for the accounts Conversation view.
-                if assistant_text:
+                if conversation_text:
                     conversations.set_last_message_usage(conversation_id, turn_usage)
 
                 # Hand the frontend the authoritative cumulative usage so its
