@@ -618,6 +618,23 @@ def append_message(conversation_id: str, role: str, content: str) -> None:
     _write(record)
 
 
+def set_last_message_usage(conversation_id: str, usage: dict) -> None:
+    """Tag the most recent assistant message with this turn's usage roll-up
+    ({tokens_in, tokens_out, cache_read, cache_create, cost_micros}) — the cost
+    of all the work that produced this reply. Best-effort: no-op if the strategy
+    or an assistant message is absent. Additive field, so /history carries it
+    through untouched for consumers that ignore it."""
+    record = _read(conversation_id)
+    if record is None:
+        return
+    for entry in reversed(record.get("messages") or []):
+        if entry.get("role") == "assistant":
+            entry["usage"] = usage
+            record["updated_at"] = _now_ms()
+            _write(record)
+            return
+
+
 _MAX_COMMENTARY = 400
 
 
