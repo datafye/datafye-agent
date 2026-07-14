@@ -560,6 +560,91 @@ async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str
         return None
 
 
+# -- Satisfaction analysis (inferred sidecar) ----------------------
+# A cheap Haiku sidecar (like classify_lifecycle) that infers a 1-5 satisfaction
+# rank + short reasons from the recent transcript, run post-stream and reported
+# to accounts as source='inferred'. Only the DERIVED signal leaves the sandbox,
+# never the raw conversation, so it is privacy-safe regardless of consent.
+_SATISFACTION_PROMPT = (
+    "You gauge how SATISFIED a user is with Yukti (an AI that builds trading "
+    "strategies for them), from their conversation. Weigh the user's tone, whether "
+    "their requests are being met, friction or rework, and any praise or "
+    "complaints. Reply with ONLY a JSON object, no markdown fences and no other "
+    "text:\n"
+    '{"rank": <integer 1-5, where 5=delighted, 3=neutral, 1=very frustrated>, '
+    '"reasons": "<one or two short plain sentences on WHY, no jargon>"}\n\n'
+    "Conversation (most recent last):\n\n"
+)
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Pull the first JSON object out of a model reply, tolerant of fences/prose."""
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start:end + 1])
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _recent_transcript(messages: list, limit: int = 12) -> str:
+    """A compact plain transcript of the last few turns, for the satisfaction
+    analyzer. Roles are labelled User/Yukti; each turn is length-capped."""
+    lines = []
+    for m in (messages or [])[-limit:]:
+        who = "User" if m.get("role") == "user" else "Yukti"
+        content = (m.get("content") or "").strip()
+        if content:
+            lines.append(f"{who}: {content[:1500]}")
+    return "\n".join(lines)
+
+
+async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = None) -> Optional[dict]:
+    """Infer the user's satisfaction (1-5) + a short reason from the conversation,
+    via a cheap direct model call (like classify_lifecycle). Best-effort: returns
+    {"rank": int, "reasons": str} or None on any failure / unparseable reply."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key or not transcript.strip():
+        return None
+    content = _SATISFACTION_PROMPT + transcript[:6000]
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": TITLE_MODEL,
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": content}],
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        if usage_sink is not None and data.get("usage"):
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"]})
+        parts = data.get("content", [])
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        obj = _extract_json_object(text)
+        if not obj:
+            return None
+        rank = int(obj.get("rank") or 0)
+        if rank < 1 or rank > 5:
+            return None
+        return {"rank": rank, "reasons": str(obj.get("reasons") or "").strip()}
+    except Exception as e:
+        logger.warning("Satisfaction analysis failed: %s", e)
+        return None
+
+
 # -- Usage tracking ------------------------------------------------
 # Per (stage × model) token/cost/tool usage. Accumulated into the strategy's
 # meta (drives the workspace telemetry, survives reload via /history) AND
@@ -696,6 +781,30 @@ async def _report_usage_to_accounts(conversation_id: str, stage: str, model: str
                                resp.status_code, conversation_id)
     except Exception as e:
         logger.warning("Usage report to accounts failed for %s: %s", conversation_id, e)
+
+
+async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reasons: str,
+                                           source: str, auth_token: Optional[str]) -> None:
+    """Best-effort: POST the project's satisfaction (rank 1-5 + salient reasons +
+    source) to accounts, forwarding the user's JWT. Only the DERIVED signal is
+    sent, never the raw conversation, so it is privacy-safe regardless of the
+    analytics-consent gate. A "user" source is sticky on the accounts side."""
+    if not auth_token or not AGENT_USERNAME:
+        return
+    if not conversation_id.startswith("proj-"):
+        return
+    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+           f"{AGENT_USERNAME}/projects/{conversation_id}/satisfaction")
+    body = {"rank": int(rank), "reasons": reasons or "", "source": source}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=body,
+                                     headers={"Authorization": f"Bearer {auth_token}"})
+            if resp.status_code >= 400:
+                logger.warning("Satisfaction report returned %s for %s",
+                               resp.status_code, conversation_id)
+    except Exception as e:
+        logger.warning("Satisfaction report failed for %s: %s", conversation_id, e)
 
 
 def _tool_commentary(tool: str, tool_input: dict):
@@ -1114,6 +1223,19 @@ async def stream_agent_response(
                     'stage': updated.get('stage', life['stage']),
                     'maxStage': updated.get('maxStage', life['stage']),
                 })
+
+        # Infer the user's satisfaction (best-effort, cheap) and report only the
+        # derived rank + reasons to accounts, never the raw conversation, so this
+        # is privacy-safe regardless of the analytics-consent gate. An explicit
+        # user rating would be sticky and win over this (accounts enforces it).
+        if conversation_id and conversation_id.startswith("proj-"):
+            rec2 = conversations.get(conversation_id) or {}
+            transcript = _recent_transcript(rec2.get("messages") or [])
+            sat = await analyze_satisfaction(transcript, sidecar_usage)
+            if sat:
+                conversations.set_satisfaction(conversation_id, sat["rank"], sat["reasons"], "inferred")
+                await _report_satisfaction_to_accounts(
+                    conversation_id, sat["rank"], sat["reasons"], "inferred", auth_token)
 
         # Record + report this turn's usage, attributed to the stage it landed
         # in and the model that ran it. Drives the workspace telemetry (meta,

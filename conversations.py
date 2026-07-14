@@ -684,6 +684,27 @@ def set_last_message_usage(conversation_id: str, usage: dict) -> None:
             return
 
 
+def set_satisfaction(conversation_id: str, rank: int, reasons: str, source: str) -> Optional[dict]:
+    """Cache the project's satisfaction signal on the agent side (rank 1-5 +
+    reasons + source). A "user" source is sticky: an "inferred" update does not
+    overwrite it (matching the accounts side). Returns the updated record."""
+    record = _read(conversation_id)
+    if record is None:
+        return None
+    existing = record.get("satisfaction") or {}
+    if source != "user" and existing.get("source") == "user":
+        return record   # don't clobber an explicit user rating
+    record["satisfaction"] = {
+        "rank": int(rank),
+        "reasons": reasons or "",
+        "source": source,
+        "at": _now_ms(),
+    }
+    record["updated_at"] = _now_ms()
+    _write(record)
+    return record
+
+
 def append_commentary(conversation_id: str, text: str, kind: Optional[str] = None) -> dict:
     """Append one activity-log entry and return it (so the caller can also emit
     it live over SSE). Persists only if the strategy exists. The full activity
