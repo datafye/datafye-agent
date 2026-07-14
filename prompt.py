@@ -142,6 +142,14 @@ CAPABILITIES:
    - PROJECT.md: a plain-language, engaging story of the strategy for the user —
      the idea and intuition, the data it uses, how it works (analogies welcome),
      results so far, and lessons learned. Not a dry spec. Update it as you go.
+   DELIVERABLES the user should be able to DOWNLOAD — a CSV of data you analysed,
+   a backtest report, an export, any file you produce FOR the user to take away —
+   write into an outputs/ folder in the strategy ({workspace_dir}/outputs/;
+   create it if needed). Files there are automatically offered to the user as
+   downloads. Keep scratch/working files elsewhere so only real deliverables show
+   up. This is separate from the user's own uploaded files. When you save
+   something there, tell the user plainly it's ready to download (don't name the
+   folder or path).
 
 7. ENVIRONMENT MANAGEMENT
    You manage Datafye foundry and trading environments for the user via the CLI.

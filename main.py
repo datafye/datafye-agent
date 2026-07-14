@@ -41,7 +41,7 @@ import httpx
 import yaml
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from claude_agent_sdk import (
@@ -935,6 +935,14 @@ async def stream_agent_response(
     logger.info(f"[TRACE] Message: {truncate(message)}")
     logger.info(f"[TRACE] MCP servers: {list(mcp_servers.keys())}")
 
+    # Snapshot the deliverables folder so we can announce (via `artifact`) any
+    # NEW or CHANGED output file the agent writes this turn. Keyed name -> (size,
+    # modified_at) so a re-written same-named file still counts as fresh.
+    outputs_before = {}
+    if conversation_id:
+        outputs_before = {f["name"]: (f["size"], f["modified_at"])
+                          for f in conversations.list_outputs(conversation_id)}
+
     try:
         msg_count = 0
         # Text the model writes BETWEEN tool calls is work-narration (its running
@@ -1189,6 +1197,23 @@ async def stream_agent_response(
                     })
             except Exception as e:
                 logger.warning("Usage tracking failed for %s: %s", conversation_id, e)
+
+        # Announce any deliverables the agent produced this turn so the download
+        # UI can offer them. Best-effort; never breaks the turn.
+        if conversation_id:
+            try:
+                for f in conversations.list_outputs(conversation_id):
+                    before = outputs_before.get(f["name"])
+                    if before == (f["size"], f["modified_at"]):
+                        continue   # unchanged since the turn started
+                    yield sse_event("artifact", {
+                        "conversation_id": conversation_id,
+                        "name": f["name"],
+                        "type": f["type"],
+                        "size": f["size"],
+                    })
+            except Exception as e:
+                logger.warning("Artifact announce failed for %s: %s", conversation_id, e)
 
         yield sse_event('done', {})
 
@@ -1650,6 +1675,25 @@ async def delete_conversation_file(conversation_id: str, filename: str):
     if not conversations.delete_file(conversation_id, filename):
         raise HTTPException(status_code=404, detail="No such file")
     return Response(status_code=204)
+
+
+@app.get("/v1/conversations/{conversation_id}/outputs",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def list_conversation_outputs(conversation_id: str):
+    """List the deliverables the agent produced for this project (the download
+    list). Distinct from uploads/ (the user's context files)."""
+    return {"outputs": conversations.list_outputs(conversation_id)}
+
+
+@app.get("/v1/conversations/{conversation_id}/outputs/{filename}",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def download_conversation_output(conversation_id: str, filename: str):
+    """Download one agent-produced output file. Path-safety-guarded (never serves
+    outside the project's outputs/ dir). 404 if the file does not exist."""
+    path = conversations.output_file_path(conversation_id, filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 
 
 # Fail fast at startup if a load-bearing route is missing (e.g. a mis-applied

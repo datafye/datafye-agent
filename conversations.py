@@ -528,6 +528,55 @@ def list_files(conversation_id: str) -> list:
     return out
 
 
+# --- Agent-produced OUTPUT files (deliverables the user downloads) -----------
+# Distinct from uploads/: uploads are the user's context INTO the agent; outputs
+# are files the agent produced FOR the user (a CSV of analysed data, a report, an
+# export). They live in the project's outputs/ folder, are NOT indexed into the
+# prompt (they are deliverables, not context the agent re-reads), and are served
+# back to the browser over the download endpoint.
+
+_OUTPUTS_DIRNAME = "outputs"
+
+
+def outputs_dir(conversation_id: str) -> Path:
+    """The directory holding files the agent produced for the user to download."""
+    return strategy_dir(conversation_id) / _OUTPUTS_DIRNAME
+
+
+def list_outputs(conversation_id: str) -> list:
+    """The project's agent-produced output files, name-sorted. Empty if none."""
+    d = outputs_dir(conversation_id)
+    if not d.exists():
+        return []
+    out = []
+    for child in sorted(d.iterdir()):
+        if child.is_file():
+            try:
+                out.append(_file_entry(child))
+            except OSError as e:
+                logger.warning("Skipping unreadable output %s: %s", child.name, e)
+    return out
+
+
+def output_file_path(conversation_id: str, filename: str) -> Optional[Path]:
+    """Resolve a download request to a real file inside outputs/, or None. Path-
+    safety-guarded (never escapes outputs/) since the filename arrives off a URL."""
+    name = safe_upload_name(filename)
+    if name is None:
+        return None
+    base = outputs_dir(conversation_id).resolve()
+    try:
+        resolved = (outputs_dir(conversation_id) / name).resolve()
+    except Exception:
+        return None
+    if base not in resolved.parents:
+        logger.warning("Refusing to serve output outside outputs dir: %s", filename)
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
 def save_file(conversation_id: str, filename: str, data: bytes) -> Optional[dict]:
     """Write an uploaded file into the project's uploads/ folder (creating it),
     overwriting a same-named file. Returns the file's listing entry, or None if
