@@ -47,6 +47,7 @@ from pydantic import BaseModel
 from claude_agent_sdk import (
     query, ClaudeAgentOptions,
     AssistantMessage, ResultMessage, SystemMessage,
+    create_sdk_mcp_server, tool,
 )
 
 from prompt import build_system_prompt
@@ -807,6 +808,81 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
         logger.warning("Satisfaction report failed for %s: %s", conversation_id, e)
 
 
+def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[str]):
+    """In-process tools the model can call to report to accounts, forwarding the
+    user's own JWT (the self-host-safe channel usage reporting uses; accounts, not
+    the agent, holds the Slack/JIRA creds):
+      - `submit_feedback`: log feedback in-conversation (vs the app's button).
+      - `submit_satisfaction`: record an EXPLICIT user satisfaction rating.
+    Returns None when routing isn't possible (no forwarded identity, e.g. a
+    self-hosted run), so the tools simply aren't offered."""
+    if not (auth_token and AGENT_USERNAME and getattr(auth, "ACCOUNTS_URL", None)):
+        return None
+
+    @tool(
+        "submit_feedback",
+        "Log the user's feedback about Datafye to the team. Use ONLY after the "
+        "user has agreed to you logging it for them. `category` is one of "
+        "'suggestion', 'bug', or 'general'. `message` is the feedback in the "
+        "user's words (summarize if long). `context` is optional extra detail "
+        "(what they were doing, the Datafye topic); pass an empty string if none. "
+        "Bugs and suggestions also open a tracking ticket.",
+        {"category": str, "message": str, "context": str},
+    )
+    async def submit_feedback(args):
+        category = (args.get("category") or "general").strip().lower()
+        message = (args.get("message") or "").strip()
+        context = (args.get("context") or "").strip()
+        if not message:
+            return {"content": [{"type": "text", "text": "No feedback text was provided, so nothing was logged."}]}
+        url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+               f"{AGENT_USERNAME}/feedback")
+        body = {"category": category, "message": message}
+        if context:
+            body["context"] = context
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=body,
+                                         headers={"Authorization": f"Bearer {auth_token}"})
+            if resp.status_code // 100 == 2:
+                data = resp.json() if resp.content else {}
+                jira = data.get("jira")
+                text = "Logged. Thanks for the feedback."
+                if jira:
+                    text += f" A tracking ticket was opened ({jira})."
+                return {"content": [{"type": "text", "text": text}]}
+            logger.warning("Feedback submit returned %s", resp.status_code)
+            return {"content": [{"type": "text", "text": "Could not log the feedback right now."}]}
+        except Exception as e:
+            logger.warning("Feedback submit failed: %s", e)
+            return {"content": [{"type": "text", "text": "Could not reach the feedback service right now."}]}
+
+    @tool(
+        "submit_satisfaction",
+        "Record the user's EXPLICIT satisfaction rating for THIS project, when they "
+        "actually express one (e.g. 'I love it', 'that's exactly right', 'this is "
+        "frustrating'). `rank` is an integer 1-5 (5=delighted, 3=neutral, 1=very "
+        "frustrated). `reasons` is a short plain note on why, in the user's words. "
+        "Use ONLY for a rating the user genuinely expressed -- it takes precedence "
+        "over the agent's own read. Do not fish for a rating; capture it when it's given.",
+        {"rank": int, "reasons": str},
+    )
+    async def submit_satisfaction(args):
+        try:
+            rank = int(args.get("rank") or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        if rank < 1 or rank > 5:
+            return {"content": [{"type": "text", "text": "A rating must be 1 to 5, so nothing was recorded."}]}
+        reasons = (args.get("reasons") or "").strip()
+        if conversation_id:
+            conversations.set_satisfaction(conversation_id, rank, reasons, "user")
+        await _report_satisfaction_to_accounts(conversation_id or "", rank, reasons, "user", auth_token)
+        return {"content": [{"type": "text", "text": "Thanks, I've noted your rating."}]}
+
+    return create_sdk_mcp_server("feedback", "1.0.0", tools=[submit_feedback, submit_satisfaction])
+
+
 def _tool_commentary(tool: str, tool_input: dict):
     """A sanitized, high-level activity line for a tool call as
     (text, level), or None to skip it.
@@ -987,6 +1063,14 @@ async def stream_agent_response(
         cwd = WORKSPACE_DIR
 
     mcp_servers, allowed_tools = build_mcp_config()
+    # Offer the in-conversation reporting tools (feedback + explicit satisfaction)
+    # only when we can route them (platform user with a forwarded JWT); a
+    # self-hosted run without accounts skips them.
+    reporting_server = _build_reporting_mcp(auth_token, conversation_id)
+    if reporting_server is not None:
+        mcp_servers["feedback"] = reporting_server
+        allowed_tools.append("mcp__feedback__submit_feedback")
+        allowed_tools.append("mcp__feedback__submit_satisfaction")
     system_prompt = build_system_prompt(
         docs_dir=DOCS_DIR,
         cli_path=CLI_PATH,
