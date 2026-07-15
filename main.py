@@ -765,10 +765,11 @@ async def _report_usage_to_accounts(conversation_id: str, stage: str, model: str
     the billing roll-up — never the workspace display, never the turn."""
     if not auth_token or not AGENT_USERNAME:
         return  # no forwarded identity (e.g. a self-hosted local run) — meta-only
-    # Only accounts-registered strategies carry usage there (accounts mints
-    # "proj-" ids; a legacy "c-" id is agent-local and not in the registry).
-    if not conversation_id.startswith("proj-"):
-        return
+    # Report for any project id: accounts is the authority. Registered projects
+    # (accounts-minted "proj-" AND browser-local ids that were reconciled into the
+    # registry) are accepted; an unregistered id yields a 404 that this best-effort
+    # call just logs. (Was gated to "proj-" only, which wrongly dropped usage for
+    # reconciled projects.)
     url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
            f"{AGENT_USERNAME}/projects/{conversation_id}/usage")
     body = {"idempotency_key": idem, "stage": stage, "model": model}
@@ -792,8 +793,8 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
     analytics-consent gate. A "user" source is sticky on the accounts side."""
     if not auth_token or not AGENT_USERNAME:
         return
-    if not conversation_id.startswith("proj-"):
-        return
+    # Report for any registered project (proj- OR a reconciled browser-local id);
+    # accounts 404s an unregistered id and this best-effort call just logs it.
     url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
            f"{AGENT_USERNAME}/projects/{conversation_id}/satisfaction")
     body = {"rank": int(rank), "reasons": reasons or "", "source": source}
@@ -1312,7 +1313,10 @@ async def stream_agent_response(
         # derived rank + reasons to accounts, never the raw conversation, so this
         # is privacy-safe regardless of the analytics-consent gate. An explicit
         # user rating would be sticky and win over this (accounts enforces it).
-        if conversation_id and conversation_id.startswith("proj-"):
+        # Gate on a forwarded identity (platform user) rather than the id prefix,
+        # so it runs for any registered project (incl. reconciled ids) and is
+        # skipped for a self-hosted run with no accounts to report to.
+        if conversation_id and auth_token and AGENT_USERNAME:
             rec2 = conversations.get(conversation_id) or {}
             transcript = _recent_transcript(rec2.get("messages") or [])
             sat = await analyze_satisfaction(transcript, sidecar_usage)
