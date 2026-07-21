@@ -1297,6 +1297,16 @@ async def stream_agent_response(
             yield sse_event('descriptor', {'descriptor': deployment_state['descriptor_text']})
             # Derived environment status for the frontend's env display.
             yield sse_event('env_status', _derive_env_status(deployment_state))
+        else:
+            # No environment is up (torn down, switched away from, or not yet
+            # reachable). Emit a CLEARED status so the panel doesn't keep showing a
+            # stale environment from an earlier dataset (e.g. SIP after the user has
+            # moved to a Crypto foundry). A running env re-asserts itself on the
+            # next turn's read.
+            yield sse_event('env_status', {
+                'status': 'idle', 'env_type': None,
+                'datasets': [], 'symbols': [], 'broker': None, 'mode': None,
+            })
 
         # Collect the two cheap Haiku sidecars' token usage so it's counted in
         # the turn's per-model roll-up (they run outside the SDK session, so
@@ -1352,7 +1362,12 @@ async def stream_agent_response(
         # (best-effort, forwarding the user's JWT). Never breaks the turn.
         if conversation_id and result_metrics:
             try:
-                stage_now = (conversations.get(conversation_id) or {}).get('stage', '')
+                _rec_now = conversations.get(conversation_id) or {}
+                # Fall back to the intent (then a generic label) when there is no
+                # lifecycle stage: a research/chat project has an empty track, so
+                # its stage is blank -- tag usage with the intent (e.g. "research")
+                # instead of leaving it empty, which the UI renders as "unknown".
+                stage_now = _rec_now.get('stage') or _rec_now.get('intent') or 'general'
                 base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
                 model_usage = result_metrics.get('model_usage')
                 updated_usage = None
