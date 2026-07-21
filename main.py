@@ -87,6 +87,11 @@ CLI_PATH = os.getenv("DATAFYE_AGENT_CLI_PATH", "datafye")
 # Path to Datafye samples (Java-based reference for API patterns)
 SAMPLES_DIR = os.getenv("DATAFYE_AGENT_SAMPLES_DIR", "/home/datafye/samples")
 
+# The foundry resource-cost cheat sheet ships with the agent app clone; the prompt
+# points the agent at it to estimate memory/disk before heavy foundry operations.
+CHEATSHEET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "reference", "foundry-resource-cost-cheatsheet.md")
+
 # User credentials (injected per-user at launch)
 MASSIVE_API_KEY = os.getenv("DATAFYE_AGENT_MASSIVE_API_KEY", "")
 PALPHA_API_KEY = os.getenv("DATAFYE_AGENT_PALPHA_API_KEY", "")
@@ -1089,6 +1094,9 @@ async def stream_agent_response(
         # Index of the user's uploaded context files (name/type/size); bodies are
         # read on demand from uploads/ — never inlined into the prompt.
         files_context=conversations.build_files_context(conversation_id),
+        # On-disk path to the foundry resource-cost cheat sheet (for the resource
+        # guard); empty if the bundled file is missing.
+        cheatsheet_path=CHEATSHEET_PATH if os.path.exists(CHEATSHEET_PATH) else "",
     )
 
     options = ClaudeAgentOptions(

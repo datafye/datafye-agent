@@ -33,8 +33,35 @@ def build_system_prompt(
     memory_context: str = "",
     skills_dir: str = "",
     files_context: str = "",
+    cheatsheet_path: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
+
+    # The resource guard: always-on core rules, plus a pointer to the bundled
+    # cheat sheet (per-unit rates, formula, OOM guard, instance-size map, examples).
+    cheatsheet_line = (
+        f"   For the per-unit rates, the estimation formula, the OOM guard, the\n"
+        f"   instance-size map, and worked examples, READ the foundry resource-cost\n"
+        f"   cheat sheet at: {cheatsheet_path}\n"
+        if cheatsheet_path else ""
+    )
+    resource_guard = f"""
+   RESOURCE GUARD (do this BEFORE any historical fetch or replay):
+   A fetch or replay can exhaust the instance's memory or disk. Before you run one:
+   1. Estimate its PEAK MEMORY and DISK, biased to a HIGH-VOLUME trading day (worst
+      case, round up).
+   2. Check the instance's real limits: `free -m` for RAM, `df -h` for disk.
+   3. If the worst-case estimate does not fit with headroom (keep peak under ~70% of
+      RAM, and leave at least 5 GB disk free), STOP and do not run it: tell the user
+      the estimate, the current instance, and the smallest instance size that fits,
+      and ask them to resize FIRST. Never silently run something that will OOM or
+      fill the disk.
+   HARD RULE (resizing does NOT help): a combined-ticks fetch whose ONE-DAY buffer
+   exceeds ~1.3 GB OOMs the history heap (fixed 2 GB on every instance size) and
+   writes ZERO data. Fetch trades and quotes SEPARATELY (they stream), split the
+   symbols, or use OHLC instead. And NEVER fetch with an empty symbol list -- that
+   pulls the entire provider universe.
+{cheatsheet_line}"""
 
     memory_block = f"\n{memory_context}\n" if memory_context else ""
 
@@ -180,7 +207,7 @@ CAPABILITIES:
      broken environment. To work with a different dataset, deprovision the current
      foundry and provision a fresh single-dataset one. Do not try to combine datasets
      in one descriptor.
-
+{resource_guard}
 8. TESTING
    When the user tests their algo against historical data (Backtest) or
    paper-trades it against live data (Validate):
