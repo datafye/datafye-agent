@@ -812,7 +812,7 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
 def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[str]):
     """In-process tools the model can call to report to accounts, forwarding the
     user's own JWT (the self-host-safe channel usage reporting uses; accounts, not
-    the agent, holds the Slack/JIRA creds):
+    the agent, holds the Slack/Linear creds):
       - `submit_feedback`: log feedback in-conversation (vs the app's button).
       - `submit_satisfaction`: record an EXPLICIT user satisfaction rating.
     Returns None when routing isn't possible (no forwarded identity, e.g. a
@@ -847,10 +847,12 @@ def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[st
                                          headers={"Authorization": f"Bearer {auth_token}"})
             if resp.status_code // 100 == 2:
                 data = resp.json() if resp.content else {}
-                jira = data.get("jira")
+                # accounts returns the created tracking-issue id under "ticket"
+                # (provider-neutral; "jira" kept as a fallback for older builds).
+                ticket = data.get("ticket") or data.get("jira")
                 text = "Logged. Thanks for the feedback."
-                if jira:
-                    text += f" A tracking ticket was opened ({jira})."
+                if ticket:
+                    text += f" A tracking ticket was opened ({ticket})."
                 return {"content": [{"type": "text", "text": text}]}
             logger.warning("Feedback submit returned %s", resp.status_code)
             return {"content": [{"type": "text", "text": "Could not log the feedback right now."}]}
