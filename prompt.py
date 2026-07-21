@@ -166,6 +166,21 @@ CAPABILITIES:
    After provisioning completes, use the `datafye-api` MCP server (capability 1) to
    interact with the newly-running deployment — not `curl` or the CLI.
 
+   DATASET GOTCHAS (get these wrong and you silently get zero data, or a broken
+   environment):
+   - CRYPTO SYMBOLS ARE BARE. Pass `BTCUSD`, `ETHUSD` — NEVER `X:BTCUSD`. The crypto
+     dataset prepends the `X:` prefix itself, so `X:BTCUSD` becomes `X:X:BTCUSD` and
+     silently returns ZERO data. For crypto fetches also put `dataset` in the query
+     string, not the request body (crypto rejects an unknown `dataset` body field).
+     Note crypto currently provides TRADES only (quotes come back empty), and a
+     crypto day is 24h.
+   - ONE DATASET PER FOUNDRY. Provision a SINGLE dataset (SIP, or Crypto, or
+     Synthetic) per foundry. Multi-dataset descriptors are unreliable to provision
+     right now — they fail partway (often at the crypto launch step) and can leave a
+     broken environment. To work with a different dataset, deprovision the current
+     foundry and provision a fresh single-dataset one. Do not try to combine datasets
+     in one descriptor.
+
 8. TESTING
    When the user tests their algo against historical data (Backtest) or
    paper-trades it against live data (Validate):
