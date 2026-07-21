@@ -1146,7 +1146,9 @@ async def stream_agent_response(
         # commentary. The final trailing burst (after the last tool) is its
         # message to the user -> the Conversation. We buffer the current burst and
         # route it on flush (at the next tool, or at turn end).
-        pending_burst = ""       # current, unrouted text burst
+        pending_blocks = []      # unrouted text blocks, kept DISTINCT (one per
+                                 # narration sentence / reply paragraph) so they
+                                 # never glue into a run-on line on flush
         conversation_text = ""   # the final reply -> Conversation + persisted
         tool_calls_this_turn = 0
         result_metrics = None  # stashed from ResultMessage; reported after stage classification
@@ -1175,8 +1177,12 @@ async def stream_agent_response(
                     if hasattr(block, 'text') and not hasattr(block, 'name'):
                         text = getattr(block, 'text', '')
                         if text:
-                            # Buffer; routed on flush (Work panel vs Conversation).
-                            pending_burst += text
+                            # Buffer each block SEPARATELY; routed on flush (Work
+                            # panel vs Conversation). Keeping blocks distinct (vs
+                            # string concatenation) makes each narration sentence
+                            # its own line instead of one run-on blob with the
+                            # sentences jammed together at the periods.
+                            pending_blocks.append(text)
 
                     # Thinking
                     elif hasattr(block, 'thinking'):
@@ -1188,13 +1194,16 @@ async def stream_agent_response(
                     elif hasattr(block, 'name') and hasattr(block, 'input'):
                         # The text just before this tool is the model narrating
                         # what it's about to do -- work-narration, not a message to
-                        # the user. Route it to the Work panel (detail commentary).
-                        burst = pending_burst.strip()
-                        pending_burst = ""
-                        if burst:
+                        # the user. Route each block to the Work panel as ITS OWN
+                        # line (one commentary entry per narration sentence).
+                        for burst in pending_blocks:
+                            burst = burst.strip()
+                            if not burst:
+                                continue
                             if conversation_id:
                                 conversations.append_commentary(conversation_id, burst, "muted")
                             yield sse_event('commentary', {'text': burst, 'kind': 'muted'})
+                        pending_blocks = []
                         tool_name = getattr(block, 'name', '')
                         tool_input = getattr(block, 'input', {})
                         tool_calls_this_turn += 1
@@ -1236,10 +1245,12 @@ async def stream_agent_response(
 
             # Result
             elif isinstance(msg, ResultMessage):
-                # The final trailing burst (no tool followed it) is the reply ->
-                # the Conversation. Emitted once here, after the work is done.
-                conversation_text = pending_burst.strip()
-                pending_burst = ""
+                # The final trailing blocks (no tool followed) are the reply ->
+                # the Conversation. Join as paragraphs so a multi-block reply keeps
+                # its breaks and consecutive blocks never glue together.
+                conversation_text = "\n\n".join(
+                    b.strip() for b in pending_blocks if b.strip())
+                pending_blocks = []
                 if conversation_text:
                     yield sse_event('content', {'text': conversation_text})
                     if conversation_id:
