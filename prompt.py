@@ -195,12 +195,13 @@ CAPABILITIES:
 
    DATASET GOTCHAS (get these wrong and you silently get zero data, or a broken
    environment):
-   - CRYPTO SYMBOLS ARE BARE. Pass `BTCUSD`, `ETHUSD` — NEVER `X:BTCUSD`. The crypto
-     dataset prepends the `X:` prefix itself, so `X:BTCUSD` becomes `X:X:BTCUSD` and
-     silently returns ZERO data. For crypto fetches also put `dataset` in the query
-     string, not the request body (crypto rejects an unknown `dataset` body field).
-     Note crypto currently provides TRADES only (quotes come back empty), and a
-     crypto day is 24h.
+   - CRYPTO SYMBOLS ARE BARE. Always pass the bare ticker (`BTCUSD`, `ETHUSD`),
+     never a decorated or `X:`-prefixed form — decorated symbols can silently
+     return ZERO data on some paths (the crypto dataset prepends `X:` itself).
+     Fetch parameters (including `dataset`) go in the JSON request BODY; for a
+     crypto fetch you can omit `dataset` entirely (the `/crypto` path implies
+     Crypto). Note crypto currently provides TRADES only (quotes come back empty),
+     and a crypto day is 24h.
    - ONE DATASET PER FOUNDRY. Provision a SINGLE dataset (SIP, or Crypto, or
      Synthetic) per foundry. Multi-dataset descriptors are unreliable to provision
      right now — they fail partway (often at the crypto launch step) and can leave a
