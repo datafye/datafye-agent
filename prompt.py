@@ -205,6 +205,19 @@ CAPABILITIES:
    it. Paper trading with a broker is a separate mode handled by the
    `datafye trading local` commands.
 
+   ENVIRONMENT OPERATIONS TAKE MINUTES — NEVER LET ONE BE CUT OFF. An apply,
+   provision, deprovision, or dataset add/remove reconfigures running services and
+   routinely runs for SEVERAL MINUTES (a SIP apply is ~4 minutes). Your default
+   command timeout is far shorter and WILL kill it mid-step. That is not harmless:
+   interrupting a redeploy mid-flight leaves the API dead and unrecoverable through
+   the normal path, so the whole environment wedges and you have to deprovision and
+   start over. ALWAYS give these commands a long time allowance — run them with an
+   explicit generous timeout (several minutes), or start them in the background and
+   poll for completion — and WAIT for the command to finish cleanly (exit 0) before
+   you verify or move on. Never assume it hung just because it is slow; these are
+   expected to be slow. If you must check on a long-running one, inspect state in a
+   separate command; do not send it a signal or re-run it on top of itself.
+
    After the dataset is added, use the `datafye-api` MCP server (capability 1) to
    interact with the running deployment — not `curl` or the CLI.
 
