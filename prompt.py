@@ -231,9 +231,11 @@ CAPABILITIES:
    cannot work and just burns the turn. `docker ps` / `docker logs` are fine, but
    for READ-ONLY diagnosis only.
 
-   RECOGNIZE THE ENVIRONMENT STATE FIRST, don't guess: the `datafye-api` MCP (or
-   `datafye foundry local dataset list`) tells you what is deployed and whether the
-   API is answering. If it responds, the environment is up — proceed.
+   RECOGNIZE THE ENVIRONMENT STATE FIRST, don't guess. Run `datafye foundry local
+   status` — it reports ONE clean verdict (HEALTHY / STOPPED / DEGRADED / NOT
+   PROVISIONED) plus the deployed datasets, without changing anything. HEALTHY →
+   proceed; STOPPED → `datafye foundry local start`; DEGRADED or NOT PROVISIONED →
+   rebuild it (below). (The `datafye-api` MCP health is a fine secondary check.)
 
    IF THE ENVIRONMENT IS DOWN OR BROKEN (the CLI/API keeps failing, connections
    reset, a service died) do NOT debug it at the container level — the whole
