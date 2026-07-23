@@ -459,6 +459,28 @@ else
     ok "Datafye CLI: ${CLI_PATH} -> $(readlink -f "${CLI_PATH}")"
 fi
 
+# ── Pin Java 17 for the Datafye CLI, globally (DAT-116) ───────────
+# The box's default PATH `java` may be Java 8 (`/usr/lib/jvm/java-1.8.0`), but the
+# Datafye CLI requires Java 17. Set DF_CLI_JAVA_HOME to the corretto-17 (or
+# openjdk-17) home in /etc/profile.d so the CLI works for ANY user/shell -- an
+# operator running `datafye ...` by hand, not just the install-time invocation.
+# Safe to bake into an AMI (global, not instance-specific).
+DF_CLI_JAVA_HOME=""
+for _j in /usr/lib/jvm/java-17-amazon-corretto* /usr/lib/jvm/java-17-openjdk*; do
+    if [ -x "${_j}/bin/java" ]; then DF_CLI_JAVA_HOME="${_j}"; break; fi
+done
+if [ -n "${DF_CLI_JAVA_HOME}" ]; then
+    cat > /etc/profile.d/datafye-cli.sh << EOF
+# The Datafye CLI requires Java 17; the box's default PATH java may be older.
+export DF_CLI_JAVA_HOME="${DF_CLI_JAVA_HOME}"
+EOF
+    chmod 0644 /etc/profile.d/datafye-cli.sh
+    ok "Datafye CLI Java 17: DF_CLI_JAVA_HOME=${DF_CLI_JAVA_HOME} (/etc/profile.d/datafye-cli.sh)"
+else
+    warn "Could not find a Java 17 home under /usr/lib/jvm -- DF_CLI_JAVA_HOME not set."
+    warn "An interactive 'datafye ...' may fail if PATH java is older than 17."
+fi
+
 # ── Step: Install/update docs, samples, and agent source ─────────
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Installing docs, samples, and agent source..."
@@ -586,15 +608,28 @@ if [ "$AMI_CLEANUP" = true ]; then
     ok "Foundry: deferred to first boot"
 elif [ "$IS_UPGRADE" = true ]; then
     info "[${STEP}/${TOTAL_STEPS}] Upgrading local Datafye foundry environment..."
-    sudo -u datafye "${CLI_PATH}" foundry local upgrade \
-        || { error "Foundry upgrade failed. The agent requires a working foundry environment and API MCP server to function. Resolve the issue and re-run the installer."; exit 1; }
-    ok "Foundry environment upgraded"
+    if sudo -u datafye "${CLI_PATH}" foundry local upgrade; then
+        ok "Foundry environment upgraded"
+    else
+        # Non-fatal (DAT-115): a stale/broken foundry left by prior testing can fail
+        # the FAST-restart upgrade. The agent runs WITHOUT a foundry (it provisions
+        # one on demand), so we must NOT abort here and leave the datafye-agent
+        # service stopped -- the service is started below regardless.
+        warn "Foundry upgrade failed -- continuing so the agent is not left stopped."
+        warn "The agent will provision a fresh foundry on demand. If the foundry stays"
+        warn "broken, deprovision + reprovision it as the datafye user and investigate."
+    fi
 else
     info "[${STEP}/${TOTAL_STEPS}] Provisioning local Datafye foundry environment..."
     info "  (First-time provision may take several minutes while Docker images are pulled.)"
-    sudo -u datafye "${CLI_PATH}" foundry local provision \
-        || { error "Foundry provision failed. The agent requires a working foundry environment and API MCP server to function. Resolve the issue and re-run the installer."; exit 1; }
-    ok "Foundry environment provisioned"
+    if sudo -u datafye "${CLI_PATH}" foundry local provision; then
+        ok "Foundry environment provisioned"
+    else
+        # Non-fatal for the same reason: never leave the agent service down over a
+        # foundry problem -- it provisions on demand.
+        warn "Foundry provision failed -- continuing so the agent is not left stopped."
+        warn "The agent will provision a foundry on demand; investigate separately."
+    fi
 fi
 
 # ── Write configuration ──────────────────────────────────────────
