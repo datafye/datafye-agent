@@ -930,6 +930,26 @@ def _tool_commentary(tool: str, tool_input: dict):
     return None
 
 
+def _is_env_changing_tool(tool: str, tool_input: dict) -> bool:
+    """True if a tool call is likely to CHANGE the deployed environment (provision,
+    apply, dataset add/remove, deprovision, morph, start/stop). The streamer emits
+    a transitioning env_status when one starts and re-reads the environment right
+    after it finishes -- so the workspace env panel updates the moment the agent
+    spins up / reconfigures an environment, instead of waiting for turn end (which
+    on a long turn can be minutes later)."""
+    _ENV_VERBS = ("apply", "provision", "deprovision", "dataset", "morph",
+                  "upgrade", "start", "stop", "deploy", "create")
+    if tool == "Bash":
+        cmd = ((tool_input or {}).get("command") or "").lower()
+        if ("foundry local" in cmd or "trading local" in cmd) and any(v in cmd for v in _ENV_VERBS):
+            return True
+        return False
+    if tool.startswith("mcp__datafye-api__"):
+        op = tool.split("mcp__datafye-api__", 1)[1].lower()
+        return any(v in op for v in _ENV_VERBS)
+    return False
+
+
 async def _fetch_deployment_state() -> Optional[dict]:
     """Best-effort snapshot of the running Datafye environment.
 
@@ -1165,6 +1185,10 @@ async def stream_agent_response(
         # climbing in real time. Reconciled to the authoritative `usage` event
         # at turn end (this is a live estimate, not the billed figure).
         ticker_tokens = 0
+        # The id of an in-flight environment-changing tool (apply/provision/...);
+        # its tool_result triggers a mid-turn deployment re-read so the env panel
+        # updates as soon as the environment actually changes (not at turn end).
+        pending_env_tool_id = None
         result_metrics = None  # stashed from ResultMessage; reported after stage classification
 
         async for msg in query(prompt=message, options=options):
@@ -1243,11 +1267,19 @@ async def stream_agent_response(
                                 conversations.append_commentary(conversation_id, text, level)
                             yield sse_event('commentary', {'text': text, 'kind': level})
 
+                        # An environment-changing tool just STARTED: show the panel
+                        # a transitioning state (e.g. "Applying...") right away, and
+                        # remember its id so we re-read the environment when it ends.
+                        if _is_env_changing_tool(tool_name, tool_input):
+                            pending_env_tool_id = getattr(block, 'id', '') or True
+                            yield sse_event('env_status', {'status': 'transitioning'})
+
                     # Tool result
                     elif hasattr(block, 'tool_use_id'):
                         is_err = bool(getattr(block, 'is_error', False))
+                        result_tool_id = getattr(block, 'tool_use_id', '')
                         yield sse_event('tool_result', {
-                            'tool_use_id': getattr(block, 'tool_use_id', ''),
+                            'tool_use_id': result_tool_id,
                             'content': str(getattr(block, 'content', '') or ''),
                             'is_error': getattr(block, 'is_error', False)
                         })
@@ -1256,6 +1288,26 @@ async def stream_agent_response(
                             if conversation_id:
                                 conversations.append_commentary(conversation_id, err_text, 'error')
                             yield sse_event('commentary', {'text': err_text, 'kind': 'error'})
+
+                        # An environment-changing tool just FINISHED: re-read the
+                        # deployment now and push fresh descriptor + env_status, so
+                        # the panel reflects the new environment mid-turn instead of
+                        # waiting for turn end. Best-effort; never breaks the turn.
+                        if pending_env_tool_id and (pending_env_tool_id is True
+                                                    or pending_env_tool_id == result_tool_id):
+                            pending_env_tool_id = None
+                            try:
+                                dep = await _fetch_deployment_state()
+                                if dep:
+                                    yield sse_event('descriptor', {'descriptor': dep['descriptor_text']})
+                                    yield sse_event('env_status', _derive_env_status(dep))
+                                else:
+                                    yield sse_event('env_status', {
+                                        'status': 'idle', 'env_type': None,
+                                        'datasets': [], 'symbols': [], 'broker': None, 'mode': None,
+                                    })
+                            except Exception as e:
+                                logger.warning("Mid-turn env read failed: %s", e)
 
                 # This model round's usage -> accumulate NEW tokens and push a
                 # live ticker so the status bar counts up in real time. Best-
