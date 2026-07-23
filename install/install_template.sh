@@ -422,20 +422,29 @@ fi
 # ── Step: Install / validate Datafye CLI ─────────────────────────
 next_step
 if is_snapshot "$VERSION"; then
-    info "[${STEP}/${TOTAL_STEPS}] Validating local Datafye CLI (SNAPSHOT mode)..."
-    if ! command -v datafye &>/dev/null; then
-        error "Datafye CLI not found on PATH. SNAPSHOT installs require a locally-installed"
-        error "CLI matching version ${VERSION}."
+    # SNAPSHOT mode does NOT install or upgrade the Datafye CLI -- it uses
+    # whatever CLI is already on the box. Datafye normally versions every
+    # component (platform/CLI/docs/samples/agent) on one number, but an
+    # agent-only SNAPSHOT (validating agent code) works fine against a released
+    # CLI, so the version is REPORTED, not enforced. If a SNAPSHOT agent change
+    # genuinely needs a newer CLI, upgrade the CLI manually first.
+    info "[${STEP}/${TOTAL_STEPS}] Locating Datafye CLI (SNAPSHOT mode: version not enforced)..."
+    if command -v datafye &>/dev/null; then
+        CLI_PATH=$(command -v datafye)
+    elif [ -x "${CLI_BASE}/current/bin/datafye" ]; then
+        CLI_PATH="${CLI_BASE}/current/bin/datafye"
+    else
+        error "No Datafye CLI found (on PATH or at ${CLI_BASE}/current). SNAPSHOT mode does"
+        error "not install the CLI -- install it manually, then re-run."
         exit 1
     fi
-    INSTALLED_CLI_VERSION=$(datafye version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9.-]+)?' | head -1 || true)
+    INSTALLED_CLI_VERSION=$("${CLI_PATH}" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9.-]+)?' | head -1 || true)
     if [ "$INSTALLED_CLI_VERSION" != "$VERSION" ]; then
-        error "Local Datafye CLI version '${INSTALLED_CLI_VERSION}' does not match requested"
-        error "SNAPSHOT '${VERSION}'. Install or update the local CLI first."
-        exit 1
+        warn "Local Datafye CLI is v${INSTALLED_CLI_VERSION:-unknown}, not ${VERSION}. SNAPSHOT"
+        warn "installs do not upgrade the CLI -- proceeding with the installed one. Upgrade the"
+        warn "CLI manually if your agent changes require a newer CLI."
     fi
-    CLI_PATH=$(command -v datafye)
-    ok "Using local Datafye CLI: ${CLI_PATH} (v${INSTALLED_CLI_VERSION})"
+    ok "Using local Datafye CLI: ${CLI_PATH} (v${INSTALLED_CLI_VERSION:-unknown})"
 else
     info "[${STEP}/${TOTAL_STEPS}] Installing Datafye CLI v${VERSION}..."
     curl -fsSL "https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh" | bash
