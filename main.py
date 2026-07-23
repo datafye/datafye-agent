@@ -1159,6 +1159,12 @@ async def stream_agent_response(
                                  # never glue into a run-on line on flush
         conversation_text = ""   # the final reply -> Conversation + persisted
         tool_calls_this_turn = 0
+        # Running NEW-token count (fresh input+output, cache excluded) for the
+        # live status-bar ticker. Each AssistantMessage carries this round's
+        # usage; we accumulate and emit a `ticker` so the client shows tokens
+        # climbing in real time. Reconciled to the authoritative `usage` event
+        # at turn end (this is a live estimate, not the billed figure).
+        ticker_tokens = 0
         result_metrics = None  # stashed from ResultMessage; reported after stage classification
 
         async for msg in query(prompt=message, options=options):
@@ -1208,9 +1214,13 @@ async def stream_agent_response(
                             burst = burst.strip()
                             if not burst:
                                 continue
+                            # Narration is the agent's OWN voice as it works ("I'll
+                            # log these now, grouped into coherent tickets ..."), a
+                            # distinct kind from the machine tool-labels below so
+                            # the client can render it a shade brighter in the rail.
                             if conversation_id:
-                                conversations.append_commentary(conversation_id, burst, "muted")
-                            yield sse_event('commentary', {'text': burst, 'kind': 'muted'})
+                                conversations.append_commentary(conversation_id, burst, "narration")
+                            yield sse_event('commentary', {'text': burst, 'kind': 'narration'})
                         pending_blocks = []
                         tool_name = getattr(block, 'name', '')
                         tool_input = getattr(block, 'input', {})
@@ -1247,6 +1257,15 @@ async def stream_agent_response(
                                 conversations.append_commentary(conversation_id, err_text, 'error')
                             yield sse_event('commentary', {'text': err_text, 'kind': 'error'})
 
+                # This model round's usage -> accumulate NEW tokens and push a
+                # live ticker so the status bar counts up in real time. Best-
+                # effort; a round without usage just doesn't advance the ticker.
+                mu = getattr(msg, 'usage', None)
+                if isinstance(mu, dict):
+                    ticker_tokens += (int(mu.get('input_tokens') or 0)
+                                      + int(mu.get('output_tokens') or 0))
+                    yield sse_event('ticker', {'tokens': ticker_tokens})
+
             # Stream events
             elif hasattr(msg, 'event'):
                 yield sse_event('stream', {'event': getattr(msg, 'event', {})})
@@ -1259,6 +1278,12 @@ async def stream_agent_response(
                 conversation_text = "\n\n".join(
                     b.strip() for b in pending_blocks if b.strip())
                 pending_blocks = []
+                # Guarantee a closing message. If the turn ended on a tool call
+                # with no trailing prose, conversation_text is empty -- fall back
+                # to the SDK's own final result text so the Conversation always
+                # gets a reply rather than a turn that ends silently on an action.
+                if not conversation_text:
+                    conversation_text = (getattr(msg, 'result', '') or '').strip()
                 if conversation_text:
                     yield sse_event('content', {'text': conversation_text})
                     if conversation_id:
@@ -1672,7 +1697,11 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
     - thinking: Agent reasoning {text}
     - tool_use_start: Tool invocation {tool, id, input}
     - tool_result: Tool result {tool_use_id, content, is_error}
-    - commentary: Background activity line for the activity panel {text}
+    - commentary: Background activity line for the activity panel {text, kind}
+      (kind: narration = the agent's own voice; muted/notable/check = machine
+      tool-labels; error = a failed step)
+    - ticker: Running NEW-token count for the live status ticker {tokens},
+      emitted per model round; a live estimate reconciled by `usage` at turn end
     - result: Final result {text, session_id, duration_ms, cost_usd}
     - descriptor: Raw deployment-descriptor YAML text {descriptor} (relayed to accounts)
     - env_status: Environment state {status, env_type, datasets, symbols, broker, mode}
