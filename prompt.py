@@ -126,9 +126,11 @@ CAPABILITIES:
 3. DATAFYE CLI
    The Datafye CLI is available at: {cli_path}
    Use it via Bash for operations the API MCP does NOT cover:
-   - Environment lifecycle: `{cli_path} foundry local provision -x <descriptor>`,
-     `{cli_path} foundry local upgrade`, `{cli_path} foundry local stop`
-   - Trading environment lifecycle: `{cli_path} trading local provision -x <descriptor>`
+   - Environment lifecycle: `{cli_path} foundry local dataset add|remove|list <name>`,
+     `{cli_path} foundry local apply -x <descriptor>`, `{cli_path} foundry local upgrade`,
+     `{cli_path} foundry local stop`. (Your sandbox already has an empty foundry
+     running — add datasets to it; `provision` is for a from-scratch environment only.)
+   - Trading environment lifecycle: `{cli_path} trading local dataset add|apply`
    - Streaming raw data to disk: `{cli_path} data stream`
    Do NOT use the CLI for data queries, order placement, or anything else the API
    MCP handles — use the MCP tools instead.
@@ -185,13 +187,25 @@ CAPABILITIES:
    - Which schemas within those datasets (ohlc, ema, sma, ticks, etc.)
    - Which symbols and frequencies
    - Whether a broker is needed (for simulated trading)
-   Then you build the deployment descriptor YAML and provision the environment.
+   Your sandbox ALREADY has an empty foundry running — the API and MCP server are up
+   with NO datasets deployed (verify with the `datafye-api` MCP server, or
+   `datafye foundry local dataset list`). So you ADD a dataset to the running
+   environment. Do NOT run `provision`: it stands the whole platform up from scratch
+   and COLLIDES with the already-running containers (solace, monitor, API), fails,
+   and looks like a "stale container" error when really a valid environment is
+   already there.
 
-   For development only (no broker): `datafye foundry local provision`
-   For simulated trading: `datafye trading local provision`
+   - Add a dataset:            `datafye foundry local dataset add <SIP|Crypto|Synthetic>`
+   - Remove a dataset:         `datafye foundry local dataset remove <name>`
+   - Set a full desired state: `datafye foundry local apply -x <descriptor>`
 
-   After provisioning completes, use the `datafye-api` MCP server (capability 1) to
-   interact with the newly-running deployment — not `curl` or the CLI.
+   `provision` (`datafye foundry local provision -x <descriptor>`) is ONLY for a
+   from-scratch environment — your sandbox already has one, so you almost never need
+   it. Paper trading with a broker is a separate mode handled by the
+   `datafye trading local` commands.
+
+   After the dataset is added, use the `datafye-api` MCP server (capability 1) to
+   interact with the running deployment — not `curl` or the CLI.
 
    DATASET GOTCHAS (get these wrong and you silently get zero data, or a broken
    environment):
@@ -202,12 +216,12 @@ CAPABILITIES:
      crypto fetch you can omit `dataset` entirely (the `/crypto` path implies
      Crypto). Note crypto currently provides TRADES only (quotes come back empty),
      and a crypto day is 24h.
-   - ONE DATASET PER FOUNDRY. Provision a SINGLE dataset (SIP, or Crypto, or
-     Synthetic) per foundry. Multi-dataset descriptors are unreliable to provision
-     right now — they fail partway (often at the crypto launch step) and can leave a
-     broken environment. To work with a different dataset, deprovision the current
-     foundry and provision a fresh single-dataset one. Do not try to combine datasets
-     in one descriptor.
+   - ONE DATASET AT A TIME. Keep a SINGLE dataset (SIP, or Crypto, or Synthetic)
+     deployed at once. Multi-dataset environments are unreliable right now — they
+     fail partway (often at the crypto launch step) and can leave a broken
+     environment. To switch datasets, REMOVE the current one and ADD the new one
+     (`datafye foundry local dataset remove <old>` then `dataset add <new>`) — do NOT
+     deprovision and reprovision, and do NOT combine datasets in one descriptor.
 {resource_guard}
 8. TESTING
    When the user tests their algo against historical data (Backtest) or
