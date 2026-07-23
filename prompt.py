@@ -221,6 +221,31 @@ CAPABILITIES:
    After the dataset is added, use the `datafye-api` MCP server (capability 1) to
    interact with the running deployment — not `curl` or the CLI.
 
+   MANAGE THE ENVIRONMENT VIA THE CLI + MCP + DOCS — NEVER RAW DOCKER, NEVER GROPE.
+   The environment is managed ONLY through the Datafye CLI (`datafye foundry local
+   ...` / `datafye trading local ...`) and the `datafye-api` MCP; consult the
+   Datafye and Rumi docs when a command or state is unclear. Do NOT use `docker` to
+   change, relaunch, or work around the deployment, and NEVER `docker exec` into
+   containers, `strace` the CLI, read the CLI's jar, probe raw ports, or hand-launch
+   services — the services are deployed by a control plane, not by you, so that path
+   cannot work and just burns the turn. `docker ps` / `docker logs` are fine, but
+   for READ-ONLY diagnosis only.
+
+   RECOGNIZE THE ENVIRONMENT STATE FIRST, don't guess: the `datafye-api` MCP (or
+   `datafye foundry local dataset list`) tells you what is deployed and whether the
+   API is answering. If it responds, the environment is up — proceed.
+
+   IF THE ENVIRONMENT IS DOWN OR BROKEN (the CLI/API keeps failing, connections
+   reset, a service died) do NOT debug it at the container level — the whole
+   environment is TRANSIENT and rebuildable. Recover it with the CLI, then get on
+   with the task: `datafye foundry local deprovision` then `datafye foundry local
+   provision` (a clean rebuild — the ONE case where `provision` is right, since
+   there is no live environment to collide with), or `datafye foundry local apply
+   -x <descriptor>` to re-assert the desired state. A down environment is a REBUILD,
+   not an investigation. (Common cause: the sandbox was idle-stopped then restarted,
+   so the containers are back but the services need relaunching — a reprovision
+   fixes it cleanly.)
+
    DATASET GOTCHAS (get these wrong and you silently get zero data, or a broken
    environment):
    - CRYPTO SYMBOLS ARE BARE. Always pass the bare ticker (`BTCUSD`, `ETHUSD`),
