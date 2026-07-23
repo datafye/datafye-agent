@@ -447,7 +447,27 @@ if is_snapshot "$VERSION"; then
     ok "Using local Datafye CLI: ${CLI_PATH} (v${INSTALLED_CLI_VERSION:-unknown})"
 else
     info "[${STEP}/${TOTAL_STEPS}] Installing Datafye CLI v${VERSION}..."
-    curl -fsSL "https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh" | bash
+    # Retry the fetch with a bounded backoff (DAT-123): the CLI installer can lag
+    # briefly on downloads -- e.g. a release cut where the agent AMI bake outraces
+    # the CLI publish, or a transient downloads blip -- so don't fail on the first
+    # 404. Up to ~5 minutes.
+    CLI_INSTALLER_URL="https://downloads.n5corp.com/datafye/cli/${VERSION}/install.sh"
+    CLI_INSTALLER_TMP="$(mktemp)"
+    cli_fetched=false
+    for cli_attempt in $(seq 1 20); do
+        if curl -fsSL "${CLI_INSTALLER_URL}" -o "${CLI_INSTALLER_TMP}" 2>/dev/null; then
+            cli_fetched=true; break
+        fi
+        [ "${cli_attempt}" -eq 1 ] && info "  Waiting for the CLI ${VERSION} installer to appear on downloads..."
+        sleep 15
+    done
+    if [ "${cli_fetched}" != true ]; then
+        rm -f "${CLI_INSTALLER_TMP}"
+        error "Could not fetch the Datafye CLI ${VERSION} installer from ${CLI_INSTALLER_URL} after retries."
+        exit 1
+    fi
+    bash "${CLI_INSTALLER_TMP}"
+    rm -f "${CLI_INSTALLER_TMP}"
     # The CLI installer drops files at ${CLI_BASE}/versions/datafye-cli-<v>/
     # and maintains a ${CLI_BASE}/current symlink to the active version.
     # Use the stable symlink so we don't have to track the bundle-name format.
