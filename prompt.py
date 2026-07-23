@@ -58,9 +58,20 @@ def build_system_prompt(
       fill the disk.
    HARD RULE (resizing does NOT help): a combined-ticks fetch whose ONE-DAY buffer
    exceeds ~1.3 GB OOMs the history heap (fixed 2 GB on every instance size) and
-   writes ZERO data. Fetch trades and quotes SEPARATELY (they stream), split the
-   symbols, or use OHLC instead. And NEVER fetch with an empty symbol list -- that
-   pulls the entire provider universe.
+   writes ZERO data. To shrink a fetch, in rough order: NARROW THE INTRADAY WINDOW
+   with startTime/endTime (a fetch is NOT forced to grab the whole trading day --
+   pass startTime/endTime as HH:MM[:SS[.mmm]] in the dataset's market timezone, ET
+   for SIP/Synthetic and UTC for Crypto, end exclusive; volume is front/back-loaded
+   so a narrow window cuts memory+disk roughly in proportion); fetch trades and
+   quotes SEPARATELY (noTrades/noQuotes -- they stream); split the symbols; or use
+   OHLC instead.
+   FETCHING ALL SYMBOLS IS SUPPORTED: set allSymbols:true to pull the entire
+   provider universe (an explicit opt-in because it is large -- still size it with
+   the guard above and prefer a narrow window). Do NOT tell the user "all" isn't
+   allowed. Omitting symbols is NOT a silent universe pull -- it just returns 400;
+   only allSymbols:true fetches everything. For the exact fetch contract (params,
+   ask/bid = quotes, CSV output) consult the "Fetching Historical Data" doc rather
+   than asserting limits from memory.
 {cheatsheet_line}"""
 
     memory_block = f"\n{memory_context}\n" if memory_context else ""
