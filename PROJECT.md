@@ -225,7 +225,7 @@ The Datafye platform has a Java-based Algo SDK for high-performance, integrated 
 
 ### Why Conversational Dataset Config (Not Forms)?
 
-A dropdown can't capture "I want to use daily OHLC and EMA data for US tech stocks, plus some alternative sentiment data." The agent can. It understands intent, maps it to the right datasets and schemas, and provisions the environment — all in one conversation. This is particularly important for users who don't know what datasets exist or what schemas they need.
+A dropdown can't capture "I want to use daily OHLC and EMA data for US tech stocks, plus some alternative sentiment data." The agent can. It understands intent, maps it to the right datasets and schemas, and applies them to the running foundry — all in one conversation. This is particularly important for users who don't know what datasets exist or what schemas they need.
 
 ## The Algo Development Flow
 
@@ -235,12 +235,12 @@ Here's what a typical session looks like from the agent's perspective:
 2. **Agent determines data needs**: SIP dataset, ohlc-1d and sma-1d schemas, symbols AAPL and MSFT
 3. **Agent checks credentials**: Massive API key configured? Yes → proceed. No → "Please add your Massive API key in Settings"
 4. **Agent builds descriptor**: Creates a YAML deployment descriptor
-5. **Agent provisions environment**: Runs `datafye foundry local provision -x descriptor.yaml`
+5. **Agent applies the dataset**: The sandbox boots a **pre-provisioned empty foundry** (API + MCP up, no datasets), so the agent ADDS its dataset to the running foundry (`datafye foundry local dataset add` / `apply`) rather than running `provision` — a fresh `provision` collides with the already-running platform and fails (DAT-93). Only **one dataset at a time**: switch datasets with `dataset remove`/`dataset add`, not deprovision+reprovision
 6. **Agent writes algo code**: Creates Python files in the workspace
 7. **Agent tests**: Downloads historical data, runs the algo, collects results
 8. **Agent presents results**: Returns, win rate, trade count — the agent also renders these inline in the conversation as a **scorecard table** (for both Backtest and Validate/paper results), and the frontend shows them in the scorecard panel and charts
 9. **Iteration**: User says "try a shorter lookback period" → agent modifies and re-tests
-10. **Simulated trading**: If broker is configured, agent provisions a trading environment
+10. **Simulated trading**: If broker is configured, the agent switches the running environment to a trading (paper) configuration via `apply` (cross-mode `--morph`), not a fresh provision
 
 ### Sizing the box before you fetch (the foundry resource guard)
 
