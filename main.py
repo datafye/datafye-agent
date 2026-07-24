@@ -1786,7 +1786,7 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
 # Each buffered frame is tagged with an SSE `id:` = its sequence number; the
 # client tracks the last id it saw and resumes with ?after=<seq>.
 _TURN_GRACE_S = 120     # keep a finished turn's buffer this long (late resume)
-_TURN_ORPHAN_S = 90     # cancel a running turn with no consumer for this long
+_TURN_ORPHAN_S = 300    # cancel a running turn with no consumer for this long (parked turns survive a detour)
 _turns: Dict[str, "_Turn"] = {}
 _turn_sweeper_task: Optional["asyncio.Task"] = None
 
