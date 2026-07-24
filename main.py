@@ -32,8 +32,10 @@ import json
 import os
 import logging
 import socket
+import asyncio
 import time
-from typing import Optional, AsyncIterator
+import uuid
+from typing import Optional, AsyncIterator, Dict, List
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -1772,6 +1774,124 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
     return {"bootstrapped": True, "username": user_id}
 
 
+# ── Resumable turns ────────────────────────────────────────────────
+# A chat turn runs as a BACKGROUND task that buffers its SSE frames, so a client
+# that drops mid-turn can RECONNECT (GET /v1/chat/resume) and replay from where
+# it left off instead of losing the in-flight turn. Decoupling the turn from the
+# HTTP response is what makes resume possible; the trade-offs it forces:
+#   - an explicit Stop must cancel the task (a mere disconnect no longer does):
+#     the client calls POST /v1/chat/stop.
+#   - an abandoned turn (client gone, never resumes) is cancelled by a watchdog
+#     once it has had no consumer for _TURN_ORPHAN_S, so it can't bill forever.
+# Each buffered frame is tagged with an SSE `id:` = its sequence number; the
+# client tracks the last id it saw and resumes with ?after=<seq>.
+_TURN_GRACE_S = 120     # keep a finished turn's buffer this long (late resume)
+_TURN_ORPHAN_S = 90     # cancel a running turn with no consumer for this long
+_turns: Dict[str, "_Turn"] = {}
+_turn_sweeper_task: Optional["asyncio.Task"] = None
+
+
+class _Turn:
+    def __init__(self, turn_id: str):
+        self.id = turn_id
+        self.frames: List[str] = []          # buffered SSE frames; index == seq
+        self.done = False
+        self.task: Optional[asyncio.Task] = None
+        self.cond = asyncio.Condition()
+        self.consumers = 0
+        self.idle_since = time.time()        # when consumers last dropped to 0
+        self.created = time.time()
+
+
+async def _turn_emit(turn: "_Turn", frame: str) -> None:
+    async with turn.cond:
+        seq = len(turn.frames)
+        turn.frames.append(f"id: {seq}\n{frame}")
+        turn.cond.notify_all()
+
+
+async def _run_turn(turn: "_Turn", message: str, conversation_id: Optional[str],
+                    algo_id: Optional[str], auth_token: Optional[str]) -> None:
+    """Background producer: run the agent turn, buffering every SSE frame. On an
+    explicit stop (CancelledError) or an error, close the underlying stream (so the
+    SDK subprocess is torn down promptly) and emit a terminal event so a
+    reconnecting client always sees the turn end."""
+    gen = tracked_stream_agent_response(
+        message=message, conversation_id=conversation_id,
+        algo_id=algo_id, auth_token=auth_token)
+    stopped = False
+    err: Optional[Exception] = None
+    try:
+        async for frame in gen:
+            await _turn_emit(turn, frame)
+    except asyncio.CancelledError:
+        stopped = True   # explicit stop / orphan watchdog
+    except Exception as e:
+        logger.exception("turn %s failed", turn.id)
+        err = e
+    finally:
+        # Close the generator so query()'s subprocess is killed now, not at GC.
+        try:
+            await gen.aclose()
+        except Exception:
+            pass
+        if stopped:
+            await _turn_emit(turn, sse_event("commentary", {"text": "Stopped.", "kind": "notable"}))
+            await _turn_emit(turn, sse_event("done", {"stopped": True}))
+        elif err is not None:
+            await _turn_emit(turn, sse_event("error", {"message": str(err), "error_type": type(err).__name__}))
+            await _turn_emit(turn, sse_event("done", {}))
+        async with turn.cond:
+            turn.done = True
+            turn.cond.notify_all()
+
+
+async def _drain_turn(turn: "_Turn", after: int) -> AsyncIterator[str]:
+    """Consumer: replay buffered frames after `after`, then stream live until the
+    turn is done. Several consumers can drain the same turn concurrently (the
+    original request and any resume reconnect)."""
+    async with turn.cond:
+        turn.consumers += 1
+    try:
+        i = max(0, after + 1)
+        while True:
+            async with turn.cond:
+                while i >= len(turn.frames) and not turn.done:
+                    await turn.cond.wait()
+                new = turn.frames[i:]
+                done = turn.done
+            for frame in new:
+                yield frame
+                i += 1
+            if done and i >= len(turn.frames):
+                break
+    finally:
+        async with turn.cond:
+            turn.consumers -= 1
+            if turn.consumers <= 0:
+                turn.idle_since = time.time()
+
+
+async def _turn_sweeper() -> None:
+    while True:
+        await asyncio.sleep(15)
+        now = time.time()
+        for tid, turn in list(_turns.items()):
+            if turn.done:
+                if now - turn.idle_since > _TURN_GRACE_S:
+                    _turns.pop(tid, None)
+            elif turn.consumers <= 0 and now - turn.idle_since > _TURN_ORPHAN_S:
+                logger.info("cancelling orphaned turn %s (no consumer for %ds)", tid, _TURN_ORPHAN_S)
+                if turn.task and not turn.task.done():
+                    turn.task.cancel()
+
+
+def _ensure_turn_sweeper() -> None:
+    global _turn_sweeper_task
+    if _turn_sweeper_task is None or _turn_sweeper_task.done():
+        _turn_sweeper_task = asyncio.create_task(_turn_sweeper())
+
+
 @app.post("/v1/chat", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def chat(request: ChatRequest, authorization: Optional[str] = Header(default=None)):
     """
@@ -1816,15 +1936,38 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
     # the user (self-or-admin), no new credential.
     auth_token = (authorization[len("Bearer "):].strip()
                   if authorization and authorization.startswith("Bearer ") else None)
-    return StreamingResponse(
-        tracked_stream_agent_response(
-            message=request.message,
-            conversation_id=request.conversation_id,
-            algo_id=request.algo_id,
-            auth_token=auth_token,
-        ),
-        media_type="text/event-stream"
-    )
+    # The turn runs as a background task buffering its frames; the response drains
+    # that buffer, so a dropped connection can resume via GET /v1/chat/resume.
+    turn = _Turn(uuid.uuid4().hex)
+    _turns[turn.id] = turn
+    _ensure_turn_sweeper()
+    # First frame carries the turn id so the client can resume this exact turn.
+    await _turn_emit(turn, sse_event("turn", {"turn_id": turn.id}))
+    turn.task = asyncio.create_task(
+        _run_turn(turn, request.message, request.conversation_id, request.algo_id, auth_token))
+    return StreamingResponse(_drain_turn(turn, -1), media_type="text/event-stream")
+
+
+@app.get("/v1/chat/resume", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def chat_resume(turn_id: str, after: int = -1):
+    """Reconnect to an in-flight (or just-finished) turn and replay its frames
+    after `after`, then continue live. 404 if the turn is unknown/expired — the
+    client then falls back to reloading /history."""
+    turn = _turns.get(turn_id)
+    if turn is None:
+        raise HTTPException(status_code=404, detail="turn not found or expired")
+    return StreamingResponse(_drain_turn(turn, after), media_type="text/event-stream")
+
+
+@app.post("/v1/chat/stop", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def chat_stop(turn_id: str):
+    """Explicitly stop an in-flight turn (Stop button / Esc). Cancels the
+    background task; the producer emits a Stopped + done and the drain ends."""
+    turn = _turns.get(turn_id)
+    if turn and turn.task and not turn.task.done():
+        turn.task.cancel()
+        return {"stopped": True}
+    return {"stopped": False}
 
 
 @app.get("/v1/skills", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
