@@ -705,19 +705,49 @@ def set_satisfaction(conversation_id: str, rank: int, reasons: str, source: str)
     return record
 
 
-def append_commentary(conversation_id: str, text: str, kind: Optional[str] = None) -> dict:
+def append_commentary(conversation_id: str, text: str, kind: Optional[str] = None,
+                       tool_id: Optional[str] = None, command: Optional[str] = None) -> dict:
     """Append one activity-log entry and return it (so the caller can also emit
     it live over SSE). Persists only if the strategy exists. The full activity
     trail is retained (no cap): it is the analytics record of the work, paired
     with the conversation by timestamp, and accounts persists it per project. The
-    Work panel replays it all."""
+    activity rail replays it all.
+
+    A tool-label entry carries its `tool_id` (to correlate the deferred output,
+    see attach_tool_output) and the formatted `command` -- these back the Tool
+    Detail (command + output) shown in the workspace rail and the accounts
+    Conversation view."""
     entry = {"text": text, "kind": kind, "at": _now_ms()}
+    if tool_id:
+        entry["tool_id"] = tool_id
+    if command:
+        entry["command"] = command
     record = _read(conversation_id)
     if record is not None:
         record.setdefault("commentary", []).append(entry)
         record["updated_at"] = _now_ms()
         _write(record)
     return entry
+
+
+def attach_tool_output(conversation_id: str, tool_id: str, output: str,
+                       is_error: bool = False) -> None:
+    """Attach a tool's (already size-capped) output to its commentary entry,
+    matched by tool_id, so the Tool Detail replays from /history and shows in the
+    accounts Conversation view. No-op if no matching entry (an unlabeled tool)."""
+    if not tool_id:
+        return
+    record = _read(conversation_id)
+    if record is None:
+        return
+    for entry in reversed(record.get("commentary", [])):
+        if entry.get("tool_id") == tool_id:
+            entry["output"] = output
+            if is_error:
+                entry["output_error"] = True
+            record["updated_at"] = _now_ms()
+            _write(record)
+            return
 
 
 def get_sdk_session(conversation_id: str) -> Optional[str]:

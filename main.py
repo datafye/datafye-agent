@@ -930,6 +930,33 @@ def _tool_commentary(tool: str, tool_input: dict):
     return None
 
 
+# The raw command behind a tool call, for the persisted Tool Detail (mirrors the
+# frontend's toolCommandText). Distinct from _tool_commentary: that is the
+# sanitized panel line ("Reading reference material"); this is the exact command
+# ("Read /path/x.py") revealed under the Tool Detail toggle. Persisted with its
+# (size-capped) output so the detail survives a reload and shows in accounts.
+_DETAIL_OUTPUT_CAP = 2000  # chars of tool output persisted per step
+
+def _tool_command_text(tool: str, tool_input: dict) -> str:
+    ti = tool_input or {}
+    if tool == "Bash":
+        return ti.get("command") or "(bash)"
+    if tool in ("Read", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead"):
+        return (tool + " " + (ti.get("file_path") or ti.get("notebook_path") or "")).strip()
+    if tool == "Grep":
+        return "Grep " + (ti.get("pattern") or "") + (" in " + ti["path"] if ti.get("path") else "")
+    if tool == "Glob":
+        return "Glob " + (ti.get("pattern") or "")
+    if tool in ("WebFetch", "WebSearch"):
+        return tool + " " + (ti.get("url") or ti.get("query") or "")
+    try:
+        args = json.dumps(ti)
+    except Exception:
+        args = ""
+    name = tool[len("mcp__"):] if tool.startswith("mcp__") else tool
+    return (name + (" " + args if args and args != "{}" else "")).strip()
+
+
 def _is_env_changing_tool(tool: str, tool_input: dict) -> bool:
     """True if a tool call is likely to CHANGE the deployed environment (provision,
     apply, dataset add/remove, deprovision, morph, start/stop). The streamer emits
@@ -1260,11 +1287,15 @@ async def stream_agent_response(
                         note = _tool_commentary(tool_name, tool_input)
                         if note:
                             text, level = note
-                            # Persist every level (the Work panel is the
-                            # auditable side-mirror — it replays the ground-level
-                            # detail, not just milestones; the store is capped).
+                            # Persist the label WITH its tool_id + the exact command,
+                            # so the Tool Detail (command + output) replays from
+                            # /history and shows in the accounts Conversation view.
+                            # The output is attached later (at tool_result).
                             if conversation_id:
-                                conversations.append_commentary(conversation_id, text, level)
+                                conversations.append_commentary(
+                                    conversation_id, text, level,
+                                    tool_id=getattr(block, 'id', ''),
+                                    command=_tool_command_text(tool_name, tool_input))
                             yield sse_event('commentary', {'text': text, 'kind': level})
 
                         # An environment-changing tool just STARTED: show the panel
@@ -1278,11 +1309,18 @@ async def stream_agent_response(
                     elif hasattr(block, 'tool_use_id'):
                         is_err = bool(getattr(block, 'is_error', False))
                         result_tool_id = getattr(block, 'tool_use_id', '')
+                        result_content = str(getattr(block, 'content', '') or '')
                         yield sse_event('tool_result', {
                             'tool_use_id': result_tool_id,
-                            'content': str(getattr(block, 'content', '') or ''),
+                            'content': result_content,
                             'is_error': getattr(block, 'is_error', False)
                         })
+                        # Attach the (capped) output to the tool's commentary entry
+                        # so the persisted Tool Detail carries command + output.
+                        if conversation_id and result_tool_id:
+                            conversations.attach_tool_output(
+                                conversation_id, result_tool_id,
+                                result_content[:_DETAIL_OUTPUT_CAP], is_err)
                         if is_err:
                             err_text = 'A step reported an error'
                             if conversation_id:
