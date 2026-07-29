@@ -904,7 +904,16 @@ def _tool_commentary(tool: str, tool_input: dict):
     "error" (a step failed). The same shape is used across the agents.
     """
     if tool in ("Read", "NotebookRead"):
-        return ("Reading reference material", "muted")
+        # A Read spans docs, samples, and the user's own project files — classify
+        # by where the file lives (inspect the path, never print it) so reading a
+        # project source file doesn't read as "Reading reference material".
+        path = ((tool_input or {}).get("file_path")
+                or (tool_input or {}).get("notebook_path") or "").lower()
+        if DOCS_DIR and DOCS_DIR.lower() in path:
+            return ("Consulting the Datafye documentation", "muted")
+        if SAMPLES_DIR and SAMPLES_DIR.lower() in path:
+            return ("Studying a reference sample", "muted")
+        return ("Reviewing the project files", "muted")
     if tool in ("Grep", "Glob"):
         return ("Searching for relevant details", "muted")
     if tool in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
