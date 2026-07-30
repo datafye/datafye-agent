@@ -887,18 +887,65 @@ fi  # end standalone mode
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Configuring auto-upgrade..."
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-if [ -f "${SCRIPT_DIR}/upgrade-check.sh" ]; then
-    cp "${SCRIPT_DIR}/upgrade-check.sh" "${INSTALL_DIR}/upgrade-check.sh"
-elif [ ! -f "${INSTALL_DIR}/upgrade-check.sh" ]; then
+# SCRIPT_DIR is only meaningful when this installer runs as a FILE (a manual
+# install, first-boot, or the Packer bake). On the auto-upgrade path it arrives
+# as `curl … | bash`, where BASH_SOURCE[0] is unset and `dirname` would silently
+# resolve to cron's working directory — a directory with nothing to do with the
+# installer. Leave it EMPTY there so the companion-script lookup below falls
+# through to the version-matched copies in the cloned agent tree, rather than
+# being hijacked by a stray upgrade-check.sh that happens to sit in the cwd.
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+else
+    SCRIPT_DIR=""
+fi
+
+# Refresh the installer's companion scripts in the install dir on EVERY install,
+# including auto-upgrades. Two things this has to get right:
+#
+# 1. ALWAYS REPLACE. The old shape only copied from SCRIPT_DIR, and fell back to
+#    a download that was skipped whenever the file already existed. On the
+#    auto-upgrade path SCRIPT_DIR is empty (see above) and the file always
+#    exists, so upgrade-check.sh was NEVER refreshed — a box stayed pinned to
+#    whatever version was baked into its AMI, and a fix to upgrade-check.sh
+#    could only ship via a re-bake. The cloned agent tree carries the
+#    version-matched copy, so use it as the fallback source instead.
+#
+# 2. ATOMIC REPLACE (write-temp + mv), never a plain `cp` onto the destination.
+#    On the auto-upgrade path this installer is invoked BY the very
+#    upgrade-check.sh it is about to replace, and that script is still
+#    executing. bash reads a script lazily, by byte offset: a `cp` truncates and
+#    rewrites the SAME inode, so the running shell's fd suddenly points at
+#    different bytes, and the next line it reads is whatever happens to sit at
+#    its saved offset in the new file. That is a mid-line fragment, so bash dies
+#    with a bogus "syntax error near unexpected token" AFTER the upgrade already
+#    succeeded. `mv` swaps the directory entry instead: the running shell keeps
+#    the original (now unlinked) inode and reads its own remaining lines intact.
+for f in upgrade-check.sh install.sh; do
+    src_candidates=()
+    [ -n "${SCRIPT_DIR}" ] && src_candidates+=("${SCRIPT_DIR}/${f}")
+    src_candidates+=("${AGENT_CODE_DIR}/install/${f}")
+    # install_template.sh gets stored as install.sh in the install dir for
+    # upgrades — source it under either name.
+    if [ "$f" = "install.sh" ]; then
+        [ -n "${SCRIPT_DIR}" ] && src_candidates+=("${SCRIPT_DIR}/install_template.sh")
+        src_candidates+=("${AGENT_CODE_DIR}/install/install_template.sh")
+    fi
+    for src in "${src_candidates[@]}"; do
+        if [ -f "$src" ]; then
+            cp "$src" "${INSTALL_DIR}/.${f}.new"
+            chmod +x "${INSTALL_DIR}/.${f}.new"
+            mv -f "${INSTALL_DIR}/.${f}.new" "${INSTALL_DIR}/${f}"
+            break
+        fi
+    done
+done
+
+# Last resort: a first install where the agent tree somehow has no install/ dir.
+if [ ! -f "${INSTALL_DIR}/upgrade-check.sh" ]; then
     curl -fsSL "https://downloads.n5corp.com/datafye/agent/${VERSION}/upgrade-check.sh" \
         -o "${INSTALL_DIR}/upgrade-check.sh" 2>/dev/null || true
-fi
-chmod +x "${INSTALL_DIR}/upgrade-check.sh" 2>/dev/null || true
-
-if [ -f "${SCRIPT_DIR}/install_template.sh" ]; then
-    cp "${SCRIPT_DIR}/install_template.sh" "${INSTALL_DIR}/install.sh"
-    chmod +x "${INSTALL_DIR}/install.sh"
+    chmod +x "${INSTALL_DIR}/upgrade-check.sh" 2>/dev/null || true
 fi
 
 cat > /etc/cron.d/datafye-agent-upgrade << CRON

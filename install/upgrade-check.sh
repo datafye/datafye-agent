@@ -141,5 +141,17 @@ echo "${LOG_PREFIX} Fetching installer v${LATEST_VERSION} from downloads.n5corp.
 # pinning semantics. Config (mode, credentials, DNS, port) is preserved
 # automatically by the installer via agent.env. DATAFYE_AUTO_UPGRADE=1 arms the
 # installer's own last-moment mid-turn re-check.
-curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | DATAFYE_AUTO_UPGRADE=1 bash
-echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
+#
+# The tail is a BRACE GROUP so bash parses the upgrade, the log line, and the
+# exit as ONE compound command before running any of it — and then never reads
+# from this file again. The installer we are invoking REPLACES this very script;
+# bash reads a script lazily by byte offset, so a replacement on the same inode
+# would leave the shell resuming mid-line in the new file and dying with a bogus
+# "syntax error near unexpected token" after a perfectly successful upgrade.
+# (The installer also swaps the file atomically via mv, which keeps our original
+# inode alive. This is the belt to that pair of braces.)
+{
+    curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | DATAFYE_AUTO_UPGRADE=1 bash
+    echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
+    exit 0
+}
