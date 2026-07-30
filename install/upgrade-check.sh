@@ -18,11 +18,19 @@
 # Datafye Agent - Auto-Upgrade Check
 #
 # Checks downloads.n5corp.com for the latest agent version and upgrades
-# if the installed version is behind. Designed to run via cron or systemd timer.
+# if the installed version is behind. Designed to run via cron every 1 minute
+# UNDER flock (so a tick can't fire while an upgrade is in progress).
 #
-# Setup (cron, every 5 minutes):
-#   echo "*/5 * * * * root /opt/datafye/agent/upgrade-check.sh >> /var/log/datafye-agent-upgrade.log 2>&1" \
-#     > /etc/cron.d/datafye-agent-upgrade
+# NEVER upgrades mid-turn. Before it downloads/runs the installer it gates on the
+# agent's own /health: it proceeds only when the agent is idle (running_jobs==0),
+# no live preview is exposed (active_proxied_apps empty), and the user has been
+# away for at least DATAFYE_UPGRADE_INACTIVITY_WINDOW seconds (last_chat_activity_at,
+# bumped by chat turns AND the SPA's visible-tab presence ping). Otherwise it
+# defers and retries on the next tick.
+#
+# Setup (installed by install_template.sh):
+#   * * * * * root /usr/bin/flock -n /run/lock/datafye-agent-upgrade.lock \
+#     /opt/datafye/agent/upgrade-check.sh >> /var/log/datafye-agent-upgrade.log 2>&1
 #
 # The version file is published by the agent build pipeline to:
 #   https://downloads.n5corp.com/datafye/agent/latest/version.txt
@@ -70,11 +78,68 @@ if [ "${CURRENT_VERSION}" = "${LATEST_VERSION}" ]; then
 fi
 
 echo "${LOG_PREFIX} $(date -u +%Y-%m-%dT%H:%M:%SZ) Upgrade available: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
+
+# ── Never-mid-turn gate ───────────────────────────────────────────
+# Proceed only when the agent is genuinely idle: no turn running, no live
+# preview exposed, and the user has been away (no chat/presence) for at least
+# the inactivity window. A turn's running_jobs stays >0 for the whole
+# background turn even if the SPA disconnected, so this can't race a parked
+# turn. If /health is unreachable there is no turn to protect (and an upgrade
+# may fix a down agent), so we proceed.
+AGENT_PORT=18780
+if [ -f "${ENV_FILE}" ]; then
+    _p=$(grep -oP '^DATAFYE_AGENT_PORT=\K.*' "${ENV_FILE}" 2>/dev/null || true)
+    [ -n "${_p}" ] && AGENT_PORT="${_p}"
+fi
+WINDOW_SECONDS="${DATAFYE_UPGRADE_INACTIVITY_WINDOW:-120}"
+
+health_json=$(curl -fsS --connect-timeout 3 --max-time 5 "http://127.0.0.1:${AGENT_PORT}/health" 2>/dev/null || true)
+if [ -n "${health_json}" ]; then
+    verdict=$(printf '%s' "${health_json}" | python3 -c '
+import sys, json, time
+try:
+    h = json.load(sys.stdin)
+except Exception:
+    print("PROCEED unparseable-health"); sys.exit(0)
+window_ms = int(sys.argv[1]) * 1000
+now_ms = int(time.time() * 1000)
+rj = h.get("running_jobs", 0) or 0
+apps = h.get("active_proxied_apps") or []
+last = h.get("last_chat_activity_at") or 0
+if rj > 0:
+    print("DEFER running_jobs=%d" % rj); sys.exit(0)
+if apps:
+    print("DEFER live_preview=%d" % len(apps)); sys.exit(0)
+idle_ms = (now_ms - last) if last else window_ms   # never active => treat as idle
+if idle_ms < window_ms:
+    print("DEFER active_recently idle_ms=%d" % idle_ms); sys.exit(0)
+print("PROCEED idle_ms=%d" % idle_ms)
+' "${WINDOW_SECONDS}" 2>/dev/null || echo "DEFER health-parse-failed")
+    case "${verdict}" in
+        PROCEED*) echo "${LOG_PREFIX} gate passed (${verdict})" ;;
+        *)        echo "${LOG_PREFIX} upgrade deferred (${verdict}); will retry next tick"; exit 0 ;;
+    esac
+else
+    echo "${LOG_PREFIX} agent /health unreachable; proceeding with upgrade"
+fi
+
+# ── Jitter ────────────────────────────────────────────────────────
+# downloads.n5corp.com is a single origin (no CDN today); spread the download
+# herd when many agents upgrade in the same idle window. Held under flock, so a
+# 1-min tick can't overlap this. Set DATAFYE_UPGRADE_JITTER_SECONDS=0 to disable.
+JITTER_MAX="${DATAFYE_UPGRADE_JITTER_SECONDS:-60}"
+if [ "${JITTER_MAX}" -gt 0 ] 2>/dev/null; then
+    j=$(( RANDOM % (JITTER_MAX + 1) ))
+    echo "${LOG_PREFIX} jittering ${j}s before download"
+    sleep "${j}"
+fi
+
 echo "${LOG_PREFIX} Fetching installer v${LATEST_VERSION} from downloads.n5corp.com..."
 
 # Always fetch the latest installer (which has the target version baked in);
 # do not reuse the local installer with --version, since that would change
 # pinning semantics. Config (mode, credentials, DNS, port) is preserved
-# automatically by the installer via agent.env.
-curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | bash
+# automatically by the installer via agent.env. DATAFYE_AUTO_UPGRADE=1 arms the
+# installer's own last-moment mid-turn re-check.
+curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | DATAFYE_AUTO_UPGRADE=1 bash
 echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"

@@ -183,6 +183,28 @@ else
     AGENT_CLONE_URL="${AGENT_REPO}"
 fi
 
+# ── Auto-upgrade mid-turn guard (last-moment re-check) ────────────
+# When invoked by the idle-gated upgrade-check (which exports DATAFYE_AUTO_UPGRADE=1),
+# re-check the running agent's /health right before we touch anything and abort if
+# a turn started in the gate-to-now window. A restart drops the in-flight
+# resumable-turn buffer, so we NEVER restart the agent mid-turn — better to defer
+# and let the next cron tick retry. Not armed for fresh/manual installs (the var
+# is only set on the auto-upgrade path), so operators are never blocked.
+if [ "${DATAFYE_AUTO_UPGRADE:-}" = "1" ] && [ -f "${INSTALL_DIR}/version" ]; then
+    _guard_port=$(grep -oP '^DATAFYE_AGENT_PORT=\K.*' "${INSTALL_DIR}/agent.env" 2>/dev/null || true)
+    _guard_port="${_guard_port:-18780}"
+    _guard_health=$(curl -fsS --connect-timeout 3 --max-time 5 "http://127.0.0.1:${_guard_port}/health" 2>/dev/null || true)
+    if [ -n "${_guard_health}" ]; then
+        _guard_rj=$(printf '%s' "${_guard_health}" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("running_jobs",0) or 0)
+except Exception: print(0)' 2>/dev/null || echo 0)
+        if [ "${_guard_rj}" -gt 0 ] 2>/dev/null; then
+            info "Auto-upgrade aborted: agent is mid-turn (running_jobs=${_guard_rj}); next cron tick will retry."
+            exit 0
+        fi
+    fi
+fi
+
 # ── Detect existing installation ──────────────────────────────────
 CURRENT_VERSION=""
 IS_UPGRADE=false
@@ -880,10 +902,14 @@ if [ -f "${SCRIPT_DIR}/install_template.sh" ]; then
 fi
 
 cat > /etc/cron.d/datafye-agent-upgrade << CRON
-# Datafye Agent auto-upgrade check (every 5 minutes)
-*/5 * * * * root ${INSTALL_DIR}/upgrade-check.sh >> /var/log/datafye-agent-upgrade.log 2>&1
+# Datafye Agent auto-upgrade check (every minute, under flock).
+# The check itself is cheap and idle-gated (it defers unless the agent is idle
+# and the user is away); flock -n makes a tick a no-op while a prior check OR an
+# in-flight install still holds the lock, so upgrades never overlap or re-fire
+# mid-install.
+* * * * * root /usr/bin/flock -n /run/lock/datafye-agent-upgrade.lock ${INSTALL_DIR}/upgrade-check.sh >> /var/log/datafye-agent-upgrade.log 2>&1
 CRON
-ok "Auto-upgrade: every 5 minutes"
+ok "Auto-upgrade: idle-gated check every minute (flock-guarded)"
 
 # ── AMI cleanup (if requested) ────────────────────────────────────
 if [ "$AMI_CLEANUP" = true ]; then
