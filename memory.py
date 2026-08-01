@@ -20,23 +20,35 @@ of a turn and writes during a turn, so it doesn't relearn the same things every
 session. There is no special memory tool — the agent uses Read/Write, guided by
 a protocol in the system prompt (the same shape Claude Code's own memory uses).
 
-Two scopes:
+Three SCOPES. All of it is the agent's memory, so the distinguishing word is
+how far the knowledge reaches:
 
-  - GLOBAL  (<state>/memory/ + <state>/CLAUDE.md): cross-strategy facts — the
-    user's preferences, reusable patterns, lessons that apply to more than one
-    strategy. Owned by this module.
+  - FLEET   (<app>/fleet_memory/): lessons distilled from across the whole
+    fleet and shipped WITH THE AGENT BUILD. Read-only — curated out of band,
+    never written by an agent. Because it lives in the app directory (which the
+    installer replaces wholesale on every install and upgrade) the bank arrives
+    as a unit, self-prunes deleted files, and cannot collide with anything the
+    agent writes.
 
-  - PER-STRATEGY (<strategy>/memory/ + <strategy>/CLAUDE.md): facts specific to
+  - USER    (<state>/memory/ + <state>/CLAUDE.md): facts about THIS user's
+    workspace that hold across their strategies — preferences, reusable
+    patterns, lessons from one strategy that apply to the next. Owned by this
+    module. (Called GLOBAL until fleet memory made that word ambiguous.)
+
+  - STRATEGY (<strategy>/memory/ + <strategy>/CLAUDE.md): facts specific to
     one strategy. The strategy folder and its CLAUDE.md/memory are scaffolded by
     conversations.py; the SDK auto-loads the strategy's CLAUDE.md as project
     memory (setting_sources=["project"]), so this module injects only the things
-    the SDK does NOT auto-load: the global notes, the global index, and the
-    per-strategy memory INDEX (memory/MEMORY.md is not auto-loaded; CLAUDE.md is).
+    the SDK does NOT auto-load: the user notes, the user index, the fleet index,
+    and the per-strategy memory INDEX (memory/MEMORY.md is not auto-loaded;
+    CLAUDE.md is).
 
 build_memory_context() renders the always-on block for the system prompt: the
 protocol plus the current index/notes content. Bodies of individual memory
 files are read on demand by the agent, not injected — only the one-line indexes
-are always-on, to keep the per-turn context small.
+are always-on, to keep the per-turn context small. That is also why the fleet
+bank must stay a small number of TOPIC files rewritten as they accumulate
+rather than one file per lesson: its index is paid for on every single turn.
 """
 
 from __future__ import annotations
@@ -49,34 +61,48 @@ import paths
 
 logger = logging.getLogger(__name__)
 
-GLOBAL_DIR = Path(paths.state_path("memory"))
-GLOBAL_INDEX = GLOBAL_DIR / "MEMORY.md"
-GLOBAL_CLAUDE_MD = Path(paths.state_path("CLAUDE.md"))
+_APP_DIR = Path(__file__).resolve().parent
 
-_GLOBAL_INDEX_TEMPLATE = """# Global Memory
+# FLEET — read-only, ships with the app clone (mirrors skills.py's system tier).
+FLEET_DIR = Path(
+    os.environ.get(
+        "DATAFYE_AGENT_FLEET_MEMORY_DIR",
+        str(_APP_DIR / "fleet_memory"),
+    )
+)
+FLEET_INDEX = FLEET_DIR / "MEMORY.md"
 
-Cross-strategy memory: user preferences, reusable patterns, and lessons that
-apply to more than one strategy. One line per memory file. (Empty for now.)
-"""
+# USER — this user's workspace, across their strategies. Agent-writable.
+USER_DIR = Path(paths.state_path("memory"))
+USER_INDEX = USER_DIR / "MEMORY.md"
+USER_CLAUDE_MD = Path(paths.state_path("CLAUDE.md"))
 
-_GLOBAL_CLAUDE_TEMPLATE = """# Global Working Notes
+_USER_INDEX_TEMPLATE = """# User Memory
 
-Durable, cross-strategy notes for this user's Datafye workspace. Keep it concise.
+Memory for this user's workspace: preferences, reusable patterns, and lessons
+that apply to more than one of their strategies. One line per memory file.
 (Empty for now.)
 """
 
+_USER_CLAUDE_TEMPLATE = """# Working Notes
 
-def ensure_global_memory() -> None:
-    """Scaffold the global memory dir, its index, and the global CLAUDE.md if
-    absent. Best-effort; idempotent."""
+Durable notes for this user's Datafye workspace, across strategies. Keep it
+concise. (Empty for now.)
+"""
+
+
+def ensure_user_memory() -> None:
+    """Scaffold the user memory dir, its index, and the user CLAUDE.md if
+    absent. Best-effort; idempotent. (Fleet memory needs no scaffolding — it
+    ships with the build, and its absence is a valid state.)"""
     try:
-        GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
-        if not GLOBAL_INDEX.exists():
-            GLOBAL_INDEX.write_text(_GLOBAL_INDEX_TEMPLATE)
-        if not GLOBAL_CLAUDE_MD.exists():
-            GLOBAL_CLAUDE_MD.write_text(_GLOBAL_CLAUDE_TEMPLATE)
+        USER_DIR.mkdir(parents=True, exist_ok=True)
+        if not USER_INDEX.exists():
+            USER_INDEX.write_text(_USER_INDEX_TEMPLATE)
+        if not USER_CLAUDE_MD.exists():
+            USER_CLAUDE_MD.write_text(_USER_CLAUDE_TEMPLATE)
     except OSError as e:
-        logger.warning("Could not scaffold global memory at %s: %s", GLOBAL_DIR, e)
+        logger.warning("Could not scaffold user memory at %s: %s", USER_DIR, e)
 
 
 def _read(path: os.PathLike | str) -> str:
@@ -90,30 +116,59 @@ def build_memory_context(strategy_cwd: str | None) -> str:
     """Render the always-on MEMORY block for the system prompt.
 
     `strategy_cwd` is the current strategy folder (the chat turn's cwd), or None
-    for conversation-less/fallback requests (then only global memory is shown)."""
-    global_notes = _read(GLOBAL_CLAUDE_MD) or "(none yet)"
-    global_index = _read(GLOBAL_INDEX) or "(empty)"
+    for conversation-less/fallback requests (then only fleet + user memory)."""
+    user_notes = _read(USER_CLAUDE_MD) or "(none yet)"
+    user_index = _read(USER_INDEX) or "(empty)"
+    fleet_index = _read(FLEET_INDEX)
 
     strat_mem_dir = os.path.join(strategy_cwd, "memory") if strategy_cwd else None
     strat_index = _read(os.path.join(strat_mem_dir, "MEMORY.md")) if strat_mem_dir else ""
 
+    # Fleet memory is optional: a self-hosted or pre-seed instance has no bank,
+    # and an empty stub in the prompt would only invite the model to wonder
+    # about it. Omit the scope entirely rather than announce that it is empty.
+    # An index carrying only its header counts as EMPTY — the bank ships as a
+    # scaffold before it is seeded, so presence of the file proves nothing.
+    has_fleet = any(
+        line.lstrip().startswith("- ") for line in fleet_index.splitlines()
+    )
+
+    fleet_scope_line = (
+        f"- FLEET memory ({FLEET_DIR}): lessons distilled from across the whole\n"
+        f"  Datafye fleet, shipped with this agent build. READ-ONLY — treat it as\n"
+        f"  established practice, and never write to it (see below).\n"
+        if has_fleet else ""
+    )
+    fleet_section = (
+        f"\n\nFLEET MEMORY INDEX (read-only):\n{fleet_index}"
+        if has_fleet else ""
+    )
+    fleet_write_rule = (
+        "\n- NEVER write to or edit FLEET memory. It is curated centrally and replaced\n"
+        "  wholesale on each agent upgrade, so an edit there would be lost anyway. When\n"
+        "  a fleet lesson needs correcting, record what you found in USER memory."
+        if has_fleet else ""
+    )
+
     per_strategy_line = (
-        f"- PER-STRATEGY memory ({strat_mem_dir}) plus this strategy's CLAUDE.md: "
+        f"- STRATEGY memory ({strat_mem_dir}) plus this strategy's CLAUDE.md: "
         f"facts specific to the strategy you are working on now."
         if strat_mem_dir else
-        "- PER-STRATEGY memory is unavailable for this request (no strategy folder)."
+        "- STRATEGY memory is unavailable for this request (no strategy folder)."
     )
 
     strat_section = (
-        f"\nTHIS STRATEGY'S MEMORY INDEX:\n{strat_index or '(empty)'}"
+        f"\n\nTHIS STRATEGY'S MEMORY INDEX:\n{strat_index or '(empty)'}"
         if strat_mem_dir else ""
     )
 
     return f"""MEMORY:
 You keep durable memory across sessions as plain markdown files, so you do not
-relearn the same things each time. Two scopes:
-- GLOBAL memory ({GLOBAL_DIR}): cross-strategy facts — the user's preferences,
-  reusable patterns, lessons that apply to more than one strategy.
+relearn the same things each time. It is organised by SCOPE — how far the
+knowledge reaches:
+{fleet_scope_line}- USER memory ({USER_DIR}): facts about this user's workspace that hold across
+  their strategies — their preferences, reusable patterns, lessons from one
+  strategy that apply to the next.
 {per_strategy_line}
 
 How to use it:
@@ -121,14 +176,14 @@ How to use it:
   relevant, Read that file for the detail — do not guess from the one-liner.
 - When you learn something durable and useful for a FUTURE session, write a short
   markdown file in the right memory dir and add a one-line pointer to that dir's
-  MEMORY.md. Choose GLOBAL vs PER-STRATEGY by whether it is reusable across
+  MEMORY.md. Choose USER vs STRATEGY by whether it is reusable across
   strategies. Keep this strategy's CLAUDE.md (working memory) and PROJECT.md
   current too.
 - Do NOT record transient, conversation-only details, secrets/API keys, or
-  anything already obvious from the code and files.
+  anything already obvious from the code and files.{fleet_write_rule}
 
-GLOBAL WORKING NOTES:
-{global_notes}
+WORKING NOTES (this user, across strategies):
+{user_notes}
 
-GLOBAL MEMORY INDEX:
-{global_index}{strat_section}"""
+USER MEMORY INDEX:
+{user_index}{fleet_section}{strat_section}"""

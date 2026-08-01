@@ -20,10 +20,10 @@ against a REAL agent process making REAL model calls, and asserts the major
 surfaces work together end to end:
 
   health -> bootstrap (accounts-signed JWT) -> health
-    -> chat: write GLOBAL + PER-STRATEGY memory
+    -> chat: write USER + STRATEGY memory
     -> chat: author a USER-GLOBAL skill (author-skill -> Skill tool)
     -> GET /v1/skills lists system + the new user skill
-    -> chat in a NEW strategy: recall the GLOBAL memory, WITHOUT leaking the
+    -> chat in a NEW strategy: recall the USER memory, WITHOUT leaking the
        first strategy's private fact
     -> strategy folders are scaffolded (CLAUDE.md / PROJECT.md / memory / skills)
 
@@ -241,7 +241,7 @@ def main():
 
         # --- memory: write global + per-strategy ------------------------
         _, mtools = chat_turn(self_jwt, STRAT_A,
-            "Remember for the future: (1) GLOBAL preference for all my strategies — "
+            "Remember for the future: (1) a preference for all my strategies — "
             "default to a 2 percent stop-loss; (2) for THIS strategy only — trade only "
             "AAPL and MSFT. Save both to memory in the right scope now.")
         sdir = os.path.join(WORKDIR, "state")
@@ -251,7 +251,7 @@ def main():
         def wrote_nonindex(d):
             return os.path.isdir(d) and any(f != "MEMORY.md" for f in os.listdir(d))
         check("memory: Write tool used", any((t or "").lower() == "write" for t in mtools))
-        check("memory: GLOBAL memory file written", wrote_nonindex(gmem))
+        check("memory: USER memory file written", wrote_nonindex(gmem))
         check("memory: PER-STRATEGY memory file written", wrote_nonindex(smem))
 
         # --- skills: author a user-global skill -------------------------
@@ -270,7 +270,7 @@ def main():
         rans, _ = chat_turn(self_jwt, STRAT_B,
             "What is my default stop-loss preference? One short sentence. No tools.")
         low = rans.lower()
-        check("recall: GLOBAL memory recalled in new strategy", "2" in rans and "stop" in low)
+        check("recall: USER memory recalled in new strategy", "2" in rans and "stop" in low)
         check("recall: per-strategy fact did NOT leak",
               "aapl" not in low and "msft" not in low)
 

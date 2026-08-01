@@ -30,6 +30,7 @@ including custom events for environment status, scorecard, and chart data.
 
 import json
 import os
+import re
 import logging
 import socket
 import asyncio
@@ -893,6 +894,85 @@ def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[st
     return create_sdk_mcp_server("feedback", "1.0.0", tools=[submit_feedback, submit_satisfaction])
 
 
+# --- Bash command classification (feeds _tool_commentary) ---
+#
+# Matched on command TOKENS, never on substrings of the whole command line. A
+# substring net is wrong in ways that showed up in real traffic: "latest" and
+# "src/test/" contain "test" but run no test, and a bare "test"/"validate"
+# keyword fires on any path or URL that happens to contain the word.
+_TEST_PROGRAMS = ("pytest", "ctest")
+# Trading-run words. Matched against command-line TOKENS split on the usual
+# filename separators, so `python run_backtest.py` counts but `.../latest/` does
+# not (nothing here is a substring of "latest").
+_RUN_TOKENS = ("backtest", "paper", "replay")
+# Datafye CLI subcommands that stand up or reshape the trading environment.
+_ENV_TOKENS = ("foundry", "dataset", "provision", "deprovision", "apply", "morph", "deploy")
+_TOKEN_SPLIT = re.compile(r"[/_\-.]+")
+
+
+def _bash_activity(cmd: str):
+    """Classify a Bash command as (text, level) for the activity rail.
+
+    Splits on shell separators so `cd x && pytest` is judged on the pytest
+    segment, then keys on the program and its arguments rather than scanning
+    the whole line for keywords.
+    """
+    raw = (cmd or "").lower()
+    cli_name = os.path.basename(CLI_PATH or "datafye").lower()
+    saw_env = False
+
+    for segment in re.split(r"&&|\|\||[;|]", raw):
+        tokens = segment.split()
+        # step over leading env assignments, e.g. `FOO=bar pytest`
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens.pop(0)
+        if not tokens:
+            continue
+        program = tokens[0].rsplit("/", 1)[-1]
+        args = [t for t in tokens[1:] if not t.startswith("-")]
+        # every word in the command, split on filename separators
+        pieces = {p for t in tokens[1:] for p in _TOKEN_SPLIT.split(t) if p}
+
+        if program in _TEST_PROGRAMS or (program.startswith("python") and "pytest" in pieces):
+            return ("Running the tests", "check")
+        if pieces & set(_RUN_TOKENS):
+            return ("Running the backtest", "check")
+        if program == cli_name or program == "datafye":
+            if pieces & set(_ENV_TOKENS) or (args and args[0] in _ENV_TOKENS):
+                saw_env = True
+                continue
+            return ("Running a Datafye command", "muted")
+
+    if saw_env:
+        return ("Setting up the trading environment", "notable")
+    return ("Running a workspace command", "muted")
+
+
+def _is_memory_path(path: str) -> bool:
+    """True if this path is one of the agent's memory files, in ANY scope.
+
+    Fleet, user and per-strategy memory all read as simply "memory" in the rail:
+    the SCOPE is recoverable from Tool Detail, which carries the exact path, so
+    the sanitized line does not need to distinguish them.
+
+    Deliberately does NOT treat a bare CLAUDE.md as memory. The user-scope one is
+    matched by its exact path below, and a strategy's CLAUDE.md is auto-loaded by
+    the SDK rather than Read, so a loose basename match would mostly catch a
+    user's own project CLAUDE.md and mislabel it.
+    """
+    if not path:
+        return False
+    p = path.replace("\\", "/").lower()
+    for scope_dir in (str(memory.FLEET_DIR), str(memory.USER_DIR)):
+        if scope_dir and scope_dir.replace("\\", "/").lower() in p:
+            return True
+    if p == str(memory.USER_CLAUDE_MD).replace("\\", "/").lower():
+        return True
+    # Per-strategy memory lives at <strategy>/memory/...; every scope's index is
+    # MEMORY.md, which the agent may read by name.
+    return "/memory/" in p or os.path.basename(p) == "memory.md"
+
+
 def _tool_commentary(tool: str, tool_input: dict):
     """A sanitized, high-level activity line for a tool call as
     (text, level), or None to skip it.
@@ -909,6 +989,11 @@ def _tool_commentary(tool: str, tool_input: dict):
         # project source file doesn't read as "Reading reference material".
         path = ((tool_input or {}).get("file_path")
                 or (tool_input or {}).get("notebook_path") or "").lower()
+        # Memory first: it is the most specific location, and a memory read
+        # silently labelled "Reviewing the project files" makes it impossible to
+        # see from the rail that the agent consulted what it had learned.
+        if _is_memory_path(path):
+            return ("Recalling from memory", "muted")
         if DOCS_DIR and DOCS_DIR.lower() in path:
             return ("Consulting the Datafye documentation", "muted")
         if SAMPLES_DIR and SAMPLES_DIR.lower() in path:
@@ -917,12 +1002,13 @@ def _tool_commentary(tool: str, tool_input: dict):
     if tool in ("Grep", "Glob"):
         return ("Searching for relevant details", "muted")
     if tool in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
+        # Same split on the write side: recording a lesson is not editing the
+        # user's strategy, and saying so is what makes memory writes visible.
+        if _is_memory_path((tool_input or {}).get("file_path") or ""):
+            return ("Saving to memory", "muted")
         return ("Updating a file in the workspace", "muted")
     if tool == "Bash":
-        cmd = ((tool_input or {}).get("command") or "").lower()
-        if any(k in cmd for k in ("backtest", "paper", "validate", "test", "pytest")):
-            return ("Running the backtest", "check")
-        return ("Running a workspace command", "muted")
+        return _bash_activity((tool_input or {}).get("command") or "")
     if tool in ("WebFetch", "WebSearch"):
         return ("Looking something up online", "muted")
     if tool == "Task":
@@ -1627,8 +1713,14 @@ async def lifespan(app: FastAPI):
 
     # Memory: scaffold the global (cross-strategy) memory store. Per-strategy
     # memory is scaffolded per strategy folder by conversations.ensure().
-    memory.ensure_global_memory()
-    logger.info(f"  Global memory: {memory.GLOBAL_DIR}")
+    memory.ensure_user_memory()
+    logger.info(f"  User memory: {memory.USER_DIR}")
+    # Fleet memory ships with the build (read-only). Absent is a valid state —
+    # a self-hosted or pre-seed instance simply runs without the scope.
+    if memory.FLEET_INDEX.exists():
+        logger.info(f"  Fleet memory: {memory.FLEET_DIR}")
+    else:
+        logger.info("  Fleet memory: none shipped with this build")
 
     if check_api_mcp_reachable(DATAFYE_API_MCP_URL):
         logger.info(f"  Datafye API MCP: reachable at {DATAFYE_API_MCP_URL}")
