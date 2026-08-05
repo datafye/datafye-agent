@@ -352,8 +352,27 @@ def usage_public(record: dict) -> dict:
     return {
         "totals": dict(usage.get("totals") or {}),
         "by_stage_model": dict(usage.get("by_stage_model") or {}),
+        "context_tokens": int(usage.get("context_tokens") or 0),
         "updated_at": usage.get("updated_at", 0),
     }
+
+
+def set_context_tokens(conversation_id: str, tokens: int) -> None:
+    """Record the strategy's context size as of the turn that just ended.
+
+    Deliberately NOT one of the additive usage fields: those are deltas summed
+    across turns, and context size is a LATEST VALUE, not a sum. It is the whole
+    prompt at the final step (uncached input + cache writes + cache read), so it
+    already accounts for everything carried in from previous turns -- summing it
+    would count the same context once per turn.
+    """
+    record = _read(conversation_id)
+    if record is None:
+        return
+    usage = record.setdefault("usage", _empty_usage())
+    usage["context_tokens"] = int(tokens or 0)
+    record["updated_at"] = _now_ms()
+    _write(record)
 
 
 def add_usage(conversation_id: str, stage: str, model: str, delta: dict,
@@ -706,7 +725,10 @@ def set_satisfaction(conversation_id: str, rank: int, reasons: str, source: str)
 
 
 def append_commentary(conversation_id: str, text: str, kind: Optional[str] = None,
-                       tool_id: Optional[str] = None, command: Optional[str] = None) -> dict:
+                       tool_id: Optional[str] = None, command: Optional[str] = None,
+                       step: Optional[int] = None,
+                       usage: Optional[dict] = None,
+                       call_tokens: Optional[int] = None) -> dict:
     """Append one activity-log entry and return it (so the caller can also emit
     it live over SSE). Persists only if the strategy exists. The full activity
     trail is retained (no cap): it is the analytics record of the work, paired
@@ -716,12 +738,28 @@ def append_commentary(conversation_id: str, text: str, kind: Optional[str] = Non
     A tool-label entry carries its `tool_id` (to correlate the deferred output,
     see attach_tool_output) and the formatted `command` -- these back the Tool
     Detail (command + output) shown in the workspace rail and the accounts
-    Conversation view."""
+    Conversation view.
+
+    `step` is the model round that produced this entry. Every entry from one
+    round shares it, so a step's lines can be grouped without inferring the
+    boundary from how the rail happens to render (one round can emit several
+    narration lines). It is an identity, not a dense index -- gaps are fine.
+    `usage` rides on the `step`-kind badge entry only."""
     entry = {"text": text, "kind": kind, "at": _now_ms()}
     if tool_id:
         entry["tool_id"] = tool_id
     if command:
         entry["command"] = command
+    if step is not None:
+        entry["step"] = step
+    if usage:
+        entry["usage"] = usage
+    # What the tool CALL put into the prompt, as distinct from what its result
+    # brought back. For Write/Edit the call carries the whole file and the
+    # result is an acknowledgement, so weighing only the result reported a
+    # near-zero figure for the most expensive thing in the step.
+    if call_tokens:
+        entry["call_tokens"] = call_tokens
     record = _read(conversation_id)
     if record is not None:
         record.setdefault("commentary", []).append(entry)
@@ -731,10 +769,16 @@ def append_commentary(conversation_id: str, text: str, kind: Optional[str] = Non
 
 
 def attach_tool_output(conversation_id: str, tool_id: str, output: str,
-                       is_error: bool = False) -> None:
+                       is_error: bool = False,
+                       result_tokens: Optional[int] = None) -> None:
     """Attach a tool's (already size-capped) output to its commentary entry,
     matched by tool_id, so the Tool Detail replays from /history and shows in the
-    accounts Conversation view. No-op if no matching entry (an unlabeled tool)."""
+    accounts Conversation view. No-op if no matching entry (an unlabeled tool).
+
+    `result_tokens` is the weight of the FULL result, measured by the caller
+    before the display cap. It is what the result adds to the prompt, and it is
+    then re-read on every remaining round of the turn -- so it, not the capped
+    display text, is what explains the turn's cost."""
     if not tool_id:
         return
     record = _read(conversation_id)
@@ -745,6 +789,8 @@ def attach_tool_output(conversation_id: str, tool_id: str, output: str,
             entry["output"] = output
             if is_error:
                 entry["output_error"] = True
+            if result_tokens is not None:
+                entry["result_tokens"] = result_tokens
             record["updated_at"] = _now_ms()
             _write(record)
             return

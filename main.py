@@ -35,6 +35,7 @@ import logging
 import socket
 import asyncio
 import time
+import unicodedata
 import uuid
 from typing import Optional, AsyncIterator, Dict, List
 from contextlib import asynccontextmanager
@@ -64,6 +65,15 @@ import skills
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# One-off diagnostic: dump the raw per-round usage object from the SDK. OFF by
+# default -- it is one line per model round, which is hundreds per build turn.
+# Set DATAFYE_AGENT_LOG_USAGE=1 in agent.env and restart to read which fields
+# the bundled CLI actually passes through (notably any 5m/1h cache-creation
+# split), which is only knowable from real traffic. Logged at INFO deliberately:
+# the service runs at INFO, so a debug-level line would be silently swallowed
+# and the diagnostic would look broken rather than disabled.
+_LOG_RAW_USAGE = os.getenv("DATAFYE_AGENT_LOG_USAGE", "").strip().lower() in ("1", "true", "yes")
 
 # -- Configuration from environment --------------------------------
 # All env vars use DATAFYE_AGENT_ prefix for consistency.
@@ -168,6 +178,14 @@ INTERNAL_TOOLS = [
     # Claude Code harness renders interactively; the Datafye workspace has
     # no handler for it, so a model that used it would silently fail to
     # surface its question. Without the tool, the model asks inline.)
+    #
+    # "Task" (delegate to a subagent) is deliberately ABSENT, and stays absent.
+    # It was first dropped as harness-only; the stronger reason is that a
+    # subagent does NOT inherit prompt.py, so nothing this agent says about
+    # audience, plain language or voice governs delegated work, and its output
+    # lands unfiltered in a user-facing surface. It also spends its own
+    # containment benefit: a subagent exists so its exploration stays OUT of the
+    # main context, and a large report lands there anyway.
     "EnterPlanMode", "ExitPlanMode",
     # Notebook
     "NotebookEdit",
@@ -1034,6 +1052,100 @@ def _tool_commentary(tool: str, tool_input: dict):
 # (size-capped) output so the detail survives a reload and shows in accounts.
 _DETAIL_OUTPUT_CAP = 2000  # chars of tool output persisted per step
 
+# Rough token weight of a tool result, for the activity rail's per-tool figure.
+# ~4 chars/token is close enough for the code, logs and listings tools return;
+# an exact count would mean a count_tokens API call per tool call, which is far
+# too expensive for a display badge. Deliberately measured on the FULL result,
+# before _DETAIL_OUTPUT_CAP truncates it for display: the whole result is what
+# lands in the prompt and gets re-read on every remaining round of the turn.
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+
+# Common non-ASCII punctuation, mapped to what it means rather than dropped, so
+# a folded sentence still reads as one. Anything not listed falls through to the
+# NFKD pass below (which turns o-umlaut into o) and then to removal.
+_ASCII_PUNCT = {
+    "—": " - ", "–": "-",              # em / en dash
+    "‘": "'", "’": "'",                # smart single quotes
+    "“": '"', "”": '"',                # smart double quotes
+    "…": "...",                             # ellipsis
+    " ": " ", " ": " ", " ": " ",  # non-breaking / thin spaces
+    "•": "-", "→": "->",               # bullet, arrow
+}
+
+
+def _ascii_fold(text: str) -> str:
+    """Reduce text to ASCII before it reaches the commentary trail.
+
+    prompt.py's plain-ASCII rule already forbids non-ASCII punctuation, but it
+    governs what the AGENT writes. Thinking text is the API summarizer's output,
+    which no prompt instruction reaches -- and observed thinking is full of em
+    dashes. That text is now persisted, and accounts stores the trail
+    ASCII-encoded (its resultJson is a QUARK ASCII String), so folding here is
+    what keeps it from breaking on the way out.
+
+    Folding, not stripping: a dropped em dash welds two clauses together, and a
+    dropped accent is preferable to a dropped letter.
+    """
+    if not text:
+        return text
+    if text.isascii():
+        return text
+    for bad, good in _ASCII_PUNCT.items():
+        text = text.replace(bad, good)
+    if text.isascii():
+        return text
+    # NFKD splits an accented letter into letter + combining mark; dropping the
+    # marks leaves the letter. Whatever survives that and is still non-ASCII
+    # (CJK, emoji) has no ASCII reading and goes.
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if ord(c) < 128)
+
+
+def _step_usage(mu) -> dict:
+    """The two trustworthy figures for one step, for the activity rail.
+
+    `new`     -- what this request appended to the prompt: the previous step's
+                 reply plus its tool results. BOTH terms are summed because a
+                 span under the minimum cacheable prefix is silently not cached
+                 and bills as input_tokens rather than cache_creation.
+    `carried` -- the prefix re-read from cache. This is the cost that accrues
+                 every step whether or not anything new happened, and it is what
+                 makes a long turn expensive.
+
+    There is deliberately NO output figure. What reaches us here is the
+    `message_start` usage, whose input side is complete and authoritative (which
+    is why `new` at step N reconciles exactly with `carried` at step N+1) but
+    whose `output_tokens` is a placeholder -- the API docs show it as literally
+    1, 2 or 3. The real count arrives at the END of the same step's stream, on
+    `message_delta`, which we do not currently see. Storing the placeholder
+    under a name that reads like an output count was worse than not storing it
+    at all. Whole-TURN output remains correct via ResultMessage.model_usage;
+    only per-step granularity is missing.
+    """
+    def n(*keys):
+        for k in keys:
+            v = _usage_get(mu, k)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    return {
+        "new": (n("inputTokens", "input_tokens")
+                + n("cacheCreationInputTokens", "cache_creation_input_tokens")),
+        "carried": n("cacheReadInputTokens", "cache_read_input_tokens"),
+    }
+
+
 def _tool_command_text(tool: str, tool_input: dict) -> str:
     ti = tool_input or {}
     if tool == "Bash":
@@ -1258,6 +1370,12 @@ async def stream_agent_response(
         # is the cwd's .claude; we deliberately do NOT load "user"/"local".
         setting_sources=["project"],
         include_partial_messages=True,
+        # Adaptive thinking is the model default; what is NOT the default is
+        # getting the text back. On Opus 5 `display` defaults to "omitted", so
+        # thinking blocks arrive with an empty string, the emit below is skipped,
+        # and the reasoning is invisible -- while still being billed at output
+        # rates. `display` controls visibility only and does not change billing.
+        thinking={"type": "adaptive", "display": "summarized"},
     )
 
     # Persist the user's turn and resume the strategy's SDK session.
@@ -1303,12 +1421,25 @@ async def stream_agent_response(
                                  # never glue into a run-on line on flush
         conversation_text = ""   # the final reply -> Conversation + persisted
         tool_calls_this_turn = 0
-        # Running NEW-token count (fresh input+output, cache excluded) for the
-        # live status-bar ticker. Each AssistantMessage carries this round's
-        # usage; we accumulate and emit a `ticker` so the client shows tokens
-        # climbing in real time. Reconciled to the authoritative `usage` event
-        # at turn end (this is a live estimate, not the billed figure).
-        ticker_tokens = 0
+        # The strategy's CONTEXT SIZE, refreshed every step and shown in the
+        # live ticker. It is the whole prompt at that step -- uncached input +
+        # cache writes + cache read -- so it is exact, needs no summing, and
+        # stays correct across turns (a later turn's prompt already carries the
+        # earlier ones). Within a turn it tracks Sum(new), since
+        # carried(N) = Sum(new(1..N-1)).
+        #
+        # It replaced a counter that summed input_tokens + output_tokens: the
+        # first is only the uncached remainder (single digits once the prefix is
+        # cached) and the second is the message_start placeholder (1-3), so it
+        # read in the tens on a turn whose context had already reached 64K.
+        context_tokens = 0
+        # The MAIN-THREAD step every commentary entry belongs to. One step can
+        # emit several rail lines (narration is flushed one line per block), so
+        # the grouping has to be stamped rather than inferred from the rendering.
+        step_no = 0
+        # The last step's figures, used to tell a NEW step from another message
+        # of the step we are already in (see the AssistantMessage branch).
+        last_step_usage = None
         # The id of an in-flight environment-changing tool (apply/provision/...);
         # its tool_result triggers a mid-turn deployment re-read so the env panel
         # updates as soon as the environment actually changes (not at turn end).
@@ -1334,6 +1465,71 @@ async def stream_agent_response(
 
             # AssistantMessage
             elif isinstance(msg, AssistantMessage) and msg.content:
+                # An AssistantMessage is NOT a model round: the SDK emits one per
+                # content block, and every message of a round repeats that
+                # round's SAME usage object. Counting messages therefore produced
+                # a badge per block (observed on Sutra: 2-4 identical badges in a
+                # row) and inflated the step number. A round is detected by the
+                # usage CHANGING -- the figures grow monotonically as the prompt
+                # grows, so an unchanged object means we are still inside one
+                # round.
+                #
+                # A SUBAGENT's messages arrive on this same stream, carrying
+                # their own conversation's usage, and are distinguishable only by
+                # parent_tool_use_id (None = the main thread). Counting them into
+                # one sequence interleaved two independent contexts, so the step
+                # number jumped around and the context appeared to SHRINK. Only
+                # the main thread is measured here; a subagent's context is its
+                # own and dies with it. Its TOKENS are still billed and still
+                # counted -- they arrive in ResultMessage.model_usage, so the
+                # accounts totals are untouched by this.
+                is_main = getattr(msg, 'parent_tool_use_id', None) is None
+                mu = getattr(msg, 'usage', None)
+                step_usage = None
+                if is_main and isinstance(mu, dict):
+                    su = _step_usage(mu)
+                    # A step reporting nothing gets no badge; an all-zero line
+                    # is noise in the rail.
+                    if any(su.values()) and su != last_step_usage:
+                        last_step_usage = su
+                        step_usage = su
+                        step_no += 1
+                if _LOG_RAW_USAGE:
+                    logger.info(
+                        "step %s msg: thread=%s blocks=%s usage=%s",
+                        step_no,
+                        "main" if is_main else getattr(msg, 'parent_tool_use_id', '?'),
+                        [type(b).__name__ for b in (msg.content or [])],
+                        json.dumps(mu, default=str) if isinstance(mu, dict) else repr(mu))
+
+                # A subagent's CONTENT is its own business. Gating only the badge
+                # leaves `pending_blocks` thread-blind, so a subagent's text
+                # accumulates into the same buffer as the main agent's and
+                # flushes into the rail as narration -- a long delegated report
+                # appearing as if Yukti had said it, interleaved with the real
+                # narration and out of order relative to either thread.
+                #
+                # It cannot be fixed by tuning rail copy, because a subagent does
+                # NOT inherit prompt.py: it runs on the SDK's default agent
+                # prompt, so every rule about audience, plain language and short
+                # action lines is simply absent for delegated work. The rail is
+                # the main agent's account of itself; delegated work is
+                # represented by the one tool line that spawned it.
+                #
+                # Tool calls are still COUNTED so the turn's tool_calls metric
+                # stays honest -- only the rail output is suppressed.
+                if not is_main:
+                    tool_calls_this_turn += sum(
+                        1 for b in msg.content
+                        if hasattr(b, 'name') and hasattr(b, 'input'))
+                    continue
+                if step_usage:
+                    if conversation_id:
+                        conversations.append_commentary(
+                            conversation_id, '', 'step', step=step_no, usage=step_usage)
+                    yield sse_event('commentary', {
+                        'text': '', 'kind': 'step', 'step': step_no, 'usage': step_usage,
+                    })
                 for block in msg.content:
                     # Text
                     if hasattr(block, 'text') and not hasattr(block, 'name'):
@@ -1348,8 +1544,20 @@ async def stream_agent_response(
 
                     # Thinking
                     elif hasattr(block, 'thinking'):
-                        thinking = getattr(block, 'thinking', '')
+                        # Folded to ASCII: this is the summarizer's prose, not
+                        # the agent's, so prompt.py's punctuation rule does not
+                        # reach it -- and it goes to a trail accounts stores
+                        # ASCII-encoded. Folded before the yield too, so the live
+                        # rail and the /history replay cannot differ.
+                        thinking = _ascii_fold(getattr(block, 'thinking', ''))
                         if thinking:
+                            # Persisted as well as streamed: thinking used to be
+                            # live-only, so reopening a strategy lost the one
+                            # record of reasoning that is billed but otherwise
+                            # leaves no trace.
+                            if conversation_id:
+                                conversations.append_commentary(
+                                    conversation_id, thinking, 'thinking', step=step_no)
                             yield sse_event('thinking', {'text': thinking})
 
                     # Tool use
@@ -1366,9 +1574,20 @@ async def stream_agent_response(
                             # log these now, grouped into coherent tickets ..."), a
                             # distinct kind from the machine tool-labels below so
                             # the client can render it a shade brighter in the rail.
+                            # Only what the model actually said reaches the
+                            # trail. A step that opens straight into tool calls
+                            # leaves no line here, and the SPA stands one in at
+                            # render time. That is deliberately NOT done here: a
+                            # stand-in is the harness speaking, and this register
+                            # is the agent's own voice -- persisting it would put
+                            # fabricated words in the trail that accounts stores
+                            # and the Conversation view shows.
                             if conversation_id:
-                                conversations.append_commentary(conversation_id, burst, "narration")
-                            yield sse_event('commentary', {'text': burst, 'kind': 'narration'})
+                                conversations.append_commentary(
+                                    conversation_id, burst, "narration", step=step_no)
+                            yield sse_event('commentary', {
+                                'text': burst, 'kind': 'narration', 'step': step_no,
+                            })
                         pending_blocks = []
                         tool_name = getattr(block, 'name', '')
                         tool_input = getattr(block, 'input', {})
@@ -1388,12 +1607,25 @@ async def stream_agent_response(
                             # so the Tool Detail (command + output) replays from
                             # /history and shows in the accounts Conversation view.
                             # The output is attached later (at tool_result).
+                            # Weigh the CALL, not just the result. For Write and
+                            # Edit the model generates the whole file into the
+                            # call's input and the result is one line back, so a
+                            # result-only figure reported ~nothing for the most
+                            # expensive thing in the step. Measured off the JSON
+                            # because that is the form the call takes in the
+                            # prompt, escaping and all.
+                            call_tokens = _estimate_tokens(
+                                json.dumps(tool_input or {}, default=str))
                             if conversation_id:
                                 conversations.append_commentary(
                                     conversation_id, text, level,
                                     tool_id=getattr(block, 'id', ''),
-                                    command=_tool_command_text(tool_name, tool_input))
-                            yield sse_event('commentary', {'text': text, 'kind': level})
+                                    command=_tool_command_text(tool_name, tool_input),
+                                    step=step_no, call_tokens=call_tokens)
+                            yield sse_event('commentary', {
+                                'text': text, 'kind': level, 'step': step_no,
+                                'call_tokens': call_tokens,
+                            })
 
                         # An environment-changing tool just STARTED: show the panel
                         # a transitioning state (e.g. "Applying...") right away, and
@@ -1407,22 +1639,33 @@ async def stream_agent_response(
                         is_err = bool(getattr(block, 'is_error', False))
                         result_tool_id = getattr(block, 'tool_use_id', '')
                         result_content = str(getattr(block, 'content', '') or '')
+                        # Weigh the FULL result before the display cap: this is
+                        # what the result adds to the prompt, and the client
+                        # cannot recompute it on a replay (it only ever sees the
+                        # capped text). Sent live as well as persisted so both
+                        # paths show the same estimator's number.
+                        result_tokens = _estimate_tokens(result_content)
                         yield sse_event('tool_result', {
                             'tool_use_id': result_tool_id,
                             'content': result_content,
-                            'is_error': getattr(block, 'is_error', False)
+                            'is_error': getattr(block, 'is_error', False),
+                            'result_tokens': result_tokens,
                         })
                         # Attach the (capped) output to the tool's commentary entry
                         # so the persisted Tool Detail carries command + output.
                         if conversation_id and result_tool_id:
                             conversations.attach_tool_output(
                                 conversation_id, result_tool_id,
-                                result_content[:_DETAIL_OUTPUT_CAP], is_err)
+                                result_content[:_DETAIL_OUTPUT_CAP], is_err,
+                                result_tokens=result_tokens)
                         if is_err:
                             err_text = 'A step reported an error'
                             if conversation_id:
-                                conversations.append_commentary(conversation_id, err_text, 'error')
-                            yield sse_event('commentary', {'text': err_text, 'kind': 'error'})
+                                conversations.append_commentary(
+                                    conversation_id, err_text, 'error', step=step_no)
+                            yield sse_event('commentary', {
+                                'text': err_text, 'kind': 'error', 'step': step_no,
+                            })
 
                         # An environment-changing tool just FINISHED: re-read the
                         # deployment now and push fresh descriptor + env_status, so
@@ -1444,18 +1687,38 @@ async def stream_agent_response(
                             except Exception as e:
                                 logger.warning("Mid-turn env read failed: %s", e)
 
-                # This model round's usage -> accumulate NEW tokens and push a
-                # live ticker so the status bar counts up in real time. Best-
-                # effort; a round without usage just doesn't advance the ticker.
-                mu = getattr(msg, 'usage', None)
-                if isinstance(mu, dict):
-                    ticker_tokens += (int(mu.get('input_tokens') or 0)
-                                      + int(mu.get('output_tokens') or 0))
-                    yield sse_event('ticker', {'tokens': ticker_tokens})
+                # This model round's usage -> push a live ticker so the status
+                # bar tracks the context in real time.
+                # Gated on step_usage (a round we have not already counted): the
+                # SDK repeats one round's usage across every message of that
+                # round, so accumulating per MESSAGE double- or triple-counted
+                # every round. Pre-existing; only visible once the same repeat
+                # showed up as duplicate step badges.
+                # `tokens` is kept as the field name a client predating this
+                # carries; its MEANING changed from a running new-token tally to
+                # the context size, which is what the ticker now shows.
+                if step_usage:
+                    context_tokens = step_usage['new'] + step_usage['carried']
+                    yield sse_event('ticker', {'tokens': context_tokens})
 
             # Stream events
             elif hasattr(msg, 'event'):
-                yield sse_event('stream', {'event': getattr(msg, 'event', {})})
+                ev = getattr(msg, 'event', {})
+                if _LOG_RAW_USAGE:
+                    # The one place a real PER-STEP output count could come
+                    # from: `message_delta` carries the authoritative (and
+                    # cumulative) output_tokens at the end of each step's
+                    # stream, where message_start only carried a placeholder.
+                    # Log only the usage-bearing events -- the delta firehose
+                    # would be thousands of lines a turn.
+                    try:
+                        ev_type = ev.get('type') if isinstance(ev, dict) else None
+                        if ev_type in ('message_start', 'message_delta', 'message_stop'):
+                            logger.info("step %s stream %s: %s",
+                                        step_no, ev_type, json.dumps(ev, default=str)[:600])
+                    except Exception:   # diagnostics must never break a turn
+                        pass
+                yield sse_event('stream', {'event': ev})
 
             # Result
             elif isinstance(msg, ResultMessage):
@@ -1642,6 +1905,14 @@ async def stream_agent_response(
                 # passes through /history for the accounts Conversation view.
                 if conversation_text:
                     conversations.set_last_message_usage(conversation_id, turn_usage)
+
+                # Persist the context size reached this turn, so the status bar
+                # still shows it after a reload. Written BEFORE the usage
+                # snapshot is emitted, so the snapshot carries it.
+                if context_tokens:
+                    conversations.set_context_tokens(conversation_id, context_tokens)
+                    if isinstance(updated_usage, dict):
+                        updated_usage['context_tokens'] = context_tokens
 
                 # Hand the frontend the authoritative cumulative usage so its
                 # status bar + per-(stage × model) stepper badges reconcile to
