@@ -107,7 +107,36 @@ fi
 log "No foundry present. Provisioning an empty foundry (this takes several minutes)..."
 
 if sudo -u datafye "${CLI_PATH}" foundry local provision; then
-    log "Foundry provisioned. The agent can now add datasets with 'dataset add'/'apply'."
+    log "Foundry provisioned. Stopping it so the box is left in the standard rest state..."
+
+    # Leave the foundry PRESENT BUT STOPPED, not running. Two reasons, and the
+    # second is the one that matters:
+    #
+    #   1. It gives every box one uniform postcondition. After this unit has run,
+    #      a foundry always exists and only ever needs STARTING -- so the wake
+    #      path (DAT-124) has a single case to handle rather than branching on
+    #      "never existed" versus "existed but stopped".
+    #
+    #   2. It avoids the app-less wake state. `foundry local stop` runs each
+    #      system's `shutdown` admin script and only then stops the environment,
+    #      so the XVM apps come down cleanly. That also marks the containers as
+    #      EXPLICITLY stopped, and `--restart unless-stopped` (what the local
+    #      provisioner sets) deliberately does NOT restart those on the next
+    #      daemon start. A foundry left RUNNING when the box stops is the
+    #      opposite: its containers were never explicitly stopped, so they come
+    #      back as bare sshd machines with no apps inside and the API never
+    #      answers -- the wedge in DAT-171. Stopping cleanly here keeps a fresh
+    #      box out of that state from the very first boot.
+    if sudo -u datafye "${CLI_PATH}" foundry local stop; then
+        log "Foundry present and stopped. Start it with 'foundry local start' before use."
+        exit 0
+    fi
+
+    # The foundry exists, which is the postcondition that matters; it is simply
+    # still running. Do not fail the unit over this -- report it and move on.
+    log "WARNING: provisioned but could not stop cleanly; the foundry is left RUNNING."
+    log "         It is usable, but if the box stops while it is up, its containers"
+    log "         will come back without their apps (DAT-171)."
     exit 0
 fi
 

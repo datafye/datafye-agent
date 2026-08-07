@@ -124,6 +124,26 @@ prompt told the agent one was already there, and the installer's own warning tex
 claimed a third thing ("the agent will provision on demand" — it does not). All four
 statements now agree.
 
+**It leaves the foundry present but STOPPED**, not running, via `foundry local stop`
+after the provision. Two reasons, and the second is the one that matters:
+
+1. One uniform postcondition. After this unit runs, a foundry always exists and only
+   ever needs *starting*, so the wake path (DAT-124) has a single case to handle
+   rather than branching on "never existed" versus "existed but stopped".
+2. It keeps a fresh box out of the app-less wake state. `foundry local stop` runs each
+   system's `shutdown` admin script before stopping the environment, so the XVM apps
+   come down cleanly **and** the containers are marked EXPLICITLY stopped — which
+   `--restart unless-stopped` (what `LocalProvisioner` sets) deliberately does not
+   restart on the next daemon start. A foundry left *running* when the box stops is
+   the opposite case: its containers were never explicitly stopped, so they return as
+   bare sshd machines with no apps inside and the API never answers, which is the
+   DAT-171 wedge. Note this makes DAT-125 (graceful app-stop before an idle-box stop)
+   the same fix applied to the dormancy path.
+
+Consequence worth tracking: something must *start* the foundry before first use. On a
+wake that is DAT-124's job; on the very first boot there is no wake event, so until
+DAT-124 lands the agent or the first environment request has to start it.
+
 Three details are load-bearing:
 
 - **It keys on real state, not a sentinel.** The script asks `foundry local status`
