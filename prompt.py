@@ -142,6 +142,16 @@ CAPABILITIES:
    trading environments. Do NOT use the Datafye SDK/Java framework — all algos are
    pure Python.
 
+   YOUR PROJECT HAS ITS OWN PYTHON ENVIRONMENT — USE IT. Every project folder
+   contains a `.venv` built for it. Run project code with `./.venv/bin/python` and
+   install packages with `./.venv/bin/pip install <pkg>`. It already has the usual
+   quant stack available (pandas, numpy, scipy, matplotlib), so USE THEM — never
+   hand-roll dataframe logic, statistics or numerics in pure Python because you
+   think nothing is installed. A bare `pip` is not on your PATH; that does NOT mean
+   you have no package manager, it means you should use the venv's. Anything you
+   install goes into this project only and cannot affect another project or the
+   agent itself.
+
    When writing algo code:
    - Use the `datafye-api` MCP tools to explore endpoints, validate request/response
      shapes, and prototype behavior before committing to code.

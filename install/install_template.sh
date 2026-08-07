@@ -597,6 +597,29 @@ if [ ! -d "${VENV_DIR}" ]; then
 fi
 "${VENV_DIR}/bin/pip" install --upgrade pip -q
 "${VENV_DIR}/bin/pip" install -r "${AGENT_CODE_DIR}/requirements.txt" -q
+
+# ── Quant stack for PROJECT code (DAT-186) ───────────────────────
+# Installed into the SYSTEM interpreter, not the agent's venv above. Each
+# project gets its own venv built with --system-site-packages (see
+# conversations._ensure_venv), so it inherits these instantly and keeps its
+# own site-packages on top for anything project-specific.
+#
+# Pre-baked rather than installed on demand for two reasons: it puts a
+# multi-minute download in front of the user's first message otherwise, and a
+# sandbox may have slow or no egress to PyPI. The agent previously concluded
+# "No pip available" and hand-wrote its numerics in pure Python, which is a
+# poor and silently wrong-prone way to do statistics.
+#
+# Deliberately NOT installed into ${VENV_DIR}: that venv runs the agent
+# service itself, and project code must never be able to break it by
+# upgrading a shared dependency.
+info "Installing the quant stack for project code (pandas, numpy, scipy, matplotlib)..."
+if ${PYTHON_BIN} -m pip install --quiet pandas numpy scipy matplotlib; then
+    ok "Quant stack installed for project venvs"
+else
+    warn "Could not install the quant stack; project venvs will still build, but"
+    warn "pandas/numpy will be missing until this is re-run. Agent is unaffected."
+fi
 ok "Python dependencies installed"
 
 # ── Step: Configure /etc/hosts for Datafye local environment ─────
