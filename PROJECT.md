@@ -176,6 +176,76 @@ Most of the time the user is building *with* Datafye. But sometimes they ask *ab
 
 A small but load-bearing prompt rule sits alongside it: **use plain ASCII punctuation, everywhere.** No em/en dashes, no curly quotes, no ellipsis character — in chat replies *and* in the activity/progress lines. The reason isn't stylistic: non-ASCII characters break the accounts `resultJson` storage downstream, so a stray em dash in a reply can corrupt what accounts persists. Cheaper to forbid the characters at the source than to sanitize everywhere they might land.
 
+### The Foundry That Nobody Built (DAT-170)
+
+Here is a small horror story about a comment.
+
+The hosted AMI is baked by running the installer with `--ami-cleanup`, a flag that
+deliberately skips foundry provisioning. That skip is correct: provisioning pulls
+images, starts containers and writes instance-specific state under `~/.rumi`, and
+snapshotting any of that into a shared AMI would hand every future sandbox one
+sandbox's leftovers. So the installer skipped it, and left a comment explaining what
+would happen instead:
+
+> Each per-user sandbox provisions its own foundry at first boot.
+
+Nothing implemented that sentence. There was a `first-boot.sh`, which made it look
+implemented, but that script is for the standalone/marketplace AMI: it reads EC2 user
+data and hard-codes `--mode standalone`, and no systemd unit ran it on a hosted box
+at all. Meanwhile `prompt.py` was telling the agent the exact opposite of the truth —
+*"your sandbox already has one, so you almost never need `provision`"* — and the
+installer's own warning text was confidently asserting a third thing, that the agent
+provisions on demand, which it never did either.
+
+So a brand-new sandbox had no environment, an agent that had been told not to make
+one, and three files each describing a different system. The gap survived because
+every individual statement was plausible and no two of them were ever read together.
+
+The fix is a hosted first-boot one-shot, `datafye-foundry-firstboot.service`, running
+`install/first-boot-foundry.sh`. It provisions an empty foundry — Platform plus the
+API system, no datasets — which is precisely the state the prompt already described,
+so the prompt did not have to change; it just became true. Three decisions inside it
+are worth keeping.
+
+**It keys on real state, not on a marker.** The obvious way to write a "first boot"
+script is to touch a sentinel file when it is done and bail out if the sentinel
+exists. That would have been a bug of the same family as the one being fixed: a
+marker written before the work succeeded locks the box out of ever retrying, so a
+single failed provision produces a sandbox that is permanently empty and *believes it
+has already handled that*. Instead it asks `foundry local status` whether a foundry
+is actually there. The pleasant side effect is that the unit is safe to leave enabled
+forever: an ordinary reboot, or a wake from dormancy, costs a one-second no-op, and a
+boot after a failure retries by itself.
+
+**It runs the CLI as the `datafye` user, always.** This looks like a detail and is
+actually a trap with teeth. The `rumi` user is in `wheel` but not in `docker`, so as
+any other user `foundry local status` cannot reach the Docker socket — and it does
+not report a permission problem, it reports *"not provisioned"*. That is a confident
+false negative indistinguishable from a genuinely empty box, and acting on it means
+provisioning on top of a live environment, which collides and fails. A status command
+that cannot tell "absent" from "I am not allowed to look" is worse than one that
+errors out.
+
+**It rides the companion-refresh loop.** The script lives in the install directory and
+is executed from there by a systemd unit, which puts it in exactly the category that
+bit us before: files a box only receives when its AMI is baked. Adding it to the loop
+that already refreshes `upgrade-check.sh` means a fix to it reaches the fleet through
+an ordinary auto-upgrade instead of requiring a re-bake.
+
+Failure is deliberately non-fatal. The agent is genuinely useful with no foundry —
+chat, docs, code and memory all work — so the unit logs loudly to the journal and
+leaves the agent running rather than taking the whole box down over an environment
+the user may not have asked for yet. The one thing it must not do is fail *silently*,
+because silence is how the original gap survived: a missing foundry left no trace
+anywhere, and the first person to notice was a user whose agent was confidently
+acting on a false assumption.
+
+The transferable lesson is about where truth lives. A comment describing a step in
+*another* file is not a mechanism, it is a hope. If a promise spans two files, put the
+thing that keeps it somewhere a test or a boot will exercise — and when you find one
+claim that is wrong, go and read every other place that claims something about the
+same subject, because they will not agree either.
+
 ### Bootstrap: How the Agent Learns Who It Is
 
 A freshly-launched agent is a blank slate. It doesn't know its username, it doesn't have the key to decrypt its own credentials, and it has no Anthropic key to talk to Claude. So it doesn't pretend otherwise — it boots into an **awaiting-bootstrap** holding state. In that state exactly two endpoints answer: `GET /health` (so accounts can see it's alive and not yet bootstrapped) and `POST /bootstrap`. Every user-facing endpoint returns HTTP 503, enforced by a single `require_bootstrapped` FastAPI dependency. Nothing runs against a `None` identity.
