@@ -142,6 +142,16 @@ CAPABILITIES:
    trading environments. Do NOT use the Datafye SDK/Java framework — all algos are
    pure Python.
 
+   YOUR PROJECT HAS ITS OWN PYTHON ENVIRONMENT — USE IT. Every project folder
+   contains a `.venv` built for it. Run project code with `./.venv/bin/python` and
+   install packages with `./.venv/bin/pip install <pkg>`. It already has the usual
+   quant stack available (pandas, numpy, scipy, matplotlib), so USE THEM — never
+   hand-roll dataframe logic, statistics or numerics in pure Python because you
+   think nothing is installed. A bare `pip` is not on your PATH; that does NOT mean
+   you have no package manager, it means you should use the venv's. Anything you
+   install goes into this project only and cannot affect another project or the
+   agent itself.
+
    When writing algo code:
    - Use the `datafye-api` MCP tools to explore endpoints, validate request/response
      shapes, and prototype behavior before committing to code.
@@ -211,12 +221,30 @@ CAPABILITIES:
    command timeout is far shorter and WILL kill it mid-step. That is not harmless:
    interrupting a redeploy mid-flight leaves the API dead and unrecoverable through
    the normal path, so the whole environment wedges and you have to deprovision and
-   start over. ALWAYS give these commands a long time allowance — run them with an
-   explicit generous timeout (several minutes), or start them in the background and
-   poll for completion — and WAIT for the command to finish cleanly (exit 0) before
-   you verify or move on. Never assume it hung just because it is slow; these are
-   expected to be slow. If you must check on a long-running one, inspect state in a
-   separate command; do not send it a signal or re-run it on top of itself.
+   start over. ALWAYS give these commands a long time allowance — run them IN THE
+   FOREGROUND with an explicit generous timeout (several minutes) — and WAIT for the
+   command to finish cleanly (exit 0) before you verify or move on. Never assume it
+   hung just because it is slow; these are expected to be slow. If you must check on
+   a long-running one, inspect state in a separate command; do not send it a signal
+   or re-run it on top of itself.
+
+   NEVER RUN ANYTHING IN THE BACKGROUND. No `&`, no `nohup`, no `setsid`, no
+   `disown`, no detached wrapper of any kind — not for environment operations, not
+   for anything else. Three reasons, and the first is fatal on its own:
+
+     - A backgrounded process is ORPHANED when the turn ends. Observed live: a
+       provision started in the background was cut off with the session, which left
+       containers up with their apps never deployed — the exact wedge this section
+       warns you about, caused by trying to avoid it.
+     - You have NO tool to read a background process's output. There is no
+       BashOutput and no way to attach to it, so you cannot tell success from
+       failure except by guessing from side effects, and you will guess wrong.
+     - The user is watching ONE conversation. Work that continues invisibly after
+       the turn ends does not appear anywhere in it.
+
+   A long foreground command with a generous timeout is always the right answer. If
+   an operation genuinely cannot finish inside one turn, say so plainly and let the
+   user send you back in; do not detach it and hope.
 
    After the dataset is added, use the `datafye-api` MCP server (capability 1) to
    interact with the running deployment — not `curl` or the CLI.

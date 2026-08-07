@@ -107,7 +107,29 @@ fi
 log "No foundry present. Provisioning an empty foundry (this takes several minutes)..."
 
 if sudo -u datafye "${CLI_PATH}" foundry local provision; then
-    log "Foundry provisioned. Stopping it so the box is left in the standard rest state..."
+    log "Foundry provisioned. Waiting for the API to answer before stopping..."
+
+    # WAIT before stopping. `foundry local stop` starts by asking the deployment
+    # API which systems are deployed, so calling it the instant `provision`
+    # returns races the API's own startup: observed on a live sandbox, the stop
+    # failed 12 seconds in and left the foundry RUNNING, which then decayed to
+    # DEGRADED (containers up, apps gone) on the next box stop. Provision
+    # returning is not the same as the API serving.
+    api_ready=false
+    for _ in $(seq 1 60); do
+        if sudo -u datafye "${CLI_PATH}" foundry local status 2>/dev/null \
+                | grep -qE '^[[:space:]]*API:[[:space:]]+up'; then
+            api_ready=true
+            break
+        fi
+        sleep 5
+    done
+
+    if [ "${api_ready}" != true ]; then
+        log "WARNING: the API did not answer within 5 minutes; stopping anyway."
+    fi
+
+    log "Stopping the foundry so the box is left in the standard rest state..."
 
     # Leave the foundry PRESENT BUT STOPPED, not running. Two reasons, and the
     # second is the one that matters:
@@ -127,14 +149,21 @@ if sudo -u datafye "${CLI_PATH}" foundry local provision; then
     #      back as bare sshd machines with no apps inside and the API never
     #      answers -- the wedge in DAT-171. Stopping cleanly here keeps a fresh
     #      box out of that state from the very first boot.
-    if sudo -u datafye "${CLI_PATH}" foundry local stop; then
+    # Capture the stop's output: the first cut logged only THAT it failed, which
+    # left no way to tell a racing API from a genuinely broken shutdown.
+    stop_out=$(sudo -u datafye "${CLI_PATH}" foundry local stop 2>&1)
+    stop_rc=$?
+    if [ ${stop_rc} -eq 0 ]; then
         log "Foundry present and stopped. Start it with 'foundry local start' before use."
         exit 0
     fi
 
     # The foundry exists, which is the postcondition that matters; it is simply
     # still running. Do not fail the unit over this -- report it and move on.
-    log "WARNING: provisioned but could not stop cleanly; the foundry is left RUNNING."
+    log "WARNING: provisioned but could not stop cleanly (exit ${stop_rc}); left RUNNING."
+    printf '%s\n' "${stop_out}" | tail -20 | while IFS= read -r line; do
+        log "  stop: ${line}"
+    done
     log "         It is usable, but if the box stops while it is up, its containers"
     log "         will come back without their apps (DAT-171)."
     exit 0

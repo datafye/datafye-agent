@@ -50,6 +50,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -179,6 +181,52 @@ def _scaffold(conversation_id: str, name: str) -> None:
                 path.write_text(content)
     except OSError as e:
         logger.warning("Could not scaffold strategy folder %s: %s", conversation_id, e)
+    _ensure_venv(conversation_id)
+
+
+# Per-project Python environment. Created here rather than at project-create
+# time so it is self-healing: _scaffold runs on EVERY ensure(), so a project
+# that predates this (or whose venv was deleted) gets one on its next turn.
+VENV_DIRNAME = ".venv"
+
+
+def _ensure_venv(conversation_id: str) -> None:
+    """Give the strategy folder its own venv, so the agent can install packages.
+
+    Built with --system-site-packages ON PURPOSE. The quant stack (pandas,
+    numpy, scipy, matplotlib) is pre-installed into the system interpreter by
+    the installer, so inheriting it makes creation take about a second and cost
+    almost no disk. Building an isolated venv and pip-installing pandas per
+    project would put a multi-minute download in front of the user's first
+    message, on a box that may have slow or no egress to PyPI.
+
+    The project keeps its OWN site-packages on top, so `pip install` works for
+    anything project-specific and one strategy cannot disturb another.
+
+    Note this is NOT the agent's own venv (/opt/datafye/agent/venv, which runs
+    main.py and is root-owned by design). This one belongs to the `datafye`
+    user and holds project code's dependencies. The two must stay separate:
+    strategy code upgrading a shared dependency must never be able to break the
+    agent process.
+    """
+    d = strategy_dir(conversation_id)
+    venv = d / VENV_DIRNAME
+    if (venv / "bin" / "python").exists():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+            check=True, capture_output=True, timeout=120,
+        )
+        logger.info("Created project venv for %s", conversation_id)
+    except (subprocess.SubprocessError, OSError) as e:
+        # Best-effort: a project without a venv still works, the agent just
+        # cannot install packages into it. Never fail the turn over this.
+        detail = getattr(e, "stderr", b"") or b""
+        logger.warning(
+            "Could not create project venv for %s: %s %s",
+            conversation_id, e, detail[:400].decode("utf-8", "replace"),
+        )
 
 
 def meta(record: dict) -> dict:
