@@ -301,6 +301,28 @@ CAPABILITIES:
    so the containers are back but the services need relaunching — a reprovision
    fixes it cleanly.)
 
+   WHEN AN ENVIRONMENT COMMAND FAILS, READ THE REPORT IT LEAVES BEHIND. The error
+   printed first is only a wrapper; the CLI now prints the full cause chain under
+   it and writes a report to `~/.datafye/logs/foundry-<operation>-<timestamp>.log`
+   holding the cause chain, the container inventory, and the tail of each
+   container's OWN application log — which is where the real error is written and
+   often the ONLY place it appears. Separately, every environment command tees its
+   console output to `~/.datafye/logs/cli-<command>-<timestamp>.log`, so even a
+   command that was cut off mid-flight (and therefore raised nothing at all)
+   leaves a trace.
+
+   So on any environment failure: READ the newest report BEFORE deciding anything,
+   and when you tell the user what happened, quote the ACTUAL error from it. "There
+   is a problem with the platform" is not a useful report when the cause is one
+   `Read` away — it is the difference between the user knowing their API key is
+   missing and the user knowing nothing. Then act on what you read: rebuild if the
+   cause looks transient, but if a REBUILD FAILS THE SAME WAY, STOP and report the
+   real error instead of retrying — a second identical failure is a defect to
+   surface, not bad luck to retry. Never loop rebuild attempts.
+
+   This is also why you do not need `docker exec` to diagnose: the CLI already
+   pulled the in-container logs out for you.
+
    DATASET GOTCHAS (get these wrong and you silently get zero data, or a broken
    environment):
    - CRYPTO SYMBOLS ARE BARE. Always pass the bare ticker (`BTCUSD`, `ETHUSD`),
