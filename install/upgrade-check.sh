@@ -47,6 +47,24 @@ ENV_FILE="${INSTALL_DIR}/agent.env"
 VERSION_URL="https://downloads.n5corp.com/datafye/agent/latest/version.txt"
 LOG_PREFIX="[datafye-agent-upgrade]"
 
+STATE_FILE="${INSTALL_DIR}/.upgrade-check-state"
+
+# Log a decision ONLY when it changes from the last one. This runs every
+# minute, so logging every outcome would bury the interesting lines in
+# thousands of no-ops -- but logging nothing is what let a DISABLED check look
+# exactly like a working idle one (DAT-187): an empty log was consistent with
+# "pinned and standing down" and with "checked, already current", and there was
+# no way to tell which from outside. One line per state change gives a durable
+# trace at effectively zero volume.
+note_state() {
+    local state="$1" msg="$2" prev=""
+    [ -f "${STATE_FILE}" ] && prev=$(cat "${STATE_FILE}" 2>/dev/null || true)
+    if [ "${state}" != "${prev}" ]; then
+        echo "${LOG_PREFIX} $(date -u +%Y-%m-%dT%H:%M:%SZ) ${msg}"
+        printf '%s' "${state}" > "${STATE_FILE}" 2>/dev/null || true
+    fi
+}
+
 # Check we're installed
 if [ ! -f "${INSTALL_DIR}/version" ]; then
     exit 0
@@ -56,7 +74,7 @@ fi
 if [ -f "${ENV_FILE}" ]; then
     PINNED=$(grep -oP '^DATAFYE_AGENT_PINNED=\K.*' "${ENV_FILE}" 2>/dev/null || true)
     if [ "${PINNED}" = "true" ]; then
-        # Silent — this is expected for pinned installs
+        note_state "pinned" "Auto-upgrade DISABLED (DATAFYE_AGENT_PINNED=true); holding $(cat "${INSTALL_DIR}/version" 2>/dev/null). Clear the pin in ${ENV_FILE} to re-enable."
         exit 0
     fi
 fi
@@ -73,7 +91,7 @@ fi
 
 # Compare
 if [ "${CURRENT_VERSION}" = "${LATEST_VERSION}" ]; then
-    # Up to date, silent
+    note_state "current:${CURRENT_VERSION}" "Auto-upgrade ACTIVE; already at ${CURRENT_VERSION} (latest)."
     exit 0
 fi
 

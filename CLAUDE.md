@@ -166,6 +166,30 @@ Failure is non-fatal: the agent is useful without a foundry (chat, docs, code an
 memory all work), so the unit logs loudly to the journal and retries next boot rather
 than leaving the agent service down.
 
+### `--version` selects what to install; `--pin` disables upgrades (DAT-187)
+
+They used to be the same flag, and that silently disabled auto-upgrade **across the
+entire hosted fleet**. The Packer bake passes `--version` (for reproducibility, which
+is right), `--version` set `VERSION_EXPLICIT=true`, that was written to `agent.env` as
+`DATAFYE_AGENT_PINNED=true`, and `upgrade-check.sh` stands down when pinned. Every
+step was individually reasonable; composed, no hosted box had ever auto-upgraded.
+
+Now `--version` means only "install exactly this version" and a separate `--pin` means
+"never auto-upgrade". The bake passes `--version` alone, so baked boxes upgrade
+normally.
+
+**It hid because two different silences looked identical.** The cron fired every
+minute and wrote nothing, which was equally consistent with *pinned and standing down*
+and with *checked, already current* — and on the box where it was found, the installed
+and published versions happened to match. `upgrade-check.sh` now logs **on state
+change only** (a small `.upgrade-check-state` file next to the version): one line when
+it becomes pinned, one when it starts tracking a version, nothing on the thousands of
+identical no-ops in between. Bounded volume, durable trace.
+
+⚠️ **The fix cannot reach an already-pinned box by upgrading**, since that box will
+not upgrade — that is the bug. Existing sandboxes need a reprovision (or a manual edit
+of `DATAFYE_AGENT_PINNED` in `agent.env`).
+
 ### Companion scripts: always refresh them, and never `cp` onto a running one (`ddc5c01`, DAT-131)
 
 `install.sh` copies `upgrade-check.sh` (and itself) into `INSTALL_DIR` on every install. Two rules the old code broke, both of which only bite on the **auto-upgrade** path, where `install.sh` arrives as `curl … | bash` and is invoked **by** the still-executing `upgrade-check.sh`:
