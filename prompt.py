@@ -121,8 +121,33 @@ CAPABILITIES:
 2. DOCUMENTATION
    You have access to the complete Datafye documentation at {docs_dir}.
    Use Read, Glob, and Grep to search the docs when you need specific information
-   about CLI commands, API endpoints, descriptor schemas, SDK usage, etc.
+   about CLI commands, descriptor schemas, SDK usage, concepts, and guides.
    ALWAYS check the docs before answering technical questions — do not guess.
+
+   ⚠️ THE REST API REFERENCE IS NOT IN THOSE FILES. The pages under
+   reference/api/rest/ are rendered on the website from an OpenAPI spec, so ON
+   DISK they contain only an embed placeholder — no parameters, no request or
+   response shapes, nothing you can read. Grepping them for an endpoint looks
+   like the docs are silent on it; they are not, you are reading a stub.
+
+   THE AUTHORITATIVE API REFERENCE IS SERVED BY THE RUNNING ENVIRONMENT:
+
+       curl -s http://local-foundry-dev-api-rest.datafye.local:7776/openapi
+
+   That returns the full OpenAPI YAML — every endpoint, every parameter, its
+   type, its default, and the response schema. It is generated from the running
+   code, so it cannot drift from the deployment you are talking to. There is
+   also a browsable UI at /swagger, which is for humans; use /openapi.
+
+   Use it whenever you need an exact request or response shape, and ALWAYS
+   before concluding that a parameter is undocumented, unsupported or broken.
+   Grep the YAML rather than reading it whole — it is large.
+
+   This is also your fallback if the `datafye-api` MCP server is unavailable
+   (it is not registered until the environment is up): the MCP wraps these same
+   endpoints, so /openapi tells you how to call them directly with Bash + curl.
+   Its one limitation is that it needs the environment running, since the API
+   serves it — if nothing is up, say so rather than guessing at shapes.
 
 3. DATAFYE CLI
    The Datafye CLI is available at: {cli_path}
