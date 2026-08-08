@@ -63,6 +63,7 @@ mkdir -p "$TMPDIR"
 # ── Defaults ──────────────────────────────────────────────────────
 VERSION="__VERSION__"
 VERSION_EXPLICIT=false
+PINNED=false
 MODE=""
 DNS_NAME=""
 GITHUB_TOKEN=""
@@ -94,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --mode)           MODE="$2"; shift 2 ;;
         --dns)            DNS_NAME="$2"; shift 2 ;;
         --version)        VERSION="$2"; VERSION_EXPLICIT=true; shift 2 ;;
+        --pin)            PINNED=true; shift ;;
         --github-token)   GITHUB_TOKEN="$2"; shift 2 ;;
         --agent-source)   AGENT_SOURCE_DIR="$2"; shift 2 ;;
         --force)          FORCE=true; shift ;;
@@ -113,8 +115,11 @@ Options:
   --dns <name>          DNS name (standalone mode, e.g., agent.mycompany.com)
   --version <v>         Override the baked-in version. Accepts X.Y.Z for
                         released builds or X.Y-SNAPSHOT for internal testing.
-                        Passing --version pins the install; auto-upgrade is
-                        disabled until the pin is cleared.
+                        This selects WHAT to install; it does NOT disable
+                        auto-upgrade. Use --pin for that.
+  --pin                 Never auto-upgrade this install. The upgrade cron
+                        stays installed but stands down, so the box holds the
+                        version it has until someone upgrades it by hand.
   --github-token <t>    GitHub token with read access to datafye-docs.
                         Required for SNAPSHOT installs (docs repo is private).
   --agent-source <dir>  Skip the agent-source git clone and seed the agent
@@ -719,7 +724,7 @@ DATAFYE_AGENT_DOCS_DIR=${DOCS_DIR}
 DATAFYE_AGENT_SAMPLES_DIR=${SAMPLES_DIR}
 DATAFYE_AGENT_CLI_PATH=${CLI_PATH}
 DATAFYE_AGENT_DNS=${DNS_NAME}
-DATAFYE_AGENT_PINNED=${VERSION_EXPLICIT}
+DATAFYE_AGENT_PINNED=${PINNED}
 DATAFYE_AGENT_API_MCP_URL=http://local-foundry-dev-mcp-api.datafye.local:3200/mcp
 EOF
 chmod 600 "${ENV_FILE}"
