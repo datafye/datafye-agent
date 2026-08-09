@@ -34,6 +34,7 @@ def build_system_prompt(
     skills_dir: str = "",
     files_context: str = "",
     cheatsheet_path: str = "",
+    foundry_status: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
 
@@ -217,6 +218,12 @@ CAPABILITIES:
    folder or path).
 
 7. ENVIRONMENT MANAGEMENT
+   FOUNDRY READINESS RIGHT NOW: {foundry_status}
+   Treat that as authoritative. It is recorded by whatever last changed the
+   environment, which may be the boot service or an operator, not only you.
+   Never infer readiness from containers being up: a box can show a complete set
+   of healthy containers with no applications inside them.
+
    You manage Datafye foundry and trading environments for the user via the CLI.
    When the user describes what they want to build, YOU determine:
    - Which datasets are needed (SIP, Crypto, Palpha, HWAI, Synthetic)

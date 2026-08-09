@@ -60,6 +60,7 @@ import broker
 import conversations
 import credentials as credentials_module
 import memory
+from foundry import read_foundry_state, describe_for_model
 import skills
 
 # Configure logging
@@ -240,6 +241,13 @@ class HealthResponse(BaseModel):
     last_chat_activity_at: int      # epoch ms; 0 if no chat yet
     running_jobs: int               # count of in-flight chat streams
     active_proxied_apps: list[str]  # always [] in v1
+    # Foundry readiness, read from the state file the CLI and the boot service
+    # write: {state, since, operation, intended, error, reason}. "Running" (this
+    # process answering) says nothing about whether the box can do work, which is
+    # how a request once landed on a box three minutes into its first provision.
+    # state is starting|provisioning|restoring|ready|failed|absent, or "unknown"
+    # when no state has been recorded yet.
+    foundry: dict
 
 
 class CredentialsUpdate(BaseModel):
@@ -1353,6 +1361,10 @@ async def stream_agent_response(
         # On-disk path to the foundry resource-cost cheat sheet (for the resource
         # guard); empty if the bundled file is missing.
         cheatsheet_path=CHEATSHEET_PATH if os.path.exists(CHEATSHEET_PATH) else "",
+        # What the box can actually do right now. Read from the recorded state
+        # rather than inferred, so the model is told a provision is in flight
+        # instead of discovering it by colliding with one.
+        foundry_status=describe_for_model(read_foundry_state()),
     )
 
     options = ClaudeAgentOptions(
@@ -2074,6 +2086,7 @@ async def health():
         last_chat_activity_at=last_chat_activity_at,
         running_jobs=running_jobs,
         active_proxied_apps=active_proxied_apps,
+        foundry=read_foundry_state(),
     )
 
 
