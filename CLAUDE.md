@@ -229,7 +229,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals. Always available, including before bootstrap |
+| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals, and `foundry` (recorded foundry readiness, see below). Always available, including before bootstrap |
 | `/v1/bom` | GET | Dependency bill-of-materials — the single Datafye version this agent is built against (platform/samples/CLI/docs share one version). Reads `bom.json`; unauthenticated like `/health`; rendered on the Yukti agent surface |
 | `/bootstrap` | POST | Accounts-only. Bootstrap the agent's identity + credentials-store key from an accounts-signed JWT (`Authorization: Bearer`, `purpose=agent-bootstrap`). Idempotent for the same user; 409 on rebind |
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
@@ -333,6 +333,20 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
+
+### Foundry readiness is read, not inferred (DAT-198)
+
+`foundry.py` reads `~/.datafye/run/foundry-state.json` — written by the deploy engine (Java, every lifecycle command) and the foundry boot service (shell) — and `/health` republishes it as `foundry: {state, since, operation, intended, error, reason}`.
+
+`state` is `starting | provisioning | restoring | ready | failed | absent`, plus **`unknown`**, which is this module's own value meaning *no state file*. That is deliberately distinct from `absent`: "I don't know" and "I know there is nothing" are different answers, and only one of them means a fresh box.
+
+**Why it exists:** "Running" used to mean this Python process answers `/health`, which says nothing about whether the box can do work. On u1 that gap put a user's request onto a box three minutes into its first provision. The agent had even logged `Datafye API MCP: NOT REACHABLE` fifteen seconds earlier — the information existed, nothing consumed it.
+
+- **`is_ready()` is not "is it running".** It is *observed matches intended*, so a foundry the user deliberately stopped is ready. Treating that box as unready would leave it permanently unhealthy, fixable only by starting an environment they explicitly did not want.
+- **A missing file is the normal first-boot reading**, not an error: the boot unit is ordered after the agent, so the agent answers `/health` before anything has written a state. Absence only becomes meaningful after a grace period, and judging that is **accounts'** job — it knows when the box booted; this process does not.
+- **Reading never raises.** It is on the `/health` path, which must answer even when everything else is broken: an agent that cannot report its health is indistinguishable from a dead instance, which is the one distinction accounts needs most.
+- **An unrecognised `state` is passed through, not rejected**, so a newer writer can add one without this agent refusing to report it.
+- **The model is told the state and the reason** via `prompt.py`'s `FOUNDRY READINESS RIGHT NOW:` line, built by `describe_for_model()`. Mid-operation it explicitly tells the model not to start/apply/provision — a second operation on one foundry is what corrupts it. On `failed` it points at `~/.datafye/logs` and forbids an automatic rebuild, because the broken environment is the only evidence of why it failed.
 
 ## Key Design Decisions
 
