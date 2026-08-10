@@ -303,6 +303,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
 | `/v1/credentials` | POST | REMOVED — returns 410 Gone; credential writes go through the accounts service |
 | `/v1/credentials/update` | POST | Accounts-only. Push a single credential `{provider, value}` into the encrypted store; 204 |
+| `/v1/foundry/stop` | POST | Accounts-only, `agent-lifecycle`-token-gated. Bring the foundry down cleanly before the box is powered off (DAT-125). Returns `{status, detail}` where status is `stopped`/`absent`/`busy`/`failed` — `busy` tells accounts to ABORT the instance stop |
 | `/v1/credentials/status` | GET | Check which credentials are configured (JWT-protected) |
 | `/v1/broker/brokers` | GET | List brokers Datafye supports (StocksBroker enum) |
 | `/v1/broker/connections` | GET | List the user's brokerage connections with linked accounts |
@@ -397,6 +398,8 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_SYSTEM_PLUGIN_DIR` | `<app>/plugins/datafye` | Read-only system-skill plugin (ships with the app clone) |
 | `DATAFYE_AGENT_USER_PLUGIN_DIR` | `<state>/plugins/user` | Writable user-global skill plugin (agent authors skills here) |
 | `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | `1` (set by the agent) | Disables the `claude` CLI's own auto-memory so the agent runs ONE explicit memory model (see Key Design Decisions). Not a `DATAFYE_` var; `os.environ.setdefault` in main.py, overridable |
+| `DATAFYE_AGENT_RUN_DIR` | `~/.datafye/run` | The CLI's run directory, where the DAT-196 lock and the DAT-183 in-progress markers live. Read (never written) to tell whether an environment operation is in flight. Not under the agent state root — it belongs to the environment, which outlives this process |
+| `DATAFYE_AGENT_FOUNDRY_STOP_TIMEOUT` | `240` | Upper bound (seconds) on the graceful environment stop. Deliberately BELOW accounts' own 300s read timeout so the agent is what expires and can answer with which outcome happened |
 | `DATAFYE_AGENT_JWT_LEEWAY_SECONDS` | `60` | Clock-skew tolerance applied to time-based JWT claims (iat/nbf/exp) when verifying accounts-signed tokens — avoids "token not yet valid (iat)" failures from clock drift |
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
@@ -415,6 +418,31 @@ reports it, while the frontend renders whatever track it is handed.
 - **Reading never raises.** It is on the `/health` path, which must answer even when everything else is broken: an agent that cannot report its health is indistinguishable from a dead instance, which is the one distinction accounts needs most.
 - **An unrecognised `state` is passed through, not rejected**, so a newer writer can add one without this agent refusing to report it.
 - **The model is told the state and the reason** via `prompt.py`'s `FOUNDRY READINESS RIGHT NOW:` line, built by `describe_for_model()`. Mid-operation it explicitly tells the model not to start/apply/provision — a second operation on one foundry is what corrupts it. On `failed` it points at `~/.datafye/logs` and forbids an automatic rebuild, because the broken environment is the only evidence of why it failed.
+
+### Stopping the environment before the box (DAT-125)
+
+The accounts idle monitor used to call StopInstance on a live sandbox directly. That pulls the floor out from under a running foundry twice over: the Rumi applications are killed mid-write, risking unflushed transaction logs, and the containers are never marked stopped — so `--restart unless-stopped` faithfully restores them on the next boot **with no applications inside**, which is the DAT-171 wedge. It was observed doing exactly that on u1, sixteen minutes into a provision.
+
+`POST /v1/foundry/stop` is the fix's agent half. Accounts calls it immediately before StopInstance, for both the idle `Dormant` stop and a deliberate user `Stop`.
+
+**The reply is a decision, not a result.** `foundry.graceful_stop` returns one of four statuses, and only one of them changes what accounts does:
+
+| status | what it means | accounts |
+|---|---|---|
+| `stopped` | the environment came down cleanly | stop the box |
+| `absent` | there is no foundry here | stop the box |
+| `failed` | the stop did not complete, but nothing is in flight | stop the box, loudly |
+| `busy` | another operation owns the environment | **abort** |
+
+Only `busy` aborts, and the asymmetry is the point: an environment mid-provision must not be cut off, but a stop that merely *failed* protects nothing by keeping the box up — and a sandbox that can never stop cleanly would then bill forever with nobody watching. `failed` is logged at WARNING because that line is the only trace a box went down without a clean stop.
+
+Three details are load-bearing:
+
+- **`busy` is decided from the DAT-183 marker, not from the refusal text.** The DAT-196 lock refuses with a sentence written for humans in another repo; keying on it would be a cross-repo contract with no compiler behind it. The marker is checked twice — before doing anything, and again after a failed stop, which is what catches an operation that started *during* the stop. The lock file is deliberately not used: it is never deleted on release, so its contents describe the *last* holder rather than necessarily a current one. PIDs are confirmed against `/proc/<pid>/cmdline`, since a recycled PID would otherwise leave the box permanently "busy".
+- **The agent's timeout is deliberately shorter than the caller's.** The agent bounds the stop at `DATAFYE_AGENT_FOUNDRY_STOP_TIMEOUT` (240s) and accounts reads with a 300s timeout, so *this* side is what expires — an expiry here returns a structured answer naming what happened, while an expiry at the caller returns nothing and cannot be told from an unreachable box. A timed-out CLI is killed rather than left holding the environment lock with nobody waiting on it.
+- **The endpoint is gated by a purpose-scoped `agent-lifecycle` token**, not by the user JWT and not left open like `/v1/credentials/update`. That endpoint only writes a cache value; an unauthenticated stop would let anyone who can reach the agent take a user's environment down. A *user* token would be wrong in the other direction — this is accounts acting as accounts, and borrowing a person's identity for a machine call would mint a user-equivalent credential on every dormancy tick. `auth.require_accounts_lifecycle_jwt` demands `purpose=agent-lifecycle` **and** `sub` matching this sandbox; a perfectly valid login token is refused. Both guards now share one `_decode_bearer`, so the signature/issuer/algorithm checks cannot drift between them.
+
+The engine half is in `datafye-deploy`: `stop` no longer aborts when one application fails to shut down, and falls back to the container inventory when the deployment API cannot say which systems are deployed — because the API *is* one of the applications, so the box that most needs stopping was the one where the stop did least.
 
 ## Key Design Decisions
 
