@@ -61,6 +61,7 @@ import conversations
 import credentials as credentials_module
 import memory
 import foundry
+import warmth
 from foundry import read_foundry_state, describe_for_model, graceful_stop
 import skills
 
@@ -213,7 +214,6 @@ sessions: dict[str, str] = {}
 # unused agent goes Dormant after the threshold (and auto-wakes invisibly).
 last_chat_activity_at: int = int(time.time() * 1000)
 running_jobs: int = 0
-active_proxied_apps: list[str] = []
 
 
 # -- Request/Response Models ---------------------------------------
@@ -241,7 +241,12 @@ class HealthResponse(BaseModel):
     # Idle signals consumed by accounts' poll loop (Chunk 4):
     last_chat_activity_at: int      # epoch ms; 0 if no chat yet
     running_jobs: int               # count of in-flight chat streams
-    active_proxied_apps: list[str]  # always [] in v1
+    # Work in flight that must not be interrupted, as self-describing labels
+    # (e.g. env:data-flowing, env:provision). Accounts treats a NON-EMPTY list
+    # as busy in both the pre-stop re-check and the admin countdown, so this is
+    # what stops a box being stopped mid-provision. Empty means idle. The field
+    # name predates the meaning (DAT-184 filled a hook that had always sent []).
+    active_proxied_apps: list[str]
     # Foundry readiness, read from the state file the CLI and the boot service
     # write: {state, since, operation, intended, error, reason}. "Running" (this
     # process answering) says nothing about whether the box can do work, which is
@@ -2189,13 +2194,22 @@ async def lifespan(app: FastAPI):
     # every minute, and by the SPA. An agent that goes quiet is indistinguishable
     # from a dead instance, which is the one thing it must never look like.
     observer = asyncio.create_task(foundry.observe_forever(DATAFYE_DEPLOYMENT_API_URL))
+    # The warm signal shares the reasoning but not the loop: it answers "is
+    # work happening" rather than "is the environment usable", and accounts
+    # consumes it to decide whether stopping this box would interrupt
+    # something.
+    warm_watcher = asyncio.create_task(warmth.refresh_forever(DATAFYE_DEPLOYMENT_API_URL))
     logger.info(
         f"  Foundry readiness: intent={foundry.read_intent()['intended']}, "
         f"observing {DATAFYE_DEPLOYMENT_API_URL} every {foundry.OBSERVE_INTERVAL_SECONDS}s")
+    logger.info(
+        f"  Warm signal: data-flow window {warmth.DATA_WINDOW_SECONDS}s, "
+        f"refreshed every {warmth.REFRESH_INTERVAL_SECONDS}s")
 
     yield
 
     observer.cancel()
+    warm_watcher.cancel()
     logger.info("Datafye Agent Service shutting down...")
 
 
@@ -2266,7 +2280,7 @@ async def health():
         credentials_generation=creds.generation() if creds else None,
         last_chat_activity_at=last_chat_activity_at,
         running_jobs=running_jobs,
-        active_proxied_apps=active_proxied_apps,
+        active_proxied_apps=warmth.active_work(),
         foundry=read_foundry_state(),
     )
 
