@@ -108,6 +108,46 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### One oversized tool result must not destroy the turn (DAT-204)
+
+The SDK frames the CLI's NDJSON stdout and refuses any single message larger than
+`max_buffer_size`, **default 1 MB**. It raises out of the *read loop*, so it does not
+fail the tool call — it ends the whole turn. A user lost a 37-minute analysis to it
+because the model read back a chart it had just drawn, which is a reasonable thing to
+do and had already caught two real layout bugs.
+
+Three changes, because no one of them is sufficient:
+
+- **`MAX_BUFFER_SIZE` = 16 MB** (`DATAFYE_AGENT_MAX_BUFFER_SIZE`), passed as
+  `max_buffer_size`. Far above any legitimate result, still finite — an unbounded cap
+  would trade a lost turn for a lost process.
+- **`guard_oversized_read`**, a `PreToolUse` hook on `Read`, refuses a file at or above
+  **half** the buffer before it is read, and tells the model what to do instead
+  (`head -c`, `grep`, summarise in Python, check an image's dimensions rather than
+  reading it). Half, because the framer bounds the *encoded* message: JSON escaping
+  plus the envelope exceeds the file on disk, and base64 for an image adds a third
+  again. ⚠️ **FAIL-OPEN by construction** — it runs before every `Read`, and a guard
+  that broke reading would be worse than the bug; anything unexpected allows the read.
+- **`_turn_error_message`** translates the overflow for the user. The raw text names
+  our transport and reads like data corruption, which sends people to the wrong place.
+
+⚠️ **Raising the buffer is necessary and not sufficient**, which is the point of the
+guard. Verified by driving the real transport with the pinned SDK: 2 MB dies at the 1 MB
+default, parses at 16 MB, and 20 MB still dies at 16 MB. There is always a payload big
+enough.
+
+**A current CLI already guards its own tools** — it refuses huge text files, truncates
+bash output and downsizes images — so on 2.1.226 none of the obvious vectors reproduce.
+The guard is the backstop for what that does not cover: an older bundled CLI, and
+results arriving by another route.
+
+⚠️ **The agent's harness is the SDK's BUNDLED CLI, not the one the installer puts on
+PATH.** `_find_cli` checks `claude_agent_sdk/_bundled/claude` **first** and only falls
+back to `shutil.which("claude")`. So the harness version tracks
+`claude-agent-sdk` in `requirements.txt` (`>=0.2.128,<0.3` → Claude Code **2.1.85**),
+and the installer's `/home/datafye/.local/bin/claude` is not what runs a turn. Anything
+that depends on harness behaviour must be verified against the *bundled* binary.
+
 ### Long environment commands run in the foreground (DAT-203)
 
 `main.py` raises the harness's `BASH_MAX_TIMEOUT_MS` to **30 minutes**. That single
@@ -136,13 +176,17 @@ rather than leaving a prohibition the surface ignores — the fourth instance of
   honored instead of silently clamped.
 - **A request above the ceiling is clamped, not refused** — which is why the old
   600s cap was invisible: asking for 900s got you 600s and no error.
-- **Verified against the real CLI**, both directions: with the cap at 15s a 40s
-  command requested at `timeout: 600000` backgrounded at 15s; with the cap at 30
-  minutes the same command finished in the foreground. ⚠️ Some published reports
-  claim these env vars are inert — they are honored on the CLI tested (2.1.226).
-  **The CLI is unpinned and `install_template.sh` skips the install when a binary
-  already exists**, so a box's harness version can drift and never move again;
-  re-check this if backgrounding reappears.
+- **Verified against a real CLI**, both directions: with the cap at 15s a 40s command
+  requested at `timeout: 600000` backgrounded at 15s; with the cap at 30 minutes the
+  same command finished in the foreground; and a 660s command — past the old 600s cap —
+  ran to completion in the foreground.
+- ⚠️ **Verified on PATH CLI 2.1.226, but the agent runs the SDK's BUNDLED CLI** (see
+  DAT-204 above: `_find_cli` prefers `_bundled/claude`). For the current pin that is
+  **2.1.85**, an older build, and some published reports claim these env vars are inert
+  in some versions. The bundled binary could not be exercised on the dev Mac (its Bun
+  build needs AVX), so **this specific claim is unverified on the version that will
+  actually run** — confirm on a box, or by checking whether a long command still gets
+  backgrounded there.
 - **The prompt covers the residual case.** If a command is backgrounded anyway, the
   model is told to treat it as still running, to never start a second environment
   command, and to establish whether it finished from the DAT-183 marker
@@ -455,6 +499,7 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
+| `DATAFYE_AGENT_MAX_BUFFER_SIZE` | `16777216` | The SDK's `max_buffer_size` (DAT-204) — the largest single message accepted off the CLI's stdout. The SDK default of 1 MB is small enough for one chart to exceed, and exceeding it ends the **turn**, not just the tool call. `READ_REFUSE_BYTES` (half this) is where `guard_oversized_read` refuses a `Read` outright |
 | `DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS` | `1800000` | The value `main.py` puts in the harness's own `BASH_MAX_TIMEOUT_MS` (DAT-203) — the ceiling on how long a foreground Bash command may run before the harness moves it to the background. 30 minutes, clearing the ~17-minute cold provision. A pre-set `BASH_MAX_TIMEOUT_MS` wins over both. See *Long environment commands run in the foreground* |
 
 ### Presence: a reading user is still a user (DAT-169)

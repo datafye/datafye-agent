@@ -692,6 +692,65 @@ skips it entirely when a binary already exists** — so a box's harness can be a
 was current the day it was built, and it will never move again. A fix that depends on harness
 behavior sits on ground that drifts per box.
 
+### The Turn That Died Because It Looked At Its Own Work (DAT-204)
+
+A user spent thirty-seven minutes on an earnings analysis. At the end of it the model
+read back a chart it had drawn, to check the layout — a habit that had already caught two
+real collisions in that same session. The turn died on the spot, with an error about JSON
+and a buffer size. The next message came back "Could not reach the agent". Only the second
+retry recovered, and the work survived only because the analysis had been written to files
+along the way.
+
+The mechanism is unglamorous. The CLI writes one JSON message per line; the SDK frames
+those lines and refuses any single message larger than a megabyte. The refusal is raised
+out of the **read loop** — not out of the tool call. So it does not fail the read and let
+the model try something else; it ends the conversation's turn and everything in it.
+
+**The blast radius did not match the mistake**, and that is the part worth generalising. A
+tool call is a small, recoverable unit: it can fail, the model reads the failure, adapts,
+continues. A turn is a large, unrecoverable one. This bug took an error that belonged to
+the first category and reported it in the second, and the cost of the mismatch was
+everything the user had done that hour rather than one wasted step.
+
+Three changes, because none of them is enough alone.
+
+**Raise the ceiling.** Sixteen megabytes instead of one — far above any legitimate result.
+This makes the reported incident impossible. It is also, on its own, a false comfort: a big
+enough payload still blows any finite cap, and the cap has to stay finite or a runaway
+result trades a lost turn for a lost process. Verified rather than assumed, by driving the
+real transport: two megabytes dies at the default and passes at sixteen, and twenty
+megabytes still dies at sixteen. There is always a payload big enough.
+
+**Refuse before you read.** A `PreToolUse` hook checks a file's size and, past half the
+buffer, denies the read with a message explaining what to do instead — `head -c` a log,
+summarise a data file in Python, check an image's dimensions rather than reading the image.
+A denial costs one tool call; the alternative costs the turn. The threshold is *half* the
+buffer rather than the whole of it because the framer bounds the encoded message: JSON
+escaping and the envelope make it bigger than the file on disk, and base64 for an image
+adds a third again. Half absorbs both without arithmetic that goes stale the moment the
+envelope changes.
+
+⚠️ **The hook fails open, deliberately.** It runs before every single `Read`. A guard that
+breaks reading would be far worse than the bug it prevents, so an unstattable path, an
+unfamiliar input shape, a permission error — all of them allow the read and let the CLI
+decide, exactly as before the guard existed. When you insert yourself into a hot path, the
+question is not "is my check correct" but "what happens when my check is wrong".
+
+**And say something true when it happens anyway.** The raw error names our transport and
+reads like data corruption, which sends the reader looking in entirely the wrong place. It
+now says that a step produced more output than one message can carry, that anything already
+written to files is safe, and to ask for a smaller piece. Everything else keeps its own
+wording, because a message that is merely technical beats one that is confidently wrong.
+
+**A postscript that changed what we thought we were fixing.** None of the obvious vectors
+reproduce on a current CLI — it already refuses huge text files, truncates bash output and
+downsizes images. Chasing why led somewhere more useful: `_find_cli` prefers the CLI
+**bundled inside the SDK** over anything on `PATH`. So the harness version is not the one
+the installer carefully installs; it is whatever `claude-agent-sdk` pins in
+`requirements.txt`. A whole class of "why does the box behave differently from my laptop"
+lives in that gap, and we had been reasoning about the wrong binary — including, one commit
+earlier, in this very repository's notes about DAT-203.
+
 ### A Note on Where All This Stands
 
 The whole arc above — the graceful stop, derived readiness, intent through the model, the
