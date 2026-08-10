@@ -108,6 +108,46 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### Showing the user an app the model built (DAT-202)
+
+Sutra's refine-preview mechanism, reused rather than reinvented: a **reserved port
+band** the jump server routes straight through, so there is no per-app route to
+register, nothing to allocate centrally and nothing to leak.
+
+- **`https://<username>.app.datafye.io:<port>`**, port from
+  `DATAFYE_AGENT_APP_PORT_RANGE` (`8080-8089`). Host is
+  `DATAFYE_AGENT_APP_PREVIEW_HOST`; the base is composed **per turn** in `main.py`
+  because it needs the bootstrapped username.
+- **`.datafye-app.json`** in the project folder — `{"name": …, "port": …}` — is
+  what makes the app a warm signal. `warmth.running_apps()` reports each as
+  **`compute:<name>`**, finally filling the label space DAT-184 reserved.
+
+⚠️ **A marker is a claim; a listening port is the fact.** Only markers whose port
+actually answers are reported, so a crashed app or an abandoned marker stops
+keeping the box awake by itself. That self-healing is why this is a probe and not
+a registry — nothing has to be reliably cleaned up.
+
+⚠️ **Probe BOTH loopback and the private IP** — this is the RUMI-369 lesson, not
+belt-and-braces. An app bound only to the private interface is reachable through
+the jump server and is a real running app, but a loopback-only check calls it dead
+and the box gets stopped while the user is looking at it.
+
+⚠️ **The URL is NOT authenticated, and that is the decision, not an oversight**
+(Girish, 2026-08-10): auth is driven by the user and baked into the app the model
+builds. The prompt therefore tells the model plainly that anyone with the URL can
+open it, that protection must go *inside* the app if the content warrants it, and
+to say what it did and did not protect. Sutra's band has the same posture today.
+
+⚠️ **Self-hosted agents get no URL.** With no jump server there is no external
+route, so an empty preview host makes the prompt describe the app as local-only
+rather than handing the user a link that cannot resolve.
+
+⚠️ **The jump-server half is NOT in this repo and is not done.** nginx must route
+`<username>.app.datafye.io:8080-8089` → `<username>.rumi.local:<port>` and the
+jump SG must allow the band. Note both `datafye-accounts` and `nvx-accounts` pass
+`proxyInfo = null` at launch, so neither wires a band today — this is a bastion
+config change, not an accounts code change.
+
 ### Node is installed, project-local by default (DAT-201)
 
 Node **v24.19.0 LTS ("Krypton")** plus npm and npx, from the official tarball into

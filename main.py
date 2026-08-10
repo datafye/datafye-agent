@@ -144,6 +144,14 @@ DATAFYE_DEPLOYMENT_API_URL = os.getenv(
 # MCP servers (optional, for additional tooling)
 MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
 
+# The hostname the jump server routes to this box (DAT-202). An app the model
+# builds is reachable at https://<username>.<this>:<port> for a port in the
+# reserved band, matching the wildcard block that already routes
+# <username>.app.datafye.io to the agent. CLEAR IT on a self-hosted agent: with
+# no jump server there is no external route, and the prompt then tells the model
+# its app is local-only rather than handing the user a link that cannot resolve.
+APP_PREVIEW_HOST = os.getenv("DATAFYE_AGENT_APP_PREVIEW_HOST", "app.datafye.io")
+
 # The agent runs a single, explicit memory model (see memory.py + conversations.py):
 # global notes/index under the state root, per-strategy CLAUDE.md + memory/ in each
 # strategy folder. The claude CLI that the SDK spawns has its OWN auto-memory feature,
@@ -1653,6 +1661,14 @@ async def stream_agent_response(
         # rather than inferred, so the model is told a provision is in flight
         # instead of discovering it by colliding with one.
         foundry_status=describe_for_model(read_foundry_state()),
+        # Where an app the model builds becomes reachable (DAT-202). Composed
+        # here rather than read as config because it needs the username, which
+        # only exists after bootstrap. Empty until then, and empty forever on a
+        # self-hosted agent with no jump server in front of it -- in which case
+        # the prompt says the app is local-only instead of promising a URL that
+        # would 404.
+        app_preview_base=(f"https://{AGENT_USERNAME}.{APP_PREVIEW_HOST}"
+                          if AGENT_USERNAME and APP_PREVIEW_HOST else ""),
     )
 
     options = ClaudeAgentOptions(

@@ -35,6 +35,19 @@ _QUANT_STACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # check, which is recoverable; overstating it makes the model assume, which is not.
 _QUANT_STACK_FALLBACK = "pandas, numpy, scipy, matplotlib"
 
+# The port band an app the model builds must bind to (DAT-202), mirroring Sutra's
+# refine-preview band rather than inventing a second mechanism. The jump server
+# routes this band straight through to the box, so there is no per-app route to
+# register and nothing to leak. The BASE URL is not here: it depends on the
+# username, which only exists after bootstrap, so main.py computes it per turn.
+APP_PORT_RANGE = os.getenv("DATAFYE_AGENT_APP_PORT_RANGE", "8080-8089")
+# Kept in step with warmth.APP_MARKER by importing it, so the prompt cannot tell
+# the model to write a filename the warm signal does not look for.
+try:
+    from warmth import APP_MARKER
+except Exception:      # warmth pulls httpx; keep prompt importable without it
+    APP_MARKER = ".datafye-app.json"
+
 
 def _quant_stack() -> str:
     """The pre-installed packages, as prose for the prompt."""
@@ -59,6 +72,7 @@ def build_system_prompt(
     files_context: str = "",
     cheatsheet_path: str = "",
     foundry_status: str = "",
+    app_preview_base: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
 
@@ -74,6 +88,24 @@ def build_system_prompt(
         bash_ceiling_minutes = 10
 
     quant_stack = _quant_stack()
+
+    # Where a built app becomes reachable (DAT-202). Empty host = no jump server
+    # in front of this box (a self-hosted agent), and then there is no URL to
+    # promise -- so the whole capability is described as local-only rather than
+    # dangling a base URL that would 404.
+    app_marker = APP_MARKER
+    if app_preview_base and APP_PORT_RANGE:
+        app_band_line = (
+            f" Your apps are reachable at {app_preview_base}:<port>, where <port>\n"
+            f"   is one of {APP_PORT_RANGE} — the jump server routes that band straight\n"
+            f"   through to this box. To publish an app:"
+        )
+    else:
+        app_band_line = (
+            " ⚠️ This box has no external route, so an app you start is reachable\n"
+            "   only from the box itself. Say so rather than implying a link; you can\n"
+            "   still build and test one locally. To keep the box awake while it runs:"
+        )
 
     # The resource guard: always-on core rules, plus a pointer to the bundled
     # cheat sheet (per-unit rates, formula, OOM guard, instance-size map, examples).
@@ -233,6 +265,24 @@ CAPABILITIES:
    installing anything. A global `npm install -g` also works and goes to your own
    `~/.npm-global` — nothing here needs root, and if you hit a permission error
    writing to `/opt` you have run it from the wrong place.
+
+   SHOWING THE USER SOMETHING YOU BUILT.{app_band_line}
+     - Bind the app to a port in that band, on 0.0.0.0 — bound only to
+       127.0.0.1 it works on this box and is invisible to the user, which is the
+       most common way this goes wrong.
+     - Write `{app_marker}` in the PROJECT FOLDER, containing
+       `{{"name": "<short name>", "port": <port>}}`. That marker is what stops
+       the box being idle-stopped while the user has your app open. No marker
+       means their dashboard dies under them mid-look.
+     - Give the user the full URL. They cannot guess the port.
+     - ⚠️ THE URL IS NOT PROTECTED. Anyone who has it can open the app, so if it
+       shows anything sensitive you must build the protection INTO the app —
+       a password, a token in the path, whatever fits — and tell the user plainly
+       what you did and did not protect. Do not assume a login exists around it.
+     - Stop the app and delete the marker when it is no longer wanted. A marker
+       whose port is dead is ignored, so a crash cleans itself up, but leaving
+       one behind for a live app you have abandoned keeps the box awake for
+       nothing.
 
    ⚠️ There is no pre-installed JavaScript framework, so a first `npm install`
    fetches from the network and is not instant. For something small, plain HTML
