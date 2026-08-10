@@ -25,6 +25,7 @@ datafye-agent/
 ├── conversations.py # Per-user strategy store — one FOLDER per strategy (meta.json + CLAUDE.md + PROJECT.md + memory/ + .claude/skills/)
 ├── memory.py        # Cross-session memory: global store + the memory-protocol block injected into the prompt
 ├── skills.py        # Skill plugin wiring (system + user-global plugins) and GET /v1/skills listing
+├── warmth.py        # Warm signal: is real work in flight (feeds /health active_proxied_apps)
 ├── paths.py         # Single agent state-root (DATAFYE_AGENT_STATE_DIR) all per-user state derives from
 ├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
 ├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
@@ -399,6 +400,9 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_SYSTEM_PLUGIN_DIR` | `<app>/plugins/datafye` | Read-only system-skill plugin (ships with the app clone) |
 | `DATAFYE_AGENT_USER_PLUGIN_DIR` | `<state>/plugins/user` | Writable user-global skill plugin (agent authors skills here) |
 | `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | `1` (set by the agent) | Disables the `claude` CLI's own auto-memory so the agent runs ONE explicit memory model (see Key Design Decisions). Not a `DATAFYE_` var; `os.environ.setdefault` in main.py, overridable |
+| `DATAFYE_AGENT_WARM_DATA_WINDOW` | `600` | How recent a service's activity must be for the environment to count as working. A third of the 30-minute idle threshold, so it can never dominate the dormancy decision |
+| `DATAFYE_AGENT_WARM_REFRESH_INTERVAL` | `60` | Seconds between warm-signal probes. Cached so `/health` never waits on the deployment |
+| `DATAFYE_AGENT_WARM_PROBE_TIMEOUT` | `15` | Bound on the aggregate activity call |
 | `DATAFYE_AGENT_FOUNDRY_OBSERVE_INTERVAL` | `60` | Seconds between background foundry observations. `/health` serves the latest snapshot rather than probing on the request |
 | `DATAFYE_AGENT_FOUNDRY_PING_TIMEOUT` | `40` | Bound on the per-dataset health ping. Deliberately ABOVE the deployment API's own 30s reply timeout: a dead service makes the API wait that long, and bounding below it would turn every partial environment into "not answering at all" |
 | `DATAFYE_AGENT_RUN_DIR` | `~/.datafye/run` | The CLI's run directory, where the DAT-196 lock and the DAT-183 in-progress markers live. Read (never written) to tell whether an environment operation is in flight. Not under the agent state root — it belongs to the environment, which outlives this process |
@@ -407,6 +411,27 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
+
+### The warm signal: why a box refuses to sleep (DAT-184)
+
+Accounts' idle monitor stops a box nobody has **chatted with** for 30 minutes. That is the wrong question, and on u1 it stopped a sandbox **sixteen minutes into a foundry provision** — nobody had typed anything, so by the only measure available the box was idle. It was not. On wake `--restart unless-stopped` restored the containers with the applications never deployed.
+
+`warmth.active_work()` fills `/health`'s `active_proxied_apps`, which accounts **already** treats as busy in both places that matter (`agentBusy`, the pre-stop re-check; and `idleSnapshot`, the admin countdown). The plumbing was live and inert the whole time — the agent had always sent `[]`. **Filling the existing field rather than adding one means no accounts change and no coordinated deploy.** Values are self-describing (`env:data-flowing`, `env:provision`) because they surface raw in the admin panel and in logs, where a bare `true` tells an operator nothing about *why*.
+
+Two signals today:
+
+- **Data flowing** — one call to `GET /deployment/activity?activeWithinSeconds=N`, which fans out across every deployed dataset's feed/agg/history/reference **inside the platform** and returns a single verdict against the window we supply. The agent does not fan out over HTTP, and no threshold is baked into the platform. Cached and refreshed on a timer, never on the `/health` path.
+- **A lifecycle command in flight** — the DAT-183 marker with a liveness check, read **live** rather than cached: it is a couple of small local files, and this is the signal covering a 17-minute provision, where being a minute stale at the wrong moment is exactly the u1 failure. **A hung command counts as warm on purpose** — a box with a wedged CLI is precisely the one you want left running so somebody can log in and find out why.
+
+The third category from the ticket — compute the agent started outside a turn — reports nothing, because **there is none to report**: `prompt.py` forbids background execution outright after a backgrounded provision was orphaned with its session (DAT-185), and a turn in flight is already reported as `running_jobs`. The `compute:<name>` label space is reserved for when the agent can run and expose a long-lived app (DAT-202).
+
+Three decisions worth not relitigating:
+
+- **⚠️ An idle or empty foundry reports nothing**, and it falls out of the definition rather than needing a carve-out: an empty foundry has no datasets, so no service reports activity. If merely having containers up kept a box awake, **dormancy would stop saving anything at all** — every provisioned sandbox in the fleet would be permanently warm. Verified live against a running, provisioned, idle Synthetic foundry: `active_work() == []`.
+- **⚠️ Unreachable is not warm.** "I could not look" must not pin a box awake indefinitely on a probe that may never recover; it matches how accounts treats an agent *it* cannot reach. The case this looks like it loses — a box mid-provision whose API is not up yet — is covered by the in-flight signal, which is local and needs nothing to answer.
+- **The window is a third of the idle threshold** (`DATAFYE_AGENT_WARM_DATA_WINDOW`, 600s vs 30 min), chosen against it rather than picked: long enough that no gap inside genuinely continuous work (a live feed, a replay advancing clock ticks, a fetch reporting progress) reads as cold, short enough that it can never dominate the dormancy decision.
+
+**⚠️ Observation must never count as activity** — the platform guarantees this on its side (health pings, fetch-status polls and the activity reads themselves do not bump the signal, pinned by its own live test), which is what makes it safe to poll this once a minute forever. Without that, the accounts monitor's own polling would keep the entire fleet warm.
 
 ### Foundry readiness is DERIVED, not stored (DAT-198)
 
