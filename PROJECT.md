@@ -692,6 +692,65 @@ skips it entirely when a binary already exists** — so a box's harness can be a
 was current the day it was built, and it will never move again. A fix that depends on harness
 behavior sits on ground that drifts per box.
 
+### One Line of `pip install`, and What It Was Really About (DAT-210)
+
+The per-project Python environment worked exactly as designed. The model made a venv,
+found pandas, numpy, scipy and matplotlib waiting for it, and got straight to work.
+Then it did this:
+
+```
+./.venv/bin/pip install -q requests
+```
+
+An HTTP client. Needed by every single REST call to our own API. Absent. A few seconds
+on a fast box, minutes behind a proxy or on a cold cache — and paid again in every new
+project, before the user's first question gets any attention.
+
+Adding it is a one-word change. The interesting question is why the model had to find
+out by failing, and the answer is that **two things had to agree and nothing made them
+agree**: a list in a shell installer, and a sentence in a prompt describing that list.
+They were written at different times by different reasoning, and nothing but care kept
+them in step.
+
+So they now read the same file. `install/quant-stack.txt` is the list; the installer
+installs from it, and the prompt renders from it. Adding a package is one line in one
+place.
+
+**The drift is asymmetric, and that shapes the fallback.** Telling the model something
+is installed when it is not costs a failed import and a retry — annoying, recoverable.
+Telling it something is absent when it is present costs a pointless install in every
+project forever. Both are bad, but they are not equally bad, so when the file cannot be
+read at all the prompt names only the original four rather than guessing at the current
+list. **Understating makes the model check; overstating makes it assume.** Where you
+cannot be right, be wrong in the direction that gets corrected.
+
+The other half was deciding what else belongs. The ticket floated `pyarrow`,
+`statsmodels` and `tabulate`, and the temptation with a list like that is to take all of
+it — each one is defensible in isolation, and disk is cheap. Except it is inherited by
+every project on a box with a single root volume, so "each one is defensible" is exactly
+how a 292 MB baseline becomes a gigabyte.
+
+Measuring instead of arguing took four minutes and settled it:
+
+| package | incremental |
+|---|---|
+| `requests` | 4 MB |
+| `tabulate` | 0 MB |
+| `statsmodels` | 55 MB |
+| `pyarrow` | **132 MB** |
+
+`requests` and `tabulate` are free and evidenced — the second because
+`DataFrame.to_markdown()` raises without it, and an agent whose output is a chat message
+wants markdown tables. `pyarrow` is 45% again on top of the entire baseline for a
+storage format we do not need when CSV works. `statsmodels` was never actually reached
+for; it just sounded plausible for a trading product.
+
+Both omissions are now **stated in the prompt**, which matters more than the omission
+itself: an absent package the model knows about is a `pip install` it can make
+deliberately, while an absent package it does not know about is a failed import and a
+guess about whether the environment is broken. The measured numbers live in the file, so
+the next person to want `pyarrow` argues with figures rather than re-deriving them.
+
 ### The Confidently Wrong Lesson (DAT-209)
 
 An agent looking at a broken environment said this:

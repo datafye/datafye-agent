@@ -108,6 +108,41 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### The quant stack has one source of truth (DAT-210)
+
+`install/quant-stack.txt` lists the packages installed into the **system**
+interpreter for project code. The installer installs exactly those, and `prompt.py`
+reads **the same file** to tell the model what it already has. Adding a line there
+is the whole change.
+
+The drift it prevents is asymmetric, which is why they share a file rather than
+being kept in step by hand: telling the model a package is present when it is not
+costs a failed import and a retry, while telling it a package is absent when it is
+present costs a pointless install on every project. `requests` was the second case
+made real — the model's first act in a data project was `pip install requests`, per
+project, on a box that may sit behind a proxy.
+
+**Added:** `requests` (+4 MB — every REST call to our own API needs an HTTP client)
+and `tabulate` (+0 MB — `DataFrame.to_markdown()` raises without it, and this agent
+presents findings as markdown tables).
+
+⚠️ **Deliberately absent, and the prompt says so** rather than leaving the model to
+find out: `pyarrow` (+132 MB, ~45% again on top of the 292 MB baseline, for a
+storage-format convenience when CSV works) and `statsmodels` (+55 MB, speculative —
+no evidence it was reached for, and `scipy.stats` covers the common tests). Both are
+one `pip install` away inside a project venv, which is what that venv is for. The
+measured costs are recorded in the file so a future addition can be argued with
+numbers rather than taste — the list is inherited by every project and paid for in
+image size on a single root volume (DAT-178).
+
+⚠️ **The fallback deliberately UNDERSTATES.** If the file cannot be read, `prompt.py`
+names only the original four. Understating makes the model check, which is
+recoverable; overstating makes it assume, which is not.
+
+**Existing boxes need no venv rebuild** — project venvs are built with
+`--system-site-packages`, so a re-run installer adds the packages to the system
+interpreter and every existing project inherits them immediately.
+
 ### Fleet memory is seeded, and a wrong rule is harder to write (DAT-209)
 
 Diagnosing a broken environment, an agent concluded *"the SIP container logs are
