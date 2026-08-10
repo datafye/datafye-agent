@@ -631,10 +631,72 @@ you meet it: a rule whose enforcement lives in a component you do not control is
 convention, not a guarantee, and the only defence is to write it down where both halves
 can see it.
 
+### The Rule We Wrote Down Three Times and Still Broke (DAT-203)
+
+There is a rule this codebase keeps rediscovering: **never offer, or forbid, a capability
+the surface does not actually control.** It was learned from `AskUserQuestion` (offered to
+the model, no UI to answer it, so questions vanished), then from the `Task` family (offered,
+but a subagent does not inherit the prompt), and then from background execution — where the
+prompt had *suggested* `&` and `nohup`, the agent took the suggestion, and a provision was
+orphaned when the session ended. That third one was fixed by writing an absolute prohibition
+into `prompt.py`: never background anything, no exceptions, three reasons given.
+
+The prohibition was correct, well-argued, and could not possibly work.
+
+Because the thing doing the backgrounding was never the model. When a Bash command outlives
+its timeout, the harness does not kill it — it **moves it to the background**, returns a
+task id and an output file, and lets the turn carry on. No rule addressed to the model can
+prevent that; the model isn't the actor. We had written a rule governing the wrong party and
+then relied on it.
+
+What that costs is visible in a real incident. On u1 the model ran `start`, the harness
+backgrounded it at the 600-second default, and the returned message — a timeout notice — is
+very nearly indistinguishable from completion. The model had no way to check: there is no
+`BashOutput` here, no `KillShell`, and the `Task` tools are deliberately absent. So it polled
+the output file, saw nothing (these commands go long stretches without writing), concluded
+the operation was done, and fired `apply` on top of a `start` that was still running. Both
+failed. The environment was destroyed twice over.
+
+The fix turned out to be one environment variable. The 600 seconds was never a hard limit —
+it is the *default* of `BASH_MAX_TIMEOUT_MS`, and it is configurable. Raising it to thirty
+minutes, comfortably past the seventeen-minute cold provision, means the harness has no
+reason to background the command in the first place.
+
+That is the shape worth keeping. **When a prohibition fails, check whether you were
+prohibiting the right actor** — the durable fix removes the *reason* for the behavior rather
+than adding another sentence forbidding it. The prompt rule stays, because the model
+genuinely should not detach things; it just no longer has to carry weight it was never able
+to bear.
+
+Three details, each a small lesson of its own.
+
+**Only the ceiling moves, not the default.** `BASH_DEFAULT_TIMEOUT_MS` applies to *every*
+command, so raising it would mean an ordinary hung command — a curl to a dead host — blocks
+the turn for half an hour. The ceiling is opt-in: it only takes effect when the model asks
+for a long allowance, which the prompt tells it to do for environment work specifically. A
+limit and a default are different knobs, and the temptation to move them together is how you
+turn a targeted fix into a general liability.
+
+**The old cap was invisible because it clamped instead of refusing.** Asking for 900 seconds
+under a 600-second ceiling got you 600 seconds and no error at all. Silent clamping is the
+same failure mode as the empty output file and the hardcoded `active_proxied_apps: []`
+elsewhere in this system: a value that is *plausible* is far more expensive than one that is
+obviously broken, because nothing prompts anyone to look.
+
+**And it was verified, not reasoned about.** Published reports claim these variables are
+inert in some versions, so the behavior was tested against the actual binary in both
+directions: with the cap below the command's runtime it backgrounded exactly at the cap, and
+with the cap above it the same command ran to completion in the foreground. That check
+matters more than usual here, because ⚠️ **the Claude Code CLI is unpinned and the installer
+skips it entirely when a binary already exists** — so a box's harness can be any version that
+was current the day it was built, and it will never move again. A fix that depends on harness
+behavior sits on ground that drifts per box.
+
 ### A Note on Where All This Stands
 
 The whole arc above — the graceful stop, derived readiness, intent through the model, the
-warm signal, and the presence heartbeat — is **merged, but not yet released**. The agent
+warm signal, the presence heartbeat, and the foreground-command ceiling — is **merged, but
+not yet released**. The agent
 changes travel in an agent release, so a fleet box only gets them when that release is
 published and the auto-upgrade picks it up. Until then the code is true of the repository
 and not yet true of any sandbox, which is a distinction this project has learned to state

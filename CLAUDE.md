@@ -108,6 +108,49 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### Long environment commands run in the foreground (DAT-203)
+
+`main.py` raises the harness's `BASH_MAX_TIMEOUT_MS` to **30 minutes**. That single
+env var is the whole fix, and what it prevents is worth stating precisely.
+
+**The harness does not kill a command that outlives its timeout — it BACKGROUNDS
+it.** The tool returns `Command did not complete within its Ns timeout and was moved
+to the background`, hands back a task id and an output file, and the turn continues.
+To a model that message is nearly indistinguishable from completion, and the agent
+has no `BashOutput`, no `KillShell` and no `Task` tool with which to await the thing.
+On u1 that is exactly what happened: a `start` was backgrounded at the 600s default,
+looked finished, and an `apply` was fired on top of it. Both failed and the
+environment was destroyed.
+
+**⚠️ `prompt.py` forbidding background execution (DAT-185) could never have fixed
+this.** That rule governs the *model*; the *harness* backgrounds on its own, whatever
+the prompt says. Raising the ceiling removes the harness's REASON to background
+rather than leaving a prohibition the surface ignores — the fourth instance of
+*never offer, or forbid, a capability the surface does not control*, after
+`AskUserQuestion`, the `Task` family, and backgrounding itself.
+
+- **Only the MAX moves.** `BASH_DEFAULT_TIMEOUT_MS` stays at the harness default of
+  2 minutes, because it applies to *every* command — an ordinary one that hangs
+  would otherwise block a turn for half an hour. The prompt tells the model to pass
+  an explicit generous timeout; the raised ceiling is what makes that request
+  honored instead of silently clamped.
+- **A request above the ceiling is clamped, not refused** — which is why the old
+  600s cap was invisible: asking for 900s got you 600s and no error.
+- **Verified against the real CLI**, both directions: with the cap at 15s a 40s
+  command requested at `timeout: 600000` backgrounded at 15s; with the cap at 30
+  minutes the same command finished in the foreground. ⚠️ Some published reports
+  claim these env vars are inert — they are honored on the CLI tested (2.1.226).
+  **The CLI is unpinned and `install_template.sh` skips the install when a binary
+  already exists**, so a box's harness version can drift and never move again;
+  re-check this if backgrounding reappears.
+- **The prompt covers the residual case.** If a command is backgrounded anyway, the
+  model is told to treat it as still running, to never start a second environment
+  command, and to establish whether it finished from the DAT-183 marker
+  (`~/.datafye/run/cli-*.json`) rather than from an output file — an empty file
+  reads exactly like a job that never started.
+- **Dormancy cannot cut it off**: a command in flight is reported warm through the
+  same marker (`warmth.py`), so the box stays up for the full 30 minutes.
+
 ### Foundry reconciliation at boot (DAT-199)
 
 Every box, in every installer mode, reconciles its foundry on **every boot** through
@@ -412,6 +455,7 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
+| `DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS` | `1800000` | The value `main.py` puts in the harness's own `BASH_MAX_TIMEOUT_MS` (DAT-203) — the ceiling on how long a foreground Bash command may run before the harness moves it to the background. 30 minutes, clearing the ~17-minute cold provision. A pre-set `BASH_MAX_TIMEOUT_MS` wins over both. See *Long environment commands run in the foreground* |
 
 ### Presence: a reading user is still a user (DAT-169)
 

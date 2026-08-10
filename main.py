@@ -152,6 +152,40 @@ MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
 # Overridable by pre-setting it in the environment.
 os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 
+# How long a foreground Bash command may run before the harness gives up on it
+# (DAT-203). The harness does not KILL a command that outlives its timeout -- it
+# moves it to the BACKGROUND, hands back a task id and an output file, and lets
+# the turn continue. That is the failure this raises the ceiling to avoid: the
+# model cannot tell a still-running operation from a finished one, so on u1 it
+# fired `apply` on top of a `start` that was still going and destroyed the
+# environment.
+#
+# ⚠️ The fix is the CEILING, not a rule telling the model to wait. `prompt.py`
+# forbids backgrounding outright (DAT-185) and cannot enforce it -- the harness
+# backgrounds on its own, whatever the prompt says. Raising the ceiling above the
+# longest operation removes the harness's REASON to background rather than
+# leaving a prohibition the surface ignores. Same lesson as `AskUserQuestion` and
+# the `Task` family: never forbid what you do not control.
+#
+# 30 minutes clears the ~17-minute measured cold provision with real headroom for
+# a loaded box. The box stays awake for it: a provision in flight is reported as
+# warm through the DAT-183 marker (see warmth.py), so dormancy cannot stop the
+# instance underneath a long command.
+#
+# ⚠️ Only the MAX is raised. BASH_DEFAULT_TIMEOUT_MS is deliberately left at the
+# harness default of 2 minutes, because it applies to EVERY command -- an
+# ordinary one that hangs (a curl to a dead host) would otherwise block the turn
+# for half an hour. The prompt tells the model to pass an explicit generous
+# timeout for environment operations, and this ceiling is what makes that
+# request honored rather than silently clamped to 600000.
+#
+# Verified against the claude CLI: a 40s command requested with timeout=600000
+# backgrounds at the cap when the cap is below it, and completes in the
+# foreground when the cap is above it. ⚠️ The CLI is unpinned and only installed
+# when absent, so a box's harness version can drift -- re-check this if
+# backgrounding reappears.
+os.environ.setdefault("BASH_MAX_TIMEOUT_MS", os.getenv("DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS", "1800000"))
+
 
 def check_api_mcp_reachable(url: str, timeout: float = 2.0) -> bool:
     """Cheap TCP reachability check for the Datafye API MCP server.

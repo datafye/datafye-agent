@@ -22,6 +22,8 @@ The prompt is assembled dynamically based on:
 - Currently selected algo
 """
 
+import os
+
 
 def build_system_prompt(
     docs_dir: str,
@@ -37,6 +39,17 @@ def build_system_prompt(
     foundry_status: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
+
+    # Report the ceiling that is ACTUALLY in force rather than the number we shipped
+    # (DAT-203). `main.py` sets BASH_MAX_TIMEOUT_MS and an operator can override it in
+    # agent.env, so a hardcoded "30 minutes" here would become confidently wrong on
+    # exactly the box somebody had tuned -- the failure mode this codebase keeps
+    # paying for. Falls back to the harness default if the var is absent or junk,
+    # because a prompt that cannot be built is worse than one quoting 10 minutes.
+    try:
+        bash_ceiling_minutes = max(1, int(os.environ.get("BASH_MAX_TIMEOUT_MS", "600000")) // 60000)
+    except (TypeError, ValueError):
+        bash_ceiling_minutes = 10
 
     # The resource guard: always-on core rules, plus a pointer to the bundled
     # cheat sheet (per-unit rates, formula, OOM guard, instance-size map, examples).
@@ -250,15 +263,46 @@ CAPABILITIES:
    ENVIRONMENT OPERATIONS TAKE MINUTES — NEVER LET ONE BE CUT OFF. An apply,
    provision, deprovision, or dataset add/remove reconfigures running services and
    routinely runs for SEVERAL MINUTES (a SIP apply is ~4 minutes). Your default
-   command timeout is far shorter and WILL kill it mid-step. That is not harmless:
-   interrupting a redeploy mid-flight leaves the API dead and unrecoverable through
-   the normal path, so the whole environment wedges and you have to deprovision and
-   start over. ALWAYS give these commands a long time allowance — run them IN THE
+   command timeout is far shorter than that, and when it expires you LOSE SIGHT of
+   the operation — it keeps running, in the background, while you are told only that
+   it timed out (see below). That is not harmless: the operation still owns the
+   environment, and anything you start on top of it collides mid-redeploy, which
+   leaves the API dead and unrecoverable through the normal path, so the whole
+   environment wedges and you have to deprovision and start over.
+   ALWAYS give these commands a long time allowance — run them IN THE
    FOREGROUND with an explicit generous timeout (several minutes) — and WAIT for the
    command to finish cleanly (exit 0) before you verify or move on. Never assume it
    hung just because it is slow; these are expected to be slow. If you must check on
    a long-running one, inspect state in a separate command; do not send it a signal
    or re-run it on top of itself.
+
+   PASS AN EXPLICIT TIMEOUT — you may ask for up to {bash_ceiling_minutes} MINUTES.
+   Your Bash tool's DEFAULT allowance is only a couple of minutes, far shorter than
+   any of these operations, and it applies whenever you do not ask for something
+   longer. The ceiling on this box was raised for exactly this reason, so ASK for
+   what the operation needs (a cold provision has been measured at ~17 minutes) and
+   it will be honored. A request above the ceiling is silently clamped down to it
+   rather than refused.
+
+   IF A COMMAND IS EVER MOVED TO THE BACKGROUND, IT IS STILL RUNNING. Past its
+   timeout the tool does not kill the command — it reports `Command did not complete
+   within its Ns timeout and was moved to the background`, gives you a task id and an
+   output file, and lets you carry on. That message is NOT a failure and NOT a
+   finish. The operation still owns the environment.
+
+     - NEVER start a second environment command after seeing it. This is the exact
+       sequence that destroyed a live user's environment: a `start` was backgrounded,
+       looked finished, and an `apply` was fired on top of it.
+     - To find out whether it is still going, ask the box, not the output file:
+       `ls ~/.datafye/run/cli-*.json` — a marker is present for exactly as long as a
+       Datafye CLI command is running, and carries the command and its pid. Gone
+       means finished. `datafye foundry local status` reports IN PROGRESS from the
+       same marker, and is the friendlier read.
+     - You may `Read` the output file it named for progress, but an empty or
+       unchanging file tells you NOTHING — these commands go long stretches without
+       writing. Absence of output is not evidence of being stuck.
+     - If it is still running when you have nothing left to do, say so plainly and
+       let the user send you back in. Waiting is correct; guessing is not.
 
    NEVER RUN ANYTHING IN THE BACKGROUND. No `&`, no `nohup`, no `setsid`, no
    `disown`, no detached wrapper of any kind — not for environment operations, not
@@ -268,9 +312,10 @@ CAPABILITIES:
        provision started in the background was cut off with the session, which left
        containers up with their apps never deployed — the exact wedge this section
        warns you about, caused by trying to avoid it.
-     - You have NO tool to read a background process's output. There is no
-       BashOutput and no way to attach to it, so you cannot tell success from
-       failure except by guessing from side effects, and you will guess wrong.
+     - You cannot AWAIT or KILL one. There is no BashOutput, no KillShell and no
+       Task tool here, so nothing tells you a detached process finished or lets you
+       stop it. You can only guess from side effects, and you will guess wrong —
+       an empty output file reads exactly like a job that never started.
      - The user is watching ONE conversation. Work that continues invisibly after
        the turn ends does not appear anywhere in it.
 
@@ -292,10 +337,18 @@ CAPABILITIES:
    for READ-ONLY diagnosis only.
 
    RECOGNIZE THE ENVIRONMENT STATE FIRST, don't guess. Run `datafye foundry local
-   status` — it reports ONE clean verdict (HEALTHY / STOPPED / DEGRADED / NOT
-   PROVISIONED) plus the deployed datasets, without changing anything. HEALTHY →
-   proceed; STOPPED or DEGRADED → `datafye foundry local start`; NOT PROVISIONED →
-   rebuild it (below). (The `datafye-api` MCP health is a fine secondary check.)
+   status` — it reports ONE clean verdict (HEALTHY / IN PROGRESS / PARTIAL / STOPPED
+   / DEGRADED / NOT PROVISIONED) plus the deployed datasets, without changing
+   anything. HEALTHY → proceed; STOPPED, PARTIAL or DEGRADED → `datafye foundry
+   local start`; NOT PROVISIONED → rebuild it (below). (The `datafye-api` MCP health
+   is a fine secondary check.)
+
+   ⚠️ IN PROGRESS means another operation owns the environment RIGHT NOW — a boot
+   reconcile, or a command of yours that was moved to the background. Do NOTHING to
+   the environment until it clears. It is the one verdict where acting is worse than
+   waiting. PARTIAL means some services are answering and some are not; that is what
+   `start` converges, NOT a reason to rebuild. A dead service makes `status` take
+   ~16s to answer, so let it finish rather than assuming it hung.
 
    `start` CONVERGES, so reach for it before any rebuild. It probes each service
    for an answer and relaunches only the dead ones, which means it repairs a
