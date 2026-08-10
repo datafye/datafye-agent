@@ -205,9 +205,10 @@ sessions: dict[str, str] = {}
 # lastChatActivityAt: epoch ms of the most recent /v1/chat invocation. 0 = never.
 # runningJobs: count of in-flight chat streams. Incremented on stream start,
 #   decremented on stream completion (in tracked_stream_agent_response below).
-# activeProxiedApps: list of agent-managed app routes currently registered with
-#   the accounts service. Empty for v1 — placeholder for the future feature
-#   where the agent can stand up Jupyter etc. and ask accounts to proxy them.
+# activeProxiedApps: work in flight that must not be interrupted, computed by
+#   warmth.active_work() (DAT-184). Was a hardcoded [] placeholder until then.
+# Advanced by a chat turn AND by the presence heartbeat (POST /v1/activity),
+# so a user who is reading rather than typing still counts as present.
 # Seeded to boot time (not 0) so the accounts idle-monitor — which skips
 # last_chat_activity_at == 0 as "never active" — also idle-stops an agent that
 # was provisioned but never chatted with: idle is measured from boot, so an
@@ -2622,6 +2623,37 @@ async def foundry_intent(intent: FoundryIntent):
     return record
 
 
+@app.post("/v1/activity", status_code=204,
+          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def activity():
+    """Presence heartbeat from the SPA (DAT-169).
+
+    The accounts idle monitor measures idleness from `last_chat_activity_at`,
+    which until now advanced ONLY when a chat turn ran. So a user reading a
+    backtest result, studying a scorecard, or thinking for half an hour looked
+    exactly like a user who had closed the tab -- and their box dormed
+    underneath them.
+
+    Deliberately the same field a chat turn bumps, rather than a second one.
+    The monitor's question is "when was this box last of use to somebody", and
+    reading is as good an answer as typing; splitting it would make accounts
+    take a max over two fields for no gain.
+
+    ⚠️ This only ever PREVENTS dormancy, it never reverses it: a stopped box
+    cannot receive the heartbeat. Waking stays the auto-wake path's job.
+
+    ⚠️ The caller must send this only while its tab is VISIBLE. A hidden tab
+    that kept pinging would pin every abandoned browser session's box awake
+    forever, and dormancy would stop saving anything. The agent cannot check
+    that -- it is the frontend's half of the contract.
+
+    Cheap by construction: one assignment, no I/O. It is called on an interval
+    by every open tab, so anything more would be a per-user background load
+    that exists only to say "still here"."""
+    global last_chat_activity_at
+    last_chat_activity_at = int(time.time() * 1000)
+
+
 @app.get("/v1/skills", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def get_skills(conversation_id: Optional[str] = None):
     """List the skills available to the agent, across all tiers:
@@ -2873,6 +2905,9 @@ _REQUIRED_ROUTES = {
     # every box quietly falls back to the default, which is indistinguishable
     # from working until somebody stops their environment and it comes back.
     ("POST", "/v1/foundry/intent"),
+    # A silent 404 here means every reading user's box dorms underneath them,
+    # and the SPA cannot tell a missing endpoint from a delivered heartbeat.
+    ("POST", "/v1/activity"),
 }
 _present_routes = {
     (_m, getattr(_r, "path", None))
