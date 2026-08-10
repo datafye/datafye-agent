@@ -692,6 +692,63 @@ skips it entirely when a binary already exists** — so a box's harness can be a
 was current the day it was built, and it will never move again. A fix that depends on harness
 behavior sits on ground that drifts per box.
 
+### The Confidently Wrong Lesson (DAT-209)
+
+An agent looking at a broken environment said this:
+
+> *"The SIP container logs are completely empty, which means the apps never actually
+> launched."*
+
+It is a good inference. It is also false: Rumi services write to log files *inside*
+the container and never to stdout, so a perfectly healthy service shows an empty
+`docker logs`, exactly like one that never started. The agent acted on it — and then
+did something worse than acting on it. It **wrote the rule into its own memory**, as
+a durable lesson for next time.
+
+Two turns later it caught itself, but only by luck: a later check happened to
+contradict it.
+
+The striking part is that we already knew. The trap was written down, carefully, in a
+human-facing diagnostics note — a place the model cannot read. So it rediscovered the
+trap the expensive way, on a user's environment, and briefly institutionalised the
+opposite of the truth.
+
+**Memory turns a one-off mistake into a policy.** That is the whole hazard, and it is
+specific to systems that learn. A wrong inference costs you one turn. A wrong
+inference *written down* costs you every future turn that consults it, and it is
+applied with more confidence each time precisely because it is now "remembered"
+rather than "guessed". A durable false rule about diagnosis is worse than no rule at
+all.
+
+So the fix has two halves, and it would be incomplete with either one missing.
+
+**Give it the facts.** The fleet-memory bank had shipped as an empty scaffold since it
+was built — the feature existed and had nothing in it. It now carries the diagnostic
+traps: empty `docker logs` proves nothing; containers that are "Up" are *machines*
+running `sshd` and can be holding no applications whatsoever; the only thing that
+settles it is asking for data and seeing data; the real error is already written to
+`~/.datafye/logs` before you start theorising. Facts the model can reach beat facts it
+must re-derive, every time.
+
+**And raise the bar for writing one.** The memory protocol now separates two things
+that had been treated identically: an *observation* about this user's setup, which is
+cheap to record and cheap to be wrong about, and a *general rule* about how the
+platform behaves, which is expensive to be wrong about. A rule may not be written from
+a single observation or a plausible inference; it has to say how it was verified; and
+if fleet memory disagrees, fleet memory wins.
+
+Note the asymmetry that makes this work: **the cost of writing down a wrong rule is
+much higher than the cost of failing to write down a right one.** The right one will be
+re-derived next time at the cost of a few tool calls. The wrong one silently corrupts
+every diagnosis that follows. When the error costs are that lopsided, the correct bar
+is not "is this probably true" but "could I show someone why".
+
+A smaller thing shipped alongside, from the same session's evidence: the model had
+guessed the hostname `local-foundry-dev-api-rest.datafye.local`, which does not exist,
+and probed three candidates before finding the real one. The prompt now simply lists
+them. It is worth noticing that this is the same bug in a cheaper costume — a fact the
+system knows for certain, left for the model to reconstruct.
+
 ### The Turn That Died Because It Looked At Its Own Work (DAT-204)
 
 A user spent thirty-seven minutes on an earnings analysis. At the end of it the model

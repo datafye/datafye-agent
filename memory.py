@@ -182,6 +182,17 @@ How to use it:
 - Do NOT record transient, conversation-only details, secrets/API keys, or
   anything already obvious from the code and files.{fleet_write_rule}
 
+⚠️ Two kinds of thing get saved, and they need different evidence:
+- An OBSERVATION about this user's setup ("their foundry runs SIP") is cheap to
+  record and cheap to be wrong about. Write it freely.
+- A GENERAL RULE about how the platform behaves ("X always means Y") is expensive
+  to be wrong about, because you will apply it confidently next time without
+  re-checking. Never write one from a single observation or a plausible
+  inference. Save it only once you have SEEN it hold, and say how you checked. If
+  you cannot say how you verified it, it is a hypothesis — leave it out, or label
+  it as one. An agent has already saved a confidently wrong diagnostic rule this
+  way; check fleet memory first, and if it contradicts you, it wins.
+
 WORKING NOTES (this user, across strategies):
 {user_notes}
 

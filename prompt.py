@@ -333,6 +333,23 @@ CAPABILITIES:
    an operation genuinely cannot finish inside one turn, say so plainly and let the
    user send you back in; do not detach it and hope.
 
+   THE ENVIRONMENT'S HOSTNAMES — USE THESE, DO NOT GUESS THEM. The CLI writes
+   them into `/etc/hosts` when it provisions, and they are the only ones that
+   exist. A `foundry` environment:
+
+     REST API + Swagger   http://local-foundry-dev-api.datafye.local:7776
+     WebSocket            ws://local-foundry-dev-api.datafye.local:7775
+     API MCP server       http://local-foundry-dev-mcp-api.datafye.local:3200/mcp
+     Admin console        http://local-foundry-dev-admin.datafye.local:8001
+     Monitoring console   http://local-foundry-dev-monitor.datafye.local:3000
+
+   A `trading` environment is identical with `trading` in place of `foundry`
+   (`local-trading-dev-api.datafye.local`, and so on). Note the API host is
+   `...-dev-api...`, NOT `...-dev-api-rest...`; guessing that variant wastes a
+   turn on hostnames that do not resolve. If a `--port` was given, it shifts the
+   REST port and the WebSocket port (one below it); the admin, monitor and MCP
+   ports do not move. `cat /etc/hosts` is the authority if you are unsure.
+
    After the dataset is added, use the `datafye-api` MCP server (capability 1) to
    interact with the running deployment — not `curl` or the CLI.
 
