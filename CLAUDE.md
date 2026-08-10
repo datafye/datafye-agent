@@ -108,6 +108,45 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### Fleet memory is seeded, and a wrong rule is harder to write (DAT-209)
+
+Diagnosing a broken environment, an agent concluded *"the SIP container logs are
+completely empty, which means the apps never actually launched"* — which is false,
+because Rumi services log to files **inside** the container. It acted on that, and
+**wrote it into its own memory** as a durable lesson. It self-corrected two turns
+later only because a later check happened to contradict it.
+
+We already knew the fact. It was in a human-facing note the model could not read.
+
+Three changes:
+
+- **The bank is seeded** — `fleet_memory/diagnosing-the-environment.md` carries the
+  traps: an empty `docker logs` proves nothing, containers "Up" are *machines*
+  running `sshd` and can hold no applications at all, the only settling check is a
+  real data call, `status`'s verdicts, where the failure reports already are, and
+  `journalctl` needing sudo. This is the content DAT-176's empty scaffold existed
+  for.
+- **The prompt names the hostnames** rather than leaving them to be guessed — the
+  model had probed three candidates before finding `local-foundry-dev-api…`. The
+  `/etc/hosts` block the CLI writes is the authority; both `foundry` and `trading`
+  forms are listed, with the `-api-rest` mis-guess called out by name.
+- **The memory protocol distinguishes an observation from a rule.** An observation
+  about this user's setup is cheap to record and cheap to be wrong about. A general
+  rule about platform behaviour is expensive to be wrong about, because it gets
+  applied confidently without re-checking — so it may not be written from a single
+  observation or an inference, must say how it was verified, and loses to fleet
+  memory on conflict.
+
+⚠️ **The fleet index is paid on EVERY turn**, so the bank stays bounded: a few topic
+files rewritten as they accumulate, never one file per lesson. Seeding it moved the
+always-on memory block from ~300 to ~740 tokens; a test pins it under 1000. Bodies
+are still read on demand — only the index is always-on.
+
+⚠️ **An unseeded bank is a valid state and renders as nothing.** `build_memory_context`
+treats an index carrying only its header as empty and omits the whole scope, so the
+bank activates only once `MEMORY.md` has at least one `- ` line. A topic file added
+without its index line is invisible.
+
 ### One oversized tool result must not destroy the turn (DAT-204)
 
 The SDK frames the CLI's NDJSON stdout and refuses any single message larger than
