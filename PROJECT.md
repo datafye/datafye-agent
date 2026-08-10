@@ -218,6 +218,8 @@ Two distinctions in the reader are load-bearing, and both are the same shape: re
 
 **Reading never raises.** It sits on the `/health` path, which has to answer when everything else on the box is broken. An agent that cannot report its own health is indistinguishable from a dead instance — and telling those apart is the single thing accounts most needs.
 
+⚠️ **As of DAT-199 nothing writes that state file, so the block reports `unknown` on every box** — expected, not a defect to chase. Both writers were removed deliberately (see the postscript below and the DAT-199 story that follows), and readiness is now *derived* by whoever asks rather than stored by whoever moved last. The reader is kept because re-pointing it at the derived form is additive; wiring that up is DAT-198's remaining work.
+
 A postscript on ownership, because it cost a design round. The first implementation had the *deployment engine* record intent on every lifecycle command. It reads plausibly — the command is the thing acting — and it is wrong, with a mundane counterexample: someone SSHes in to debug, runs `stop`, and the engine writes down that this environment is meant to be stopped. The box reboots and the boot service faithfully leaves the foundry down, permanently. A debugging action promoted into standing policy. **"An operation is running" is a fact about a process; "this box should have a running foundry" is a decision somebody made** — and the component performing an action is very often not the one that decided it should happen. Desired state belongs to accounts, where the user's request actually arrives; the agent reads it and reports.
 
 ### The Foundry That Nobody Built (DAT-170)
@@ -245,11 +247,12 @@ So a brand-new sandbox had no environment, an agent that had been told not to ma
 one, and three files each describing a different system. The gap survived because
 every individual statement was plausible and no two of them were ever read together.
 
-The fix is a hosted first-boot one-shot, `datafye-foundry-firstboot.service`, running
-`install/first-boot-foundry.sh`. It provisions an empty foundry — Platform plus the
-API system, no datasets — which is precisely the state the prompt already described,
-so the prompt did not have to change; it just became true. Three decisions inside it
-are worth keeping.
+The first fix was a hosted first-boot one-shot, `datafye-foundry-firstboot.service`,
+running `install/first-boot-foundry.sh`. It provisioned an empty foundry — Platform
+plus the API system, no datasets — which is precisely the state the prompt already
+described, so the prompt did not have to change; it just became true.
+
+Three decisions inside it were right and have survived every rewrite since.
 
 **It keys on real state, not on a marker.** The obvious way to write a "first boot"
 script is to touch a sentinel file when it is done and bail out if the sentinel
@@ -258,13 +261,13 @@ marker written before the work succeeded locks the box out of ever retrying, so 
 single failed provision produces a sandbox that is permanently empty and *believes it
 has already handled that*. Instead it asks `foundry local status` whether a foundry
 is actually there. The pleasant side effect is that the unit is safe to leave enabled
-forever: an ordinary reboot, or a wake from dormancy, costs a one-second no-op, and a
-boot after a failure retries by itself.
+forever: an ordinary reboot, or a wake from dormancy, costs a fast no-op, and a boot
+after a failure retries by itself.
 
 **It runs the CLI as the `datafye` user, always.** This looks like a detail and is
 actually a trap with teeth. The `rumi` user is in `wheel` but not in `docker`, so as
-any other user `foundry local status` cannot reach the Docker socket — and it does
-not report a permission problem, it reports *"not provisioned"*. That is a confident
+any other user `foundry local status` cannot reach the Docker socket — and it did
+not report a permission problem, it reported *"not provisioned"*. That is a confident
 false negative indistinguishable from a genuinely empty box, and acting on it means
 provisioning on top of a live environment, which collides and fails. A status command
 that cannot tell "absent" from "I am not allowed to look" is worse than one that
@@ -289,6 +292,89 @@ The transferable lesson is about where truth lives. A comment describing a step 
 thing that keeps it somewhere a test or a boot will exercise — and when you find one
 claim that is wrong, go and read every other place that claims something about the
 same subject, because they will not agree either.
+
+### The Second Half of That Fix (DAT-199)
+
+The first-boot unit solved the boot it was named after and nothing else, and the two
+things it left behind turned out to matter more than the thing it fixed.
+
+The first is that it was **hosted-only**. A user who provisions their own box stops
+and starts it like anyone else, and hits the identical failure — so half the fleet
+had a mechanism and half had a comment. The second is subtler and nearly shipped as a
+disaster. A separate ticket existed for the *wake* case: restore the environment when
+a dormant box comes back. Two tickets, two obvious homes, two scripts. And on
+2026-08-09 a sandbox called u1 showed exactly what that costs: the first-boot unit
+started a provision, the agent fired a `start` three minutes into it, an `apply`
+landed on top of both, and the environment had to be rebuilt from scratch. Twice.
+**Two boot-time actors mutating one foundry was already the incident.** Adding a
+second on purpose would have moved it from every fresh boot to every wake.
+
+So the two became one: `datafye-foundry-boot.service`, installed in **every** mode,
+running on **every** boot. The rename mattered more than it sounds. "first-boot"
+described one of the two jobs the file did, and a name that disagrees with behaviour
+is precisely the drift that produced DAT-170 in the first place.
+
+**What it does not do is the interesting part.** An earlier version of this work had
+every lifecycle command write down what the environment *ought* to be. That shipped,
+and was reverted a day later, because of one scenario: an engineer SSHes into a box
+to debug something and runs `foundry local stop`. The engine dutifully records
+"intended: stopped". The box reboots. The boot service reads the record and leaves
+the foundry down — forever. A debugging action had been promoted into standing policy
+by a component with no way to tell the two apart.
+
+The line that fell out of that is worth carrying to other systems: **"an operation is
+in flight" is a fact, "this box should have a running foundry" is a policy.** The CLI
+knows the first and cannot know the second. Intent is formed where the user's request
+actually arrives — in the accounts service — and is pushed down to the box as a
+replica, never a record. So the boot service *reads* intent, *interrogates* reality,
+*reconciles*, and stores nothing at all. Absence of a recorded intent means running,
+because a sandbox exists to host a foundry, and that default is what lets the unit be
+correct today while the push half is still unbuilt.
+
+Two rules keep it from doing harm, and both are the kind you only write down after
+watching something helpful cause damage:
+
+- **Reconcile additively only.** If intent says stopped but the foundry is serving,
+  somebody started it by hand. Never tear down live work to satisfy a record.
+- **Never act while something else owns the environment**, and exit *successfully*
+  when you decline. A boot unit parked behind a seventeen-minute provision is
+  indistinguishable from a hung boot, and a red unit in `systemctl status` is a
+  signal worth reserving for the boots where something is genuinely broken.
+
+Two implementation details are worth the space because both are cases where the
+obvious thing is silently wrong.
+
+**The script cannot take the lock, and must not pretend to.** The engine's mutual
+exclusion is a Java `FileChannel.tryLock()`. The shell's equivalent is `flock`. They
+look interchangeable and are not: on Linux `tryLock` maps to **fcntl** record locks
+while `flock(1)` uses **flock(2)**, and those are *independent lock namespaces*. A
+shell `flock` on the same file succeeds against a held Java lock — mutual exclusion
+that reports success and provides nothing, which is worse than none, because now
+you believe you have it. So the script does not lock. Every operation it performs goes
+through the CLI, which takes the real lock for its duration; the script's own check is
+only a courtesy that avoids starting a command destined to be refused, and names the
+current holder in the journal. The gap between checking and acting is closed by the
+lock, not the check.
+
+**It refuses to trust a verdict it could have trusted.** `foundry local status` prints
+a tidy `Overall: HEALTHY`, and skipping the reconcile when it says so is free
+performance. It is also wrong: that verdict keys on the deployment API answering, and
+an environment with one dead service still reports HEALTHY. Taking the shortcut would
+make the unit blind to exactly the partial state it exists to repair. So the serving
+decision stays in one place — the per-service prober inside `start`, which asks each
+service for an *answer* and relaunches only the dead ones — and the only judgement the
+shell makes for itself is whether an environment exists at all. A healthy box pays a
+few seconds for that; a broken one gets fixed.
+
+The last change is one line of behaviour with a lot behind it: a fresh box is now left
+**running** rather than provisioned-and-stopped. Under the readiness model a box must
+end up matching intent, and intent is running — so stopping it made every fresh box
+permanently unready and the prompt's "your sandbox already has one" false on precisely
+the boxes that had just built one. The original reason for stopping (keeping a box out
+of the app-less wake state, where `--restart unless-stopped` faithfully restores
+containers with no applications inside them) has not gone away; it moved to where it
+belongs, which is stopping the apps cleanly *before* the box stops rather than leaving
+them stopped for hours in case it does.
 
 ### Bootstrap: How the Agent Learns Who It Is
 

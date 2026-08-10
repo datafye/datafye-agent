@@ -670,8 +670,8 @@ ok "/etc/hosts configured (rumi.local + datafye.local hostnames → 127.0.0.1)"
 # starts containers, and writes instance-specific state under ~/.rumi
 # (admin-docker-compose.yml, named volumes, etc.) — none of which is
 # safe to snapshot into an AMI. Each per-user sandbox provisions its
-# own foundry at first boot, via the datafye-foundry-firstboot.service
-# one-shot installed below in hosted mode (first-boot-foundry.sh).
+# own foundry on its first boot, via the datafye-foundry-boot.service
+# one-shot installed below in every mode (foundry-boot.sh).
 #
 # That last sentence used to be a promise nothing kept: --ami-cleanup
 # skipped provisioning and deferred to a "first boot" step that did not
@@ -681,7 +681,7 @@ ok "/etc/hosts configured (rumi.local + datafye.local hostnames → 127.0.0.1)"
 next_step
 if [ "$AMI_CLEANUP" = true ]; then
     info "[${STEP}/${TOTAL_STEPS}] Foundry provisioning skipped (--ami-cleanup mode)"
-    info "  datafye-foundry-firstboot.service provisions it on the instance's first boot."
+    info "  datafye-foundry-boot.service provisions it on the instance's first boot."
     ok "Foundry: deferred to first boot"
 elif [ "$IS_UPGRADE" = true ]; then
     info "[${STEP}/${TOTAL_STEPS}] Upgrading local Datafye foundry environment..."
@@ -693,8 +693,8 @@ elif [ "$IS_UPGRADE" = true ]; then
         # (chat, docs, code and memory all work), so we must NOT abort here and
         # leave the datafye-agent service stopped -- it is started below regardless.
         warn "Foundry upgrade failed -- continuing so the agent is not left stopped."
-        warn "The agent does NOT provision on demand: a hosted box gets its foundry from"
-        warn "datafye-foundry-firstboot.service at boot. Deprovision + reprovision as the"
+        warn "The agent does NOT provision on demand: a box gets its foundry from"
+        warn "datafye-foundry-boot.service at boot. Deprovision + reprovision as the"
         warn "datafye user, or reboot to let that unit retry, and investigate."
     fi
 else
@@ -704,10 +704,10 @@ else
         ok "Foundry environment provisioned"
     else
         # Non-fatal for the same reason: never leave the agent service down over a
-        # foundry problem. In hosted mode datafye-foundry-firstboot.service retries
-        # on the next boot, because it keys on real state rather than a marker.
+        # foundry problem. datafye-foundry-boot.service retries on the next boot,
+        # because it keys on real state rather than a marker.
         warn "Foundry provision failed -- continuing so the agent is not left stopped."
-        warn "In hosted mode the first-boot unit retries on the next boot; investigate separately."
+        warn "datafye-foundry-boot.service retries on the next boot; investigate separately."
     fi
 fi
 
@@ -776,27 +776,44 @@ systemctl daemon-reload
 systemctl enable datafye-agent.service
 ok "Systemd service: datafye-agent.service"
 
-# ── Write the hosted first-boot foundry one-shot ─────────────────
-# Hosted only. A standalone/marketplace box provisions inline during its own
-# first-boot install (first-boot.sh), and a self-hosted user owns their own
-# environment; neither needs this unit.
+# ── Write the foundry boot reconciler one-shot (DAT-199) ─────────
+# Installed in EVERY mode. Its predecessor (datafye-foundry-firstboot.service)
+# was hosted-only, which left a self-provisioned user -- who stops and starts
+# their own box and hits the identical app-less wake -- with nothing at all.
 #
 # RemainAfterExit is deliberately NOT set. The unit is meant to be re-evaluated
-# on every boot: first-boot-foundry.sh keys on whether a foundry is actually
-# provisioned, so a normal reboot or a dormancy wake costs a one-second no-op,
-# while a boot after a FAILED provision retries instead of being locked out by
-# a marker file written before the work succeeded.
-if [ "$MODE" = "hosted" ]; then
-    cat > /etc/systemd/system/datafye-foundry-firstboot.service << EOF
+# on every boot: foundry-boot.sh keys on real state rather than a marker file,
+# so a normal reboot with a healthy foundry costs a fast no-op, while a boot
+# after a FAILED provision retries instead of being locked out by a marker
+# written before the work succeeded.
+#
+# Ordering AFTER datafye-agent.service is load-bearing and must stay. The agent
+# comes up first and stays reachable throughout; gating it on the foundry would
+# take the box off the network for the length of a cold provision.
+
+# Retire the old unit BEFORE writing the new one. An upgraded box already has
+# datafye-foundry-firstboot.service enabled and pointing at a copy of the old
+# script that is still on disk, so leaving it would put TWO boot-time actors on
+# one foundry -- the u1 incident, reintroduced by the change meant to prevent
+# it. `disable` alone is not enough: the unit file has to go, or a later
+# `systemctl enable` by hand quietly resurrects it.
+if [ -f /etc/systemd/system/datafye-foundry-firstboot.service ]; then
+    systemctl disable --now datafye-foundry-firstboot.service 2>/dev/null || true
+    rm -f /etc/systemd/system/datafye-foundry-firstboot.service
+    rm -f "${INSTALL_DIR}/first-boot-foundry.sh"
+    ok "Retired datafye-foundry-firstboot.service (replaced by datafye-foundry-boot.service)"
+fi
+
+cat > /etc/systemd/system/datafye-foundry-boot.service << EOF
 [Unit]
-Description=Datafye foundry first-boot provisioner (hosted)
-Documentation=https://linear.app/datafye/issue/DAT-170
+Description=Datafye foundry boot reconciler
+Documentation=https://linear.app/datafye/issue/DAT-199
 After=network-online.target docker.service datafye-agent.service
 Wants=network-online.target docker.service
 
 [Service]
 Type=oneshot
-ExecStart=${INSTALL_DIR}/first-boot-foundry.sh
+ExecStart=${INSTALL_DIR}/foundry-boot.sh
 # A cold first provision pulls images and starts the whole platform; it ran
 # ~17 minutes on a 4-core box during DAT-174 validation, so give it real room
 # rather than killing a provision that was going to succeed.
@@ -808,10 +825,9 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable datafye-foundry-firstboot.service
-    ok "Systemd service: datafye-foundry-firstboot.service (provisions the foundry at first boot)"
-fi
+systemctl daemon-reload
+systemctl enable datafye-foundry-boot.service
+ok "Systemd service: datafye-foundry-boot.service (reconciles the foundry on every boot)"
 
 # ── Step: nginx + SSL (standalone mode only) ─────────────────────
 if [ "$MODE" = "standalone" ]; then
@@ -995,11 +1011,11 @@ fi
 #    with a bogus "syntax error near unexpected token" AFTER the upgrade already
 #    succeeded. `mv` swaps the directory entry instead: the running shell keeps
 #    the original (now unlinked) inode and reads its own remaining lines intact.
-# first-boot-foundry.sh rides this loop for the same reason upgrade-check.sh
-# does: it is referenced by a systemd unit from INSTALL_DIR, so without a
-# refresh here a box would stay pinned to whatever version its AMI baked and a
-# fix could only reach the fleet via a re-bake, never via auto-upgrade.
-for f in upgrade-check.sh install.sh first-boot-foundry.sh; do
+# foundry-boot.sh rides this loop for the same reason upgrade-check.sh does: it
+# is referenced by a systemd unit from INSTALL_DIR, so without a refresh here a
+# box would stay pinned to whatever version its AMI baked and a fix could only
+# reach the fleet via a re-bake, never via auto-upgrade.
+for f in upgrade-check.sh install.sh foundry-boot.sh; do
     src_candidates=()
     [ -n "${SCRIPT_DIR}" ] && src_candidates+=("${SCRIPT_DIR}/${f}")
     src_candidates+=("${AGENT_CODE_DIR}/install/${f}")
