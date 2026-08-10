@@ -60,6 +60,16 @@ def build_system_prompt(
         if cheatsheet_path else ""
     )
     resource_guard = f"""
+   NEVER PULL A WHOLE LARGE FILE INTO THE CONVERSATION. One oversized tool result
+   ends the TURN, not just the command — everything you have done so far in it is
+   lost. This bites hardest on the things you produce: charts, logs, exports,
+   downloaded data. Ask for the part you need instead: `head -c`/`tail -n`/`grep`
+   for text and logs, a printed summary for a data file, and for an image or chart
+   check it in Python (dimensions, or the specific thing you are verifying) rather
+   than reading the image itself. A read that would be too large is refused with a
+   message saying so; that refusal is a redirection, not a failure, so take the
+   suggestion rather than retrying the same read.
+
    RESOURCE GUARD (do this BEFORE any historical fetch or replay):
    A fetch or replay can exhaust the instance's memory or disk. Before you run one:
    1. Estimate its PEAK MEMORY and DISK, biased to a HIGH-VOLUME trading day (worst

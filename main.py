@@ -37,7 +37,7 @@ import asyncio
 import time
 import unicodedata
 import uuid
-from typing import Optional, AsyncIterator, Dict, List
+from typing import Optional, AsyncIterator, Dict, List, Any
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -49,7 +49,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from claude_agent_sdk import (
-    query, ClaudeAgentOptions,
+    query, ClaudeAgentOptions, HookMatcher,
     AssistantMessage, ResultMessage, SystemMessage,
     create_sdk_mcp_server, tool,
 )
@@ -179,12 +179,93 @@ os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 # timeout for environment operations, and this ceiling is what makes that
 # request honored rather than silently clamped to 600000.
 #
-# Verified against the claude CLI: a 40s command requested with timeout=600000
-# backgrounds at the cap when the cap is below it, and completes in the
-# foreground when the cap is above it. ⚠️ The CLI is unpinned and only installed
-# when absent, so a box's harness version can drift -- re-check this if
-# backgrounding reappears.
+# Verified against a claude CLI: a 40s command requested with timeout=600000
+# backgrounds at the cap when the cap is below it, completes in the foreground
+# when the cap is above it, and a 660s command clears the old 600s default.
+#
+# ⚠️ That was PATH CLI 2.1.226, but a turn actually runs the SDK's BUNDLED CLI
+# (`_find_cli` prefers `claude_agent_sdk/_bundled/claude` over `which claude`),
+# which for the current pin is 2.1.85. The bundled binary would not run on the
+# dev Mac, so this is UNVERIFIED on the version that ships -- re-check on a box
+# if long commands still get backgrounded.
 os.environ.setdefault("BASH_MAX_TIMEOUT_MS", os.getenv("DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS", "1800000"))
+
+# The largest single message the SDK will accept off the CLI's stdout (DAT-204).
+#
+# The SDK frames the CLI's NDJSON output and raises `CLIJSONDecodeError` on any
+# one message bigger than this. That error comes out of the READ LOOP, so it does
+# not fail the tool call -- it ends the whole turn. A user lost a 37-minute
+# analysis to it after the model read back a chart it had just drawn, which is a
+# reasonable thing to do and had already caught two real layout bugs.
+#
+# The SDK default is 1 MB, which a single chart can exceed. 16 MB is far above any
+# legitimate tool result while still bounding a runaway one: the cap has to stay
+# finite, or a pathological result trades a lost turn for a lost process.
+#
+# ⚠️ Raising this is necessary and NOT sufficient, which is why the read guard
+# below exists too. Verified against the pinned SDK by driving the real transport:
+# a 2 MB message dies at the 1 MB default and parses at 16 MB, and a 20 MB message
+# still dies at 16 MB. There is always a payload big enough.
+MAX_BUFFER_SIZE = int(os.getenv("DATAFYE_AGENT_MAX_BUFFER_SIZE", str(16 * 1024 * 1024)))
+
+# Anything at or above this is refused before it is read. Half the buffer, because
+# the framer bounds the ENCODED message -- a JSON-escaped payload plus the
+# surrounding envelope is bigger than the file on disk, and base64 for an image
+# is about a third bigger again. Half leaves room for both without arithmetic
+# that would go stale the moment the envelope changes.
+READ_REFUSE_BYTES = MAX_BUFFER_SIZE // 2
+
+
+async def guard_oversized_read(
+    input_data: dict[str, Any], tool_use_id: str | None, context: Any
+) -> dict[str, Any]:
+    """Refuse a Read whose result could not survive the SDK framer (DAT-204).
+
+    A denial costs the model one tool call and tells it what to do instead. The
+    alternative is `CLIJSONDecodeError` out of the read loop, which ends the turn
+    and everything in it -- so this trades a recoverable refusal for an
+    unrecoverable one.
+
+    ⚠️ FAIL-OPEN, deliberately. This runs before every Read, and a guard that
+    breaks reading would be far worse than the bug it prevents. Anything
+    unexpected -- a path we cannot stat, an input shape we do not recognise, a
+    permission error -- allows the read and lets the CLI decide, which is what
+    happened before this existed.
+
+    ⚠️ It does NOT replace the CLI's own limits. A current CLI already refuses
+    huge text files, truncates bash output and downsizes images; this is the
+    backstop for the cases it does not cover -- an older CLI (they are unpinned
+    and never upgrade, DAT-215) and anything reaching the framer another way.
+    """
+    try:
+        path = (input_data.get("tool_input") or {}).get("file_path")
+        if not path:
+            return {}
+        size = os.path.getsize(path)
+        if size < READ_REFUSE_BYTES:
+            return {}
+    except Exception:
+        return {}   # fail open: never let this guard be the reason a read fails
+
+    mb = size / (1024 * 1024)
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"That file is {mb:.1f} MB, which is too large to read in one go -- "
+                f"reading it would end this turn and lose the work so far, so the read "
+                f"was refused instead.\n\n"
+                f"Get at the content another way:\n"
+                f"  - text or a log: `head -c 100000 <path>`, `tail -n 500 <path>`, or "
+                f"`grep` for what you actually need\n"
+                f"  - a data file: load it in Python and print a summary, not the file\n"
+                f"  - an image or chart: check it with Python (PIL/matplotlib) and print "
+                f"the dimensions or the finding, rather than reading the image itself\n\n"
+                f"Tell the user what you did instead if it changes what they get."
+            ),
+        }
+    }
 
 
 def check_api_mcp_reachable(url: str, timeout: float = 2.0) -> bool:
@@ -1583,6 +1664,14 @@ async def stream_agent_response(
         # and the reasoning is invisible -- while still being billed at output
         # rates. `display` controls visibility only and does not change billing.
         thinking={"type": "adaptive", "display": "summarized"},
+        # A single oversized tool result must not destroy the turn (DAT-204).
+        # The SDK frames the CLI's NDJSON stdout and refuses any one message
+        # larger than this, by raising out of the read loop -- which ends the
+        # turn, not just the tool call. A user lost 37 minutes of analysis to it
+        # because the model read back a chart it had drawn. See MAX_BUFFER_SIZE.
+        max_buffer_size=MAX_BUFFER_SIZE,
+        # Refuse a read that could not survive the framer, before it is issued.
+        hooks={"PreToolUse": [HookMatcher(matcher="Read", hooks=[guard_oversized_read])]},
     )
 
     # Persist the user's turn and resume the strategy's SDK session.
@@ -2454,11 +2543,37 @@ async def _run_turn(turn: "_Turn", message: str, conversation_id: Optional[str],
             await _turn_emit(turn, sse_event("commentary", {"text": "Stopped.", "kind": "notable"}))
             await _turn_emit(turn, sse_event("done", {"stopped": True}))
         elif err is not None:
-            await _turn_emit(turn, sse_event("error", {"message": str(err), "error_type": type(err).__name__}))
+            await _turn_emit(turn, sse_event("error", {
+                "message": _turn_error_message(err),
+                "error_type": type(err).__name__,
+            }))
             await _turn_emit(turn, sse_event("done", {}))
         async with turn.cond:
             turn.done = True
             turn.cond.notify_all()
+
+
+def _turn_error_message(err: Exception) -> str:
+    """What the user should read when a turn dies (DAT-204).
+
+    The buffer overflow surfaces as `Failed to decode JSON: JSON message exceeded
+    maximum buffer size of 1048576 bytes`, which describes our transport rather
+    than anything the reader did or can act on. It also reads like data
+    corruption, which sends people looking in the wrong place -- the actual cause
+    is one tool result being too big, and the actual remedy is to ask for less.
+
+    Everything else keeps its own text: a message that is merely technical is
+    better than one that is wrong.
+    """
+    text = str(err)
+    if "exceeded maximum buffer size" in text:
+        return (
+            "That step produced more output than one message can carry, so the turn "
+            "could not be completed. Anything already written to files is safe. Ask "
+            "again for a smaller piece of it -- a summary, a page, or the specific "
+            "part you need -- rather than the whole thing."
+        )
+    return text
 
 
 async def _drain_turn(turn: "_Turn", after: int) -> AsyncIterator[str]:
