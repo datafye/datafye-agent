@@ -218,7 +218,7 @@ Two distinctions in the reader are load-bearing, and both are the same shape: re
 
 **Reading never raises.** It sits on the `/health` path, which has to answer when everything else on the box is broken. An agent that cannot report its own health is indistinguishable from a dead instance — and telling those apart is the single thing accounts most needs.
 
-⚠️ **As of DAT-199 nothing writes that state file, so the block reports `unknown` on every box** — expected, not a defect to chase. Both writers were removed deliberately (see the postscript below and the DAT-199 story that follows), and readiness is now *derived* by whoever asks rather than stored by whoever moved last. The reader is kept because re-pointing it at the derived form is additive; wiring that up is DAT-198's remaining work.
+⚠️ **For a while the block reported `unknown` on every box, because nothing wrote that state file** — expected at the time, not a defect to chase. Both writers had been removed deliberately (see the postscript below and the DAT-199 story that follows). That gap is now closed, and it did not close by putting the writers back: readiness is *derived* by whoever asks rather than stored by whoever moved last. See [Readiness, Derived](#readiness-derived-dat-198-finished) below for how the three inputs combine and which branches of the truth table are the opposite of what you would guess.
 
 A postscript on ownership, because it cost a design round. The first implementation had the *deployment engine* record intent on every lifecycle command. It reads plausibly — the command is the thing acting — and it is wrong, with a mundane counterexample: someone SSHes in to debug, runs `stop`, and the engine writes down that this environment is meant to be stopped. The box reboots and the boot service faithfully leaves the foundry down, permanently. A debugging action promoted into standing policy. **"An operation is running" is a fact about a process; "this box should have a running foundry" is a decision somebody made** — and the component performing an action is very often not the one that decided it should happen. Desired state belongs to accounts, where the user's request actually arrives; the agent reads it and reports.
 
@@ -375,6 +375,271 @@ of the app-less wake state, where `--restart unless-stopped` faithfully restores
 containers with no applications inside them) has not gone away; it moved to where it
 belongs, which is stopping the apps cleanly *before* the box stops rather than leaving
 them stopped for hours in case it does.
+
+### Stopping the Environment Before the Box (DAT-125)
+
+For most of this system's life, "stop the sandbox" meant exactly one thing: accounts
+called StopInstance on a live box and the lights went out. That is a perfectly good way
+to stop a web server. It is a bad way to stop a box hosting a running foundry, because
+it pulls the floor out twice over.
+
+The first way is the one you would predict. The Rumi applications are killed mid-write,
+so a transaction log can be left unflushed — the environment's own record of what
+happened, cut off mid-sentence.
+
+The second is worse because it is *delayed*. Nothing ever marked the containers as
+stopped, so on the next boot Docker's `--restart unless-stopped` did precisely what it
+promises and faithfully brought every container back up, with no applications inside
+them. The box is alive, the containers are alive, and nothing is running in them. That
+is the app-less wedge of DAT-171, arriving hours later, produced by a restart policy
+behaving perfectly correctly. u1 demonstrated it live: the idle monitor stopped that
+sandbox **sixteen minutes into a provision**.
+
+The fix spans three repos — accounts learns to ask, the agent learns to answer, and the
+deployment engine learns to actually finish a stop when one application misbehaves. The
+agent's half is `POST /v1/foundry/stop`, called immediately before StopInstance, for
+both the idle `Dormant` stop and a deliberate user Stop. And the interesting part is
+not that it stops the foundry. It is what it says back.
+
+**The reply is a decision, not a result.** There are four statuses, and only one of them
+changes what accounts does:
+
+| status | what happened | what accounts does |
+|---|---|---|
+| `stopped` | the environment came down cleanly | stop the box |
+| `absent` | there is no foundry here | stop the box |
+| `failed` | the stop did not complete, but nothing is in flight | stop the box, loudly |
+| `busy` | another operation owns the environment | **abort the stop** |
+
+The asymmetry is the whole design, and it is worth sitting with, because the instinct is
+to treat `failed` and `busy` as the same kind of bad news. They are not. An environment
+mid-provision must not be cut off — that is the u1 incident, and interrupting it costs a
+rebuild. But a stop that merely *failed* protects nothing by keeping the box up: the
+damage, if any, has already happened, and the alternative is a sandbox that can never
+stop cleanly and therefore **bills forever with nobody watching**. So `failed` still
+stops the box, at WARNING, because that log line is the only trace that a box went down
+without a clean stop. Refusing to act on a failure is not caution; it is just a slower,
+more expensive failure.
+
+One implementation detail carries a transferable lesson. **`busy` is decided from the
+DAT-183 in-flight marker, never from the lock's refusal text.** The tempting shortcut is
+right there: the operation lock refuses with a perfectly clear sentence, and matching on
+it is three lines. But that sentence is written for *humans*, and it lives in another
+repo. Keying on it would create a cross-repo contract with no compiler behind it — the
+kind that survives every test suite and breaks the day somebody improves the wording.
+The marker exists precisely to answer this question, so it is what gets asked.
+
+The engine half is the same lesson in a different key: `stop` no longer aborts when one
+application refuses to shut down, and falls back to the container inventory when the
+deployment API cannot say what is deployed. The API *is* one of the applications — so
+the box that most needed stopping was exactly the box where the stop did the least.
+
+### Readiness, Derived (DAT-198 finished)
+
+The DAT-198 reader shipped ahead of its data and spent a while reporting `unknown` on
+every box in the fleet, because both writers of the state file it read had been
+deliberately removed. That is now closed, and the closing is more interesting than the
+original design, because the answer was not "put the writers back". It was to stop
+storing readiness at all.
+
+Readiness is now **derived**, from three inputs that no single component owns:
+
+- **Intent** — what accounts decided, pushed down to the box and cached on disk.
+- **In flight** — the DAT-183 marker plus a liveness check: is somebody mid-operation
+  right now.
+- **Observed** — are the applications actually *answering*.
+
+`derive()` combines them and is a pure function, deliberately, because the truth table is
+the part that is easy to get subtly and confidently backwards. Three of its branches are
+the **opposite** of the obvious reading, and each one is a small lesson in what
+"healthy" means.
+
+**Intent `stopped` is READY, not unready.** A foundry the user asked to stop is in good
+order. Calling it unready leaves the box permanently unhealthy, curable only by starting
+an environment the user explicitly did not want — a health check that can only be
+satisfied by overriding the user is not a health check, it is a demand. And it stays
+ready even if the observation finds it *serving*, because somebody started it by hand:
+that is more than intended, not less.
+
+**In-flight beats every observation.** Mid-provision the deployment honestly reports "not
+serving", which is indistinguishable from a genuine mismatch. Anything reconciling on
+that reading would set about repairing an environment that is being built — which is the
+u1 collision exactly, damage produced by something trying to help.
+
+**Absent intent means running.** A sandbox exists in order to host a foundry, so "no
+deviation has ever been recorded" and "this should be running" are the same sentence.
+`unknown` would leave every fresh box permanently unready; `stopped` would leave it
+permanently empty. The default is not a fallback here, it is the statement.
+
+**The observation is refreshed in the background, not on the request**, and that is a
+deliberate inversion of the obvious design. Interrogating an environment costs real time
+precisely when something is wrong, and `/health` is not a debugging endpoint — it is
+polled by accounts for dormancy decisions, by the upgrade cron every minute, and by the
+SPA. An agent that goes quiet while it thinks is indistinguishable from a dead instance,
+and the one thing this endpoint must never do is make a healthy box look dead. So a loop
+refreshes on a timer and `/health` serves the snapshot along with its age. The in-flight
+read is cheap enough to do inline, so the fast-moving input stays current and the slow
+one is allowed to be a little stale, with its staleness stated.
+
+One lesson from the build is worth recording because it nearly shipped. The first cut of
+the health-ping parse assumed the response was a flat array of services. It is not: it
+is an object **keyed by service name**, nested under per-system groups. The code ran, the
+loop iterated over something, and the answer was quietly wrong. What caught it was not a
+test — it was cross-checking the Java prober that had been reading the same endpoint
+correctly for months. It is now guarded properly: all nine payloads captured off a live
+foundry are replayed through the Python parse in the test suite. **The agent and the CLI
+disagreeing about one box's health would be worse than either of them being wrong
+alone** — two components confidently contradicting each other is a debugging session
+nobody wins.
+
+### Who Is Allowed to Change Their Mind (DAT-214)
+
+Intent belongs to accounts. But *somebody* has to tell accounts that the user wants
+their environment gone, and answering that question turned out to be a nice piece of
+reasoning: we listed every actor that can mutate a foundry and asked, of each, whether
+it is entitled to change **intent** — the standing policy — as opposed to merely acting.
+
+Almost all of them are not.
+
+- **Accounts' explicit stop and start** are decisions about the *box*. Someone who stops
+  their sandbox on Friday afternoon fully expects their environment to be there on
+  Monday. Letting the box's power switch rewrite the environment's policy would punish
+  the user for being frugal.
+- **Dormancy** is not a decision at all. It is a cost optimisation the user never asked
+  for and mostly never sees. A box that wakes and declines to restore what nobody chose
+  to lose is the clearest possible reductio.
+- **The Yukti SPA's Stop** is box-scoped for the same reason as accounts'.
+- **An operator's `foundry local stop` while debugging** is explicitly not a policy
+  statement, and this codebase has already paid for pretending otherwise — that is the
+  reverted design from DAT-199.
+
+Which leaves exactly one actor that may legitimately change intent: **the user, speaking
+through the model.** It is the only participant in the conversation, so it is the only
+one that can possibly know. And it was, of course, the one with no way to say so.
+
+**The distinguishing factor is not the command.** This is the crux, and it is why every
+"just infer it from the lifecycle command" design fails. `foundry local stop` run because
+the user said "shut it down, I'm done for the month" and the same command run because the
+model is working around a wedged service are **byte-identical**. There is no flag, no
+argument, no telemetry that separates them. The only place the difference exists is in
+the sentence the user typed, which is why the agent is the sole production caller of the
+intent endpoint, forwarding the user's own JWT on the same self-scoped channel the usage
+and feedback reporters already use.
+
+**Two mechanisms, because a prompt rule alone will not hold.** Asking the model to
+classify a request as policy *and* remember to take a second action after it has already
+performed the first is asking for two things it will sometimes not do — and this codebase
+has the receipt. The prompt carefully explained how to run long operations, and the agent
+backgrounded a provision anyway, which was then orphaned when the session ended (DAT-185).
+A rule the system depends on should not live only in prose that the model is free to
+weigh against everything else in its context. So:
+
+- an **explicit tool** the model can call when the user actually states a decision, and
+- a **post-stream Haiku sidecar** that classifies the turn and **always runs**, so the
+  mechanism does not depend on the model choosing to use it.
+
+They cannot fight: a turn where the tool fired is marked, and the sidecar skips it.
+Explicit beats inferred, because the model's own statement is better evidence than an
+inference drawn from the same conversation.
+
+**The classifier is deliberately biased towards "no decision"**, and the bias is
+asymmetric on purpose. A wrong `stopped` costs the user their environment. A missed one
+only means their environment keeps running — which is the default anyway, and the thing
+they will notice least. When the two error directions have wildly different prices, a
+classifier that is "accurate" is the wrong goal; one that is *cheap to be wrong in* is
+the right one. An unrecognised value, unparseable output, an API failure and a missing
+key all come back as no decision rather than a guess.
+
+### The Warm Signal: Why a Box Refuses to Sleep (DAT-184, DAT-177)
+
+Accounts stops a box that nobody has **chatted with** for thirty minutes. That is a
+perfectly reasonable measure of something, and it is the wrong question. On u1 it
+stopped a sandbox sixteen minutes into a foundry provision: nobody had typed anything,
+so by the only measure available the box was idle. It was not idle. It was doing the
+single most expensive thing it ever does.
+
+The fix is almost embarrassing in hindsight. `/health` already published a field called
+`active_proxied_apps`, and accounts already treated a non-empty value as busy in both
+places that matter. The agent had always sent `[]`. **The plumbing was live and inert
+the whole time**, wired end to end on the consuming side and hardcoded to a lie on ours.
+Filling an existing field rather than adding one meant no accounts change and no
+coordinated deploy — and it is worth noticing how the bug hid: nobody was going to
+discover an empty list was *wrong*, because an empty list is also what a genuinely idle
+box sends.
+
+The values are self-describing (`env:data-flowing`, `env:provision`) rather than a bare
+`true`, because they surface raw in the admin panel and in logs, where an operator
+looking at a box that refuses to sleep needs to know *why* it refuses.
+
+The load-bearing decision is what **does not** count. **An idle or empty foundry reports
+nothing at all** — and the pleasing part is that this falls out of the definition rather
+than needing a carve-out. An empty foundry has no datasets, so no service reports any
+activity, so it reports nothing. If merely having containers up kept a box awake, every
+provisioned sandbox in the fleet would be permanently warm and **dormancy would stop
+saving anything whatsoever**. A cost-saving mechanism that never fires is worse than no
+mechanism, because it also carries the code.
+
+Two more rules in the same spirit. **Unreachable is not warm**: "I could not look" must
+not pin a box awake indefinitely on a probe that may never recover, which also matches
+how accounts treats an agent *it* cannot reach. And the case that looks lost to that
+rule — a box mid-provision whose API is not up yet — is covered by the in-flight signal,
+which is local and needs nothing to answer.
+
+The window is **a third of the thirty-minute idle threshold**: long enough that no gap
+inside genuinely continuous work reads as cold, short enough that it can never dominate
+the dormancy decision. It was chosen *against* the threshold rather than picked, which is
+the difference between a constant and a number.
+
+And then the off switch, which is a lovely small trap. Setting the window to `0` disables
+environment-based warmth entirely — and that has to be handled **on the agent's side**,
+because the platform reads `activeWithinSeconds == 0` as "use my default of 300". Forward
+the zero and you would get a *shorter* window instead of none: reaching for the off switch
+and being handed the opposite. Whenever you pass a user-facing knob through to another
+system's API, go and check what that system thinks your sentinel value means. Zero, empty
+string and null are the three most commonly overloaded values in software, and every layer
+is entitled to its own opinion about them.
+
+### A Reading User Is Still a User (DAT-169)
+
+The warm signal keeps a box alive for active *work*. This one keeps it alive for a
+present *person*, and they are genuinely different problems.
+
+Accounts measures idleness from `last_chat_activity_at`, and that field only ever
+advanced when a chat turn ran. So a user reading a backtest result, studying a scorecard,
+or simply thinking for half an hour looked **exactly** like a user who had closed the tab
+— and their box dormed underneath them, mid-thought.
+
+`POST /v1/activity` is the agent's half: it bumps the same timestamp a turn does, without
+running one. One assignment, no I/O, because every open tab calls it on an interval and
+anything heavier would be a permanent per-user background load whose entire purpose is to
+say "still here".
+
+**Deliberately the same field, not a peer.** The temptation is to add
+`last_presence_at` alongside it and let accounts take a `max`. But the monitor's actual
+question is "when was this box last of use to somebody", and reading answers it every bit
+as well as typing does. Two fields would mean two things to keep in sync, two places to
+forget, and a `max` computed forever, in exchange for a distinction nobody consuming it
+needs.
+
+**⚠️ Visible tabs only — and the agent cannot enforce it.** That half of the contract
+lives in the frontend, which gates on `document.hidden`, stops the interval when the tab
+goes away, and self-clears on sign-out. It has to, because a hidden tab that kept pinging
+would pin every abandoned browser session's box awake forever, and dormancy would stop
+saving anything — the same failure mode as a foundry that counts as warm just for
+existing, arrived at from the other direction. Worth being honest about this shape when
+you meet it: a rule whose enforcement lives in a component you do not control is a
+convention, not a guarantee, and the only defence is to write it down where both halves
+can see it.
+
+### A Note on Where All This Stands
+
+The whole arc above — the graceful stop, derived readiness, intent through the model, the
+warm signal, and the presence heartbeat — is **merged, but not yet released**. The agent
+changes travel in an agent release, so a fleet box only gets them when that release is
+published and the auto-upgrade picks it up. Until then the code is true of the repository
+and not yet true of any sandbox, which is a distinction this project has learned to state
+out loud: a fix that exists only in `main` has the same effect on a user as a fix that
+does not exist.
 
 ### Bootstrap: How the Agent Learns Who It Is
 
