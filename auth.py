@@ -110,17 +110,20 @@ def verify_bootstrap_token(token: str) -> dict:
     return claims
 
 
-async def require_self_jwt(authorization: str | None = Header(default=None)) -> dict:
-    """
-    FastAPI dependency: validates the inbound Bearer JWT and ensures its
-    subject matches the agent's bootstrapped username. Returns the
-    decoded claims on success. Raises 401 on missing/invalid token,
-    403 on subject mismatch.
+# The purpose claim on an accounts-issued lifecycle token. Accounts uses these
+# to drive the box's environment on nobody's behalf but its own -- stopping the
+# foundry before it powers the instance off (DAT-125).
+PURPOSE_AGENT_LIFECYCLE = "agent-lifecycle"
 
-    Apply via:
-        @app.post("/foo", dependencies=[Depends(require_self_jwt)])
-    or at the router level:
-        APIRouter(..., dependencies=[Depends(require_self_jwt)])
+
+def _decode_bearer(authorization: str | None) -> dict:
+    """Shared front half of every request guard: a verified set of claims.
+
+    One copy on purpose. The two guards below differ only in what they demand
+    of the claims, and a second transcription of the decode would be a second
+    place for `algorithms`, the issuer check, or `verify_aud` to drift -- the
+    kind of divergence that leaves one endpoint quietly weaker than its
+    neighbour and looks identical in review.
     """
     if _AGENT_USERNAME is None:
         # Misconfiguration: configure() wasn't called. Fail closed.
@@ -133,7 +136,7 @@ async def require_self_jwt(authorization: str | None = Header(default=None)) -> 
     token = authorization[len("Bearer "):].strip()
     try:
         signing_key = _jwks_client.get_signing_key_from_jwt(token)
-        claims = jwt.decode(
+        return jwt.decode(
             token,
             signing_key.key,
             algorithms=["RS256"],
@@ -145,10 +148,57 @@ async def require_self_jwt(authorization: str | None = Header(default=None)) -> 
     except jwt.PyJWTError as e:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Invalid token: {e}")
 
+
+def _require_subject_is_self(claims: dict) -> None:
+    """The token was minted for THIS sandbox.
+
+    Separate from the decode so the two guards state their own requirements
+    where a reader can see them, and so the check is testable without a signed
+    token.
+    """
     sub = claims.get("sub")
     if sub != _AGENT_USERNAME:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             f"Token subject '{sub}' does not match agent identity '{_AGENT_USERNAME}'",
         )
+
+
+async def require_accounts_lifecycle_jwt(authorization: str | None = Header(default=None)) -> dict:
+    """FastAPI dependency: accounts, acting as accounts, may drive lifecycle.
+
+    Deliberately NOT `require_self_jwt`. That checks a *user* token, and
+    reusing one here would mean accounts minting a user-equivalent credential
+    every time it wants to stop a foundry -- a machine-to-machine call
+    borrowing a person's identity, and a token that grants far more than the
+    one thing it is being used for. This purpose is scoped to exactly that one
+    thing: possessing it lets you stop this box's environment and nothing else.
+
+    Still bound to `sub`, so a token minted for one sandbox cannot drive
+    another's -- the agent knows who it is after bootstrap, and a mismatch is
+    a misrouted call, which on a lifecycle endpoint is worth refusing loudly.
+    """
+    claims = _decode_bearer(authorization)
+    if claims.get("purpose") != PURPOSE_AGENT_LIFECYCLE:
+        # A login token verifies perfectly well and must still be refused here,
+        # or the scoping above is decorative.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Token is not an agent-lifecycle token")
+    _require_subject_is_self(claims)
+    return claims
+
+
+async def require_self_jwt(authorization: str | None = Header(default=None)) -> dict:
+    """
+    FastAPI dependency: validates the inbound Bearer JWT and ensures its
+    subject matches the agent's bootstrapped username. Returns the
+    decoded claims on success. Raises 401 on missing/invalid token,
+    403 on subject mismatch.
+
+    Apply via:
+        @app.post("/foo", dependencies=[Depends(require_self_jwt)])
+    or at the router level:
+        APIRouter(..., dependencies=[Depends(require_self_jwt)])
+    """
+    claims = _decode_bearer(authorization)
+    _require_subject_is_self(claims)
     return claims

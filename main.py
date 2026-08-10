@@ -60,7 +60,7 @@ import broker
 import conversations
 import credentials as credentials_module
 import memory
-from foundry import read_foundry_state, describe_for_model
+from foundry import read_foundry_state, describe_for_model, graceful_stop
 import skills
 
 # Configure logging
@@ -2355,6 +2355,37 @@ async def chat_stop(turn_id: str):
     return {"stopped": False}
 
 
+@app.post("/v1/foundry/stop",
+          dependencies=[Depends(require_bootstrapped),
+                        Depends(auth.require_accounts_lifecycle_jwt)])
+async def foundry_stop():
+    """Bring the foundry down cleanly, ahead of the box being stopped (DAT-125).
+
+    Called by the accounts idle monitor immediately before StopInstance, for
+    both the idle `Dormant` stop and a deliberate user `Stop`. Before this, the
+    instance was simply pulled out from under a running environment: the Rumi
+    applications were killed mid-write, risking unflushed transaction logs, and
+    the containers were never marked stopped -- so `--restart unless-stopped`
+    faithfully restored them on the next boot with no applications inside, the
+    DAT-171 wedge. Observed doing exactly that on u1, sixteen minutes into a
+    provision.
+
+    The reply is what the caller needs to DECIDE with, not a success flag:
+    `busy` means abort the box stop (something owns the environment), `failed`
+    and `absent` mean carry on. See `foundry.graceful_stop`.
+
+    Gated by a purpose-scoped `agent-lifecycle` token, not by the user JWT and
+    not left open like `/v1/credentials/update`. That endpoint only writes a
+    cache value; an unauthenticated stop would let anyone who can reach the
+    agent take a user's environment down. And a *user* token would be the
+    wrong instrument in the other direction -- this is accounts acting as
+    accounts, so borrowing a person's identity for it would mint a
+    user-equivalent credential on every dormancy tick."""
+    result = await graceful_stop(CLI_PATH)
+    logger.info("Foundry graceful stop: %s (%s)", result["status"], result["detail"])
+    return result
+
+
 @app.get("/v1/skills", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def get_skills(conversation_id: Optional[str] = None):
     """List the skills available to the agent, across all tiers:
@@ -2597,6 +2628,11 @@ _REQUIRED_ROUTES = {
     ("GET", "/health"),
     ("POST", "/bootstrap"),
     ("POST", "/v1/chat"),
+    # A silent 404 here means every dormancy stop is ungraceful and NOTHING
+    # says so: accounts treats a missing endpoint as an older agent and
+    # proceeds to stop the box, which is the pre-DAT-125 behaviour restored
+    # invisibly.
+    ("POST", "/v1/foundry/stop"),
 }
 _present_routes = {
     (_m, getattr(_r, "path", None))
