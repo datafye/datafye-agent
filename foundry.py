@@ -13,40 +13,53 @@
 # limitations under the License.
 
 """
-The foundry as seen from the agent: what state it is in, and bringing it down
-cleanly when the box is about to stop.
+The foundry as seen from the agent: whether this box can currently do work,
+and bringing the environment down cleanly when the box is about to stop.
 
-Two halves, and they are here together because they answer to the same
-question -- whether this box can currently do work. The reader (DAT-198)
-reports it; the graceful stop (DAT-125) is what keeps the answer true across a
-power cycle.
-
-Why the reader exists: "Running" used to mean this Python process answers /health,
+Why it exists: "Running" used to mean this Python process answers /health,
 which says nothing at all about whether the box can do work. On u1 that gap put
 a user's request onto a box three minutes into its first provision -- the agent
 even logged "Datafye API MCP: NOT REACHABLE" fifteen seconds beforehand, and
 nothing acted on it.
 
-⚠️ NOTHING WRITES THIS FILE TODAY, so `/health` reports `unknown` on every box.
-That is expected, not a defect to chase. Both writers were removed on purpose:
-the deploy engine's was shipped and then REVERTED (datafye-deploy PR #11,
-because a lifecycle command cannot tell a debugging `stop` from a policy
-decision), and the foundry boot service deliberately writes no state either
-(DAT-199 -- it acts, it does not narrate). Under the agreed model readiness is
-DERIVED by whoever asks, from intent (pushed by accounts) + observation + the
-in-flight lock, rather than stored as one fact by whoever moved last.
+## Readiness is DERIVED from three inputs, never stored as one fact (DAT-198)
 
-This module is kept as the reader half so re-pointing it at the derived form is
-additive. Wiring that up is DAT-198's remaining work; until then every caller
-gets `unknown`, which is a truthful answer.
+    intent      what the box is SUPPOSED to be doing. Owned by accounts, where
+                the user's decision actually arrives, and pushed here. This box
+                holds a REPLICA in ~/.datafye/run/foundry-intent.json, never the
+                record. Absent means running: no deviation has ever been
+                recorded, and a sandbox exists to host a foundry.
+    in flight   whether an operation owns the environment right now, read from
+                the DAT-183 marker with a liveness check.
+    observed    whether the applications are ANSWERING, interrogated on demand.
 
-It deliberately does no inference of its own: the whole point was that layers
-stop guessing from side effects.
+Readiness is "observed matches intent", evaluated only when nothing is in
+flight.
 
-Note the file lives under the CLI's run directory (~/.datafye/run), NOT the
-agent's state root. It describes the environment on the box, which outlives and
-is independent of this process -- and it is written by whoever ran the command,
-which may be the boot service or an operator over SSH rather than the agent.
+⚠️ The first version of this stored readiness as a single fact that every
+lifecycle command wrote. It shipped and was reverted (datafye-deploy PR #11).
+The bug: an engineer SSHes in to debug and runs `foundry local stop`, the engine
+records intended=stopped, and the box then stays down on every subsequent boot.
+A debugging action promoted into standing policy by a component with no way to
+tell the two apart. **"An operation is in flight" is a fact about a process;
+"this box should have a running foundry" is a policy decision** -- and the
+component performing an action is very often not the one that decided it.
+
+⚠️ Interrogating without the in-flight input is dangerous. Mid-provision the
+deployment reports "not serving", which is indistinguishable from a mismatch
+against intent=running -- so anything reconciling on that would try to fix an
+environment that is being built. That is the u1 collision, produced by something
+trying to help.
+
+## Why the snapshot is refreshed in the background
+
+Interrogation costs real time when something is wrong (a dead service burns its
+probe timeout), and /health must stay fast: accounts polls it to decide
+dormancy, the upgrade cron gates on it every minute, and an agent that goes
+quiet is indistinguishable from a dead instance. So the observation is refreshed
+on a timer and /health serves the most recent snapshot with its age attached.
+The in-flight read is cheap -- a few small files -- so it is done inline and is
+always current.
 """
 
 from __future__ import annotations
@@ -57,16 +70,25 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 # Where the CLI keeps everything describing an in-flight or just-finished
-# environment operation: the DAT-196 lock and the DAT-183 markers. Not the
-# agent's state root -- this belongs to the environment, not to this process.
+# environment operation: the DAT-196 lock, the DAT-183 markers, and the intent
+# replica. Not the agent's state root -- this belongs to the environment, which
+# outlives this process and is written to by whoever ran the last command.
 RUN_DIR = os.path.abspath(
     os.path.expanduser(os.environ.get("DATAFYE_AGENT_RUN_DIR", "~/.datafye/run"))
 )
+
+# The intent replica. Same path datafye-foundry-boot.service reads before any
+# user exists (DAT-199) -- that is the whole reason it is a file on disk rather
+# than in this process's memory.
+INTENT_FILE = os.path.join(RUN_DIR, "foundry-intent.json")
 
 # Upper bound on a graceful stop. Deliberately shorter than the caller's own
 # read timeout, so THIS side is what expires: an expiry here returns a
@@ -74,133 +96,361 @@ RUN_DIR = os.path.abspath(
 # nothing at all and cannot be told from an unreachable box.
 STOP_TIMEOUT_SECONDS = int(os.environ.get("DATAFYE_AGENT_FOUNDRY_STOP_TIMEOUT", "240"))
 
-# Same location the engine's FoundryState and the boot service use. The
-# override exists so a local run can point at a scratch copy.
-FOUNDRY_STATE_FILE = os.path.abspath(
-    os.path.expanduser(
-        os.environ.get("DATAFYE_AGENT_FOUNDRY_STATE_FILE", "~/.datafye/run/foundry-state.json")
-    )
-)
+# How often the observation is refreshed, and how long a probe may take. The
+# per-service probe bound is well under the deployment API's own 30s
+# request/reply timeout, so a dead service costs us seconds rather than the
+# API's full wait.
+OBSERVE_INTERVAL_SECONDS = int(os.environ.get("DATAFYE_AGENT_FOUNDRY_OBSERVE_INTERVAL", "60"))
+# The datasets call is fast or the API is down, so it gets a short bound.
+OBSERVE_TIMEOUT_SECONDS = float(os.environ.get("DATAFYE_AGENT_FOUNDRY_OBSERVE_TIMEOUT", "5"))
+# ⚠️ The health ping is a different animal: it asks the API about four services
+# at once, and a DEAD service makes the API wait out its own 30s Rumi
+# request/reply timeout before answering for it. The engine avoids that by
+# probing each service separately in parallel, because it runs on a command's
+# critical path. Here the observation is a BACKGROUND refresh, so it can simply
+# afford to wait -- which buys per-service fidelity from a single call. Bounding
+# this below 30s would turn every partial environment into "not answering at
+# all", losing exactly the distinction the ping exists for.
+PING_TIMEOUT_SECONDS = float(os.environ.get("DATAFYE_AGENT_FOUNDRY_PING_TIMEOUT", "40"))
 
-# The states the writers use. Reproduced here as documentation, not as
-# validation: an unrecognised value is passed through rather than rejected, so a
-# newer writer can add a state without this agent refusing to report it.
-KNOWN_STATES = ("starting", "provisioning", "restoring", "ready", "failed", "absent")
+# Intent values. Deliberately only two: this is a policy statement about whether
+# the box should be hosting a foundry, not a lifecycle state machine.
+INTENT_RUNNING = "running"
+INTENT_STOPPED = "stopped"
 
-# Ours, not the writers'. Means "no state file", which is a different claim from
-# any of theirs -- notably from "absent", which asserts that no environment
-# exists. Not knowing and knowing there is nothing are answers a caller must be
-# able to tell apart.
-STATE_UNKNOWN = "unknown"
+# Derived readiness states.
+STATE_READY = "ready"              # observed matches intent
+STATE_NOT_READY = "not_ready"      # it does not
+STATE_IN_PROGRESS = "in_progress"  # an operation owns the environment; do not judge
+STATE_ABSENT = "absent"            # there is no environment, and none is intended
+STATE_UNKNOWN = "unknown"          # not enough evidence to say
+
+# What the interrogation found.
+OBSERVED_SERVING = "serving"
+OBSERVED_PARTIAL = "partial"
+OBSERVED_DOWN = "down"
+OBSERVED_UNKNOWN = "unknown"
+
+# The last observation, refreshed on a timer by observe_forever().
+_snapshot: dict[str, Any] = {
+    "observed": OBSERVED_UNKNOWN,
+    "datasets": [],
+    "not_answering": [],
+    "checked_at": None,
+    "detail": "the environment has not been interrogated yet",
+}
+
+
+# ── Intent: a replica of what accounts decided ───────────────────────────
+
+
+def read_intent() -> dict[str, Any]:
+    """The last intent accounts pushed, as {intended, source, at}.
+
+    ⚠️ ABSENT MEANS RUNNING, and that default is load-bearing rather than
+    convenient. A sandbox exists to host a foundry, so "no deviation has ever
+    been recorded" and "it should be running" are the same statement. Treating
+    absence as unknown would leave a fresh box permanently unready, and treating
+    it as stopped would leave it permanently empty.
+
+    Never raises: this feeds /health.
+    """
+    try:
+        with open(INTENT_FILE, "r") as handle:
+            record = json.load(handle)
+        intended = record.get("intended")
+        if intended in (INTENT_RUNNING, INTENT_STOPPED):
+            return {
+                "intended": intended,
+                "source": record.get("source") or "accounts",
+                "at": record.get("at"),
+            }
+        # A value from a newer writer. Fall back to running rather than refusing
+        # to act: an older box must not be bricked by a vocabulary it predates,
+        # and running is the additive answer.
+        logger.warning("Unrecognised recorded intent %r; assuming running", intended)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("Could not read the intent replica: %s", exc)
+
+    return {"intended": INTENT_RUNNING, "source": "default", "at": None}
+
+
+def write_intent(intended: str, source: str = "accounts") -> dict[str, Any]:
+    """Record what accounts last decided. Raises so the push can report failure.
+
+    Written to disk rather than held in memory because the reader that matters
+    most runs before this process does: datafye-foundry-boot.service reconciles
+    the foundry at boot, when there is no user, no JWT, and nothing to ask.
+    """
+    if intended not in (INTENT_RUNNING, INTENT_STOPPED):
+        raise ValueError(f"intent must be {INTENT_RUNNING!r} or {INTENT_STOPPED!r}, got {intended!r}")
+
+    os.makedirs(RUN_DIR, exist_ok=True)
+    record = {"intended": intended, "source": source, "at": int(time.time() * 1000)}
+    # Write-then-rename: the boot service may read this file at any moment, and
+    # a half-written replica would read as "unrecognised" and silently fall back.
+    temp = INTENT_FILE + ".new"
+    with open(temp, "w") as handle:
+        json.dump(record, handle)
+    os.replace(temp, INTENT_FILE)
+    logger.info("Foundry intent recorded: %s (from %s)", intended, source)
+    return record
+
+
+# ── Observation: are the applications answering ──────────────────────────
+
+
+async def observe(deployment_api_url: str) -> dict[str, Any]:
+    """Interrogate the deployment: which datasets are up, and are they serving.
+
+    Keys on applications ANSWERING, never on containers being up. Rumi's local
+    containers are machines running sshd with the applications deployed into
+    them afterwards, so under `--restart unless-stopped` a box presents a
+    complete, healthy-looking set of containers with nothing inside them. That
+    is the state this most needs to detect, and a container check reports it as
+    fine.
+    """
+    base = deployment_api_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient() as client:
+            datasets = await _deployed_datasets(client, base)
+            if datasets is None:
+                return _observation(OBSERVED_DOWN, [], [],
+                                    "the deployment API is not answering")
+            if not datasets:
+                # The API serves, but nothing is deployed behind it. That is the
+                # ordinary state of a fresh empty foundry, not a fault.
+                return _observation(OBSERVED_SERVING, [], [],
+                                    "the API is answering; no datasets are deployed")
+
+            dead: list[str] = []
+            for dataset in datasets:
+                dead.extend(await _dead_services(client, base, dataset))
+
+            if dead:
+                return _observation(OBSERVED_PARTIAL, datasets, dead,
+                                    "not answering: " + ", ".join(dead))
+            return _observation(OBSERVED_SERVING, datasets, [],
+                                "every deployed service is answering")
+    except Exception as exc:
+        return _observation(OBSERVED_UNKNOWN, [], [],
+                            f"the environment could not be interrogated: {exc}")
+
+
+def _observation(observed: str, datasets: list[str], dead: list[str], detail: str) -> dict[str, Any]:
+    return {
+        "observed": observed,
+        "datasets": datasets,
+        "not_answering": dead,
+        "checked_at": int(time.time() * 1000),
+        "detail": detail,
+    }
+
+
+async def _deployed_datasets(client: httpx.AsyncClient, base: str) -> list[str] | None:
+    """The deployed dataset names, or None when the API does not answer."""
+    try:
+        response = await client.get(f"{base}/datafye-api/v1/deployment/datasets",
+                                    timeout=OBSERVE_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            return None
+        return list(response.json().get("datasets") or [])
+    except Exception:
+        return None
+
+
+async def _dead_services(client: httpx.AsyncClient, base: str, dataset: str) -> list[str]:
+    """The services of one dataset that are not answering.
+
+    ⚠️ Reading this response right matters three times, and each one fails
+    silently in the WRONG direction:
+
+    - A healthy service reports an **empty** status, so a truthiness check reads
+      exactly backwards -- it would call every healthy service dead.
+    - A healthy service actually sends ``"status": null`` on the wire, because
+      the ADM string is simply unset. ``entry.get("status") or ""`` folds that
+      into the empty case on purpose; the equivalent Java trap is that a plain
+      ``asText()`` on a JSON null returns the *string* ``"null"``, which would
+      condemn every healthy service.
+    - A response listing **no services at all** is not a pass. It means the API
+      does not know about what we asked after, and treating silence as health is
+      how a down service gets missed by the thing meant to notice it.
+
+    The shape is ``{"datasets": [{"services": {"<name>": {"status": ...}}}],
+    "trading": [...]}`` -- services is an OBJECT keyed by name, nested under
+    per-system groups, not a flat list.
+    """
+    try:
+        response = await client.get(
+            f"{base}/datafye-api/v1/health/ping",
+            params={"dataset": dataset},
+            timeout=PING_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            return [f"{dataset}: the API returned HTTP {response.status_code}"]
+        body = response.json()
+    except Exception as exc:
+        return [f"{dataset}: {exc}"]
+
+    dead: list[str] = []
+    reported = 0
+    for group in ("datasets", "trading"):
+        for system in body.get(group) or []:
+            for name, service in (system.get("services") or {}).items():
+                reported += 1
+                if ((service or {}).get("status") or "") != "":
+                    dead.append(f"{dataset}/{name}")
+
+    if reported == 0:
+        return [f"{dataset}: the API reports no services"]
+    return dead
+
+
+async def observe_forever(deployment_api_url: str) -> None:
+    """Keep the observation snapshot fresh, so /health never has to wait for it.
+
+    Failures are swallowed and retried: this is a background refresher, and an
+    exception escaping it would silently stop readiness updating for the life of
+    the process -- a stale snapshot that looks live is worse than a stale one
+    that says how old it is.
+    """
+    global _snapshot
+    while True:
+        try:
+            _snapshot = await observe(deployment_api_url)
+        except Exception as exc:
+            logger.warning("Foundry observation failed: %s", exc)
+        await asyncio.sleep(OBSERVE_INTERVAL_SECONDS)
+
+
+# ── Derivation: readiness from the three inputs ──────────────────────────
 
 
 def read_foundry_state() -> dict[str, Any]:
-    """The current foundry readiness, as {state, since, operation, intended,
-    error, reason}.
+    """Derived readiness, for /health.
 
-    Never raises. This is read on the /health path, which must answer even when
+    Never raises. This is on the /health path, which must answer even when
     everything else on the box is broken -- an agent that cannot report its
     health is indistinguishable from an instance that is simply dead, and that
     is the one distinction accounts needs most.
     """
     try:
-        with open(FOUNDRY_STATE_FILE, "r") as handle:
-            raw = json.load(handle)
-    except FileNotFoundError:
-        # The ordinary reading on a fresh box: the boot service is ordered after
-        # the agent, so the agent answers /health before anything has written a
-        # state. Absence is only meaningful after a grace period, and judging
-        # that is the caller's job -- accounts knows when the box booted, this
-        # process does not.
-        return _unknown("no foundry state has been recorded yet")
+        return derive(read_intent(), dict(_snapshot), in_flight_holder())
     except Exception as exc:
-        return _unknown(f"the foundry state file could not be read: {exc}")
+        return {
+            "state": STATE_UNKNOWN,
+            "intended": None,
+            "intent_source": None,
+            "observed": OBSERVED_UNKNOWN,
+            "in_flight": None,
+            "datasets": [],
+            "not_answering": [],
+            "checked_at": None,
+            "reason": f"readiness could not be derived: {exc}",
+            "error": None,
+        }
 
-    if not isinstance(raw, dict):
-        return _unknown("the foundry state file is not an object")
 
-    state = raw.get("state") or STATE_UNKNOWN
+def derive(intent: dict[str, Any], snapshot: dict[str, Any], in_flight: str | None) -> dict[str, Any]:
+    """Combine the three inputs into one answer.
+
+    Split out and pure so the truth table -- the part that is easy to get subtly
+    backwards -- is testable without a deployment, a clock, or a filesystem.
+    """
+    intended = intent.get("intended")
+    observed = snapshot.get("observed")
+
+    if in_flight:
+        # An operation owns the environment, so there is no settled state to
+        # report and inventing one is the u1 failure. Judge nothing.
+        state, reason = STATE_IN_PROGRESS, f"an operation is running: {in_flight}"
+    elif intended == INTENT_STOPPED:
+        # ⚠️ Deliberately ready. A foundry the user asked to stop is in good
+        # order; calling it unready would leave the box permanently unhealthy,
+        # fixable only by starting an environment they explicitly did not want.
+        # It is ready even if observation finds it SERVING -- somebody started it
+        # by hand, which is more than intended, not less.
+        state, reason = STATE_READY, "the foundry is stopped, which is what was asked for"
+    elif observed == OBSERVED_SERVING:
+        state, reason = STATE_READY, snapshot.get("detail") or "the environment is serving"
+    elif observed == OBSERVED_PARTIAL:
+        state, reason = STATE_NOT_READY, snapshot.get("detail") or "some services are not answering"
+    elif observed == OBSERVED_DOWN:
+        state, reason = STATE_NOT_READY, "the environment should be running but is not answering"
+    else:
+        state, reason = STATE_UNKNOWN, snapshot.get("detail") or "the environment has not been interrogated"
+
     return {
         "state": state,
-        "since": raw.get("since"),
-        "operation": raw.get("operation"),
-        "intended": raw.get("intended"),
-        "error": raw.get("error"),
-        "reason": None,
+        "intended": intended,
+        "intent_source": intent.get("source"),
+        "observed": observed,
+        "in_flight": in_flight,
+        "datasets": snapshot.get("datasets") or [],
+        "not_answering": snapshot.get("not_answering") or [],
+        "checked_at": snapshot.get("checked_at"),
+        "reason": reason,
+        # Kept so a reader written against the earlier shape does not KeyError.
+        # Failure detail lives in the report under ~/.datafye/logs, written by
+        # whoever ran the command -- it was never this block's to carry.
+        "error": None,
     }
 
 
 def is_ready(state: dict[str, Any]) -> bool:
     """Whether the foundry matches its intended state.
 
-    Deliberately NOT "is the foundry running". A foundry the user deliberately
-    stopped is in good order, and treating it as unready would leave that box
-    permanently unhealthy, fixable only by starting an environment they
-    explicitly did not want.
+    Deliberately NOT "is the foundry running": see the stopped branch above.
     """
-    return state.get("state") == "ready"
+    return state.get("state") == STATE_READY
 
 
 def describe_for_model(state: dict[str, Any]) -> str:
     """A sentence for the system prompt telling the model what it can rely on.
 
     The model is told the state AND the reason, so it can explain the situation
-    to the user rather than acting blindly on an environment that is mid-build.
-    That is the whole failure this addresses: the information existed, nothing
-    consumed it.
+    rather than discovering it by colliding with it. That is the whole failure
+    this addresses: the information existed, nothing consumed it.
     """
     name = state.get("state")
-    operation = state.get("operation")
     intended = state.get("intended")
-    error = state.get("error")
+    reason = state.get("reason")
 
-    if name == "ready" and intended == "stopped":
+    if name == STATE_IN_PROGRESS:
+        return (
+            f"The foundry on this box is NOT ready: {reason}. Do NOT start, apply, provision "
+            "or otherwise change the environment while that is running - a second operation on "
+            "one foundry is what corrupts it. Tell the user the environment is busy and roughly "
+            "what it is doing, then wait or ask them to try again shortly."
+        )
+    if name == STATE_READY and intended == INTENT_STOPPED:
         return (
             "The foundry on this box is provisioned but deliberately STOPPED. "
             "This is a healthy state, not a fault. Start it before any data work, "
             "and tell the user you are doing so."
         )
-    if name == "ready":
+    if name == STATE_READY:
         return "The foundry on this box is ready to use."
-    if name in ("provisioning", "restoring", "starting"):
+    if name == STATE_NOT_READY:
         return (
-            f"The foundry on this box is NOT ready: a '{operation or name}' operation is in "
-            "progress. Do NOT start, apply, provision or otherwise change the environment "
-            "while that is running - a second operation on one foundry is what corrupts it. "
-            "Tell the user the environment is still being prepared and roughly what it is doing, "
-            "then wait or ask them to try again shortly."
+            f"The foundry on this box is NOT ready: {reason}. It is meant to be running. "
+            "Check 'datafye foundry local status' first, then bring it back with "
+            "'datafye foundry local start', which relaunches only what is down and does NOT "
+            "destroy the deployed datasets. Read the newest report under ~/.datafye/logs before "
+            "rebuilding, and tell the user what you found rather than that 'there is a problem'."
         )
-    if name == "failed":
-        detail = f" The last error was: {error}" if error else ""
-        return (
-            f"The foundry on this box FAILED its last '{operation or 'operation'}'.{detail} "
-            "Read the newest failure report under ~/.datafye/logs before deciding anything, and "
-            "QUOTE the real error to the user. Do NOT rebuild automatically: the broken "
-            "environment is the only evidence of why it failed. Offer a rebuild as a choice."
-        )
-    if name == "absent":
+    if name == STATE_ABSENT:
         return (
             "There is no foundry on this box, and none is intended. Any data work needs one "
             "provisioned first - tell the user before doing it."
         )
 
-    reason = state.get("reason") or "no foundry state has been recorded"
     return (
         f"The readiness of the foundry on this box is UNKNOWN ({reason}). Check with "
         "'datafye foundry local status' before assuming an environment exists, and do not "
         "assume it is broken either."
     )
-
-
-def _unknown(reason: str) -> dict[str, Any]:
-    return {
-        "state": STATE_UNKNOWN,
-        "since": None,
-        "operation": None,
-        "intended": None,
-        "error": None,
-        "reason": reason,
-    }
 
 
 # ── Graceful stop before the box is powered off (DAT-125) ────────────────

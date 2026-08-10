@@ -60,6 +60,7 @@ import broker
 import conversations
 import credentials as credentials_module
 import memory
+import foundry
 from foundry import read_foundry_state, describe_for_model, graceful_stop
 import skills
 
@@ -2014,7 +2015,20 @@ async def lifespan(app: FastAPI):
             f"Check the foundry environment: datafye foundry local status"
         )
 
+    # Keep the foundry observation fresh in the background, so /health never
+    # waits on it. Interrogating costs real time when something is wrong (a dead
+    # service makes the deployment API wait out its own reply timeout), and
+    # /health is polled by accounts for dormancy decisions, by the upgrade cron
+    # every minute, and by the SPA. An agent that goes quiet is indistinguishable
+    # from a dead instance, which is the one thing it must never look like.
+    observer = asyncio.create_task(foundry.observe_forever(DATAFYE_DEPLOYMENT_API_URL))
+    logger.info(
+        f"  Foundry readiness: intent={foundry.read_intent()['intended']}, "
+        f"observing {DATAFYE_DEPLOYMENT_API_URL} every {foundry.OBSERVE_INTERVAL_SECONDS}s")
+
     yield
+
+    observer.cancel()
     logger.info("Datafye Agent Service shutting down...")
 
 
@@ -2386,6 +2400,47 @@ async def foundry_stop():
     return result
 
 
+class FoundryIntent(BaseModel):
+    """What accounts has decided this box's foundry should be doing."""
+    intended: str            # "running" | "stopped"
+    source: Optional[str] = None
+
+
+@app.post("/v1/foundry/intent",
+          dependencies=[Depends(require_bootstrapped),
+                        Depends(auth.require_accounts_lifecycle_jwt)])
+async def foundry_intent(intent: FoundryIntent):
+    """Receive the foundry intent accounts has recorded (DAT-198).
+
+    Push, not pull, for two reasons. The agent is deliberately receive-only --
+    accounts is the only writer in the relationship, and the agent-to-accounts
+    calls that do exist all forward the *user's* JWT. And that breaks exactly
+    where it is needed: the boot service reconciles the foundry before any user
+    exists, so there is no JWT to query with and a pull would need a new machine
+    credential.
+
+    What lands here is a REPLICA, not the record. Accounts owns intent because
+    that is where the user's decision actually arrives, and because a sandbox
+    rebuild would destroy anything held only on the box.
+
+    ⚠️ Intent is not per-mutation. The installer's upgrade, a `dataset add`, an
+    engineer's debugging `stop` are all mutations and none of them are policy.
+    The decisive case is dormancy: the idle monitor stopping a box must NOT
+    record `stopped`, or the box wakes and correctly declines to restore an
+    environment the user never asked to lose."""
+    try:
+        record = foundry.write_intent(intent.intended, intent.source or "accounts")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # Unlike most pushes this one must report failure: if the replica was not
+        # written, the boot service will reconcile against the previous value and
+        # accounts needs to know its push did not land.
+        logger.error("Could not record foundry intent: %s", e)
+        raise HTTPException(status_code=500, detail=f"could not record intent: {e}")
+    return record
+
+
 @app.get("/v1/skills", dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def get_skills(conversation_id: Optional[str] = None):
     """List the skills available to the agent, across all tiers:
@@ -2633,6 +2688,10 @@ _REQUIRED_ROUTES = {
     # proceeds to stop the box, which is the pre-DAT-125 behaviour restored
     # invisibly.
     ("POST", "/v1/foundry/stop"),
+    # Same reasoning: a silent 404 here means accounts' intent pushes vanish and
+    # every box quietly falls back to the default, which is indistinguishable
+    # from working until somebody stops their environment and it comes back.
+    ("POST", "/v1/foundry/intent"),
 }
 _present_routes = {
     (_m, getattr(_r, "path", None))
