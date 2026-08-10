@@ -304,6 +304,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
 | `/v1/credentials` | POST | REMOVED — returns 410 Gone; credential writes go through the accounts service |
 | `/v1/credentials/update` | POST | Accounts-only. Push a single credential `{provider, value}` into the encrypted store; 204 |
+| `/v1/activity` | POST | Presence heartbeat from the SPA (DAT-169). Advances `last_chat_activity_at` without running a chat turn, so a user who is *reading* still counts as present. JWT-protected, self-scoped, one assignment and no I/O. 204 |
 | `/v1/foundry/intent` | POST | Accounts-only, `agent-lifecycle`-token-gated. Record the foundry intent accounts has decided (`{intended, source}`); written to the on-disk replica the boot service reads. Errors are reported rather than swallowed — a push that did not land must not look like one that did |
 | `/v1/foundry/stop` | POST | Accounts-only, `agent-lifecycle`-token-gated. Bring the foundry down cleanly before the box is powered off (DAT-125). Returns `{status, detail}` where status is `stopped`/`absent`/`busy`/`failed` — `busy` tells accounts to ABORT the instance stop |
 | `/v1/credentials/status` | GET | Check which credentials are configured (JWT-protected) |
@@ -411,6 +412,21 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
+
+### Presence: a reading user is still a user (DAT-169)
+
+The accounts idle monitor measures idleness from `last_chat_activity_at`, and that field only ever advanced when a **chat turn** ran. So a user reading a backtest result, studying a scorecard, or thinking for half an hour looked exactly like a user who had closed the tab — and their box dormed underneath them.
+
+`POST /v1/activity` is the fix's agent half: it bumps the same timestamp a turn does, without running one.
+
+- **Deliberately the same field**, not a peer. The monitor's question is "when was this box last of use to somebody", and reading answers it as well as typing does; a second field would only make accounts take a `max` over two for no gain.
+- **It only ever PREVENTS dormancy, never reverses it** — a stopped box cannot receive a heartbeat, so waking stays the auto-wake path's job.
+- **⚠️ Visible tabs only, and the agent cannot enforce it.** That is the frontend's half of the contract: a hidden tab that kept pinging would pin every abandoned browser session's box awake forever, and dormancy would stop saving anything. The Yukti SPA gates on `document.hidden`, stops the interval when the tab goes away, and self-clears on sign-out (a tick with no token means the session is over). It also starts from the sandbox-state handler rather than only from `visibilitychange`, or a user who never switches tabs would send nothing at all.
+- **Cheap by construction** — one assignment, no I/O. Every open tab calls it on an interval, so anything more would be a per-user background load whose only purpose is to say "still here".
+
+**This is one of two guards and does not substitute for the other.** The heartbeat keeps a box warm for a present *user*; the warm signal below keeps it warm for active *work*. A provision running while nobody watches needs the second; a user reading while nothing runs needs the first.
+
+**⚠️ The payoff is a threshold change that has NOT been made.** Datafye sits at 30 minutes (`datafye.accounts.idle.threshold.minutes`) precisely because it lacked this; N5 runs 10 because it has one. Lowering it is deliberately a separate, later step — doing it before the heartbeat is deployed everywhere would make the problem worse, not better. Note it would also invalidate the arithmetic behind the warm-signal window, which is documented as a third of the threshold.
 
 ### The warm signal: why a box refuses to sleep (DAT-184)
 
