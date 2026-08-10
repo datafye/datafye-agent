@@ -692,6 +692,57 @@ skips it entirely when a binary already exists** — so a box's harness can be a
 was current the day it was built, and it will never move again. A fix that depends on harness
 behavior sits on ground that drifts per box.
 
+### A Runtime the Product Had Already Promised (DAT-201)
+
+The workspace has lifecycle tracks. Ask for a dashboard, an app or a tool and the
+project routes through Explore → Design → Build → **Ship**. That stepper had been
+rendering for months on a box with no JavaScript runtime on it at all. The product was
+describing work it could not do.
+
+The failure that surfaced it was smaller and more embarrassing than "cannot build a
+dashboard". The model reached for a bundled skill's palette validator — a little script
+that checks colour contrast — found no Node, said so, and then *proceeded on the
+documented values instead of checking its own work*. It did the honest thing available
+to it. The environment had simply removed the option of verifying.
+
+Installing it is unremarkable: a pinned tarball into `/opt`, symlinks into
+`/usr/local/bin`, exactly as Maven was already done. Pinned rather than latest, because
+we had just spent a day discovering that a runtime which silently differs per box is a
+bug you cannot reproduce.
+
+Two details were worth more thought than the install itself.
+
+**The root-owned trap, met for the third time.** `/opt/datafye/agent/venv` is root-owned
+by design — that is what makes fleet memory read-only. Node's install tree is root-owned
+for the same reason. And npm's default global prefix points straight into it, so
+`npm install -g` would produce an `EACCES` the model cannot fix and cannot distinguish
+from "Node is broken". So the installer gives the `datafye` user its own prefix. The
+interesting part is *where*: in `~datafye/.npmrc`, not a profile script, because a
+model's Bash command is not a login shell and `/etc/profile.d` would never reach it. The
+same reasoning drove a second change — `main.py` puts that prefix's `bin` on `PATH`,
+since the SDK subprocess inherits `os.environ` and nothing else would make a
+freshly-installed global tool runnable by the next command. **Where a setting lives is
+part of whether the setting works.**
+
+**And the thing we chose not to do.** The ticket suggested a small pre-installed
+baseline so the first build is not a cold npm fetch, which is a reasonable ask that we
+did not fulfil. Pre-warming a framework means *choosing* one — React, Vue, Svelte, or
+none — on evidence that only ever showed the model wanting to run a single JavaScript
+file. And every project's `node_modules` lands on the same root volume: the runtime is
+209 MB once, but a framework app is 100 MB+ *per project*, and unlike the runtime that
+number multiplies.
+
+So the prompt tells the model the truth instead: Node is here, a first `npm install`
+hits the network and is not instant, and for a chart it already has matplotlib and for a
+small page plain HTML with a `<script>` tag needs no build step at all. **Telling the
+model what is expensive is cheaper than pre-paying for a guess about what it will
+want** — and if evidence later shows one stack dominating, warming the npm cache for it
+is a two-line change made on data.
+
+The disk arithmetic is now written down rather than assumed, which is really an argument
+for DAT-178: this box still runs everything off one root volume, and it just acquired a
+dependency tree that grows per project.
+
 ### One Line of `pip install`, and What It Was Really About (DAT-210)
 
 The per-project Python environment worked exactly as designed. The model made a venv,

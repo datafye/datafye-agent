@@ -328,6 +328,52 @@ if ! command -v mvn &> /dev/null; then
     ln -sf "/opt/apache-maven-${MAVEN_VERSION}/bin/mvn" /usr/local/bin/mvn
 fi
 
+# ── Node.js for project code (DAT-201) ───────────────────────────
+# The lifecycle tracks already promise this: a `dashboard`/`app`/`tool` intent
+# routes to Explore -> Design -> Build -> Ship, and there was nothing to build
+# with. The concrete failure was smaller and more telling -- the model reached
+# for a bundled skill's palette validator, reported "No Node in this sandbox to
+# re-run the validator", and proceeded on documented values instead of checking
+# its own work.
+#
+# PINNED, like Maven above and unlike the Claude CLI (DAT-215): a runtime that
+# silently differs per box is a class of bug we have already paid for. Moving
+# the pin is a reviewable edit here.
+#
+# ⚠️ ~209 MB extracted. That is comparable to the whole quant stack, on a box
+# that still runs everything off one root volume (DAT-178) -- and per-project
+# `node_modules` lands on top of it. See PROJECT.md for the disk arithmetic.
+NODE_VERSION="24.19.0"          # LTS "Krypton"
+case "$(uname -m)" in
+    x86_64|amd64)  NODE_ARCH="x64" ;;
+    aarch64|arm64) NODE_ARCH="arm64" ;;
+    *)             NODE_ARCH="" ;;
+esac
+NODE_HOME="/opt/node-v${NODE_VERSION}-linux-${NODE_ARCH}"
+if [ -z "${NODE_ARCH}" ]; then
+    warn "Unsupported architecture $(uname -m) for Node; skipping."
+    warn "The model will not be able to build or run JavaScript."
+elif [ -x "${NODE_HOME}/bin/node" ]; then
+    ok "Node.js already at the pinned version: v${NODE_VERSION}"
+else
+    info "Installing Node.js v${NODE_VERSION} (${NODE_ARCH})..."
+    # Fetch to a temp file first: piping straight into tar leaves a half-extracted
+    # tree in /opt when the download dies, and the guard above would then treat a
+    # broken install as complete on the next run.
+    NODE_TGZ="$(mktemp -t node.XXXXXX.tar.xz)"
+    if curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" -o "${NODE_TGZ}" \
+       && tar -xJf "${NODE_TGZ}" -C /opt; then
+        ln -sf "${NODE_HOME}/bin/node" /usr/local/bin/node
+        ln -sf "${NODE_HOME}/bin/npm"  /usr/local/bin/npm
+        ln -sf "${NODE_HOME}/bin/npx"  /usr/local/bin/npx
+        ok "Node.js: $(node --version 2>/dev/null) / npm $(npm --version 2>/dev/null)"
+    else
+        warn "Could not install Node.js; the model will not be able to run JavaScript."
+        warn "Everything else is unaffected -- re-run the installer to retry."
+    fi
+    rm -f "${NODE_TGZ}"
+fi
+
 ok "Python: $(${PYTHON_BIN} --version) (${PYTHON_BIN})"
 ok "Java: $(java -version 2>&1 | head -1)"
 ok "Maven: $(mvn --version 2>/dev/null | head -1)"
@@ -414,6 +460,34 @@ chown datafye:datafye /home/datafye
 chown -R datafye:datafye "${WORKSPACE_DIR}"
 # Allow datafye user to run docker
 usermod -aG docker datafye 2>/dev/null || true
+
+# ── npm writes under the datafye user, never into /opt (DAT-201) ──
+# Project dependencies are already project-local: `npm install` in a project
+# folder writes ./node_modules, which is exactly the per-project isolation the
+# `.venv` gives Python. The trap is `npm install -g`, whose default prefix is
+# the Node install in /opt -- root-owned, like the agent's own venv, and for the
+# same deliberate reason. Without this the model would meet an EACCES it cannot
+# fix and could not tell from "Node is broken".
+#
+# Written as ~datafye/.npmrc rather than exported in a profile script because
+# npm reads it whatever the shell is. A model's Bash command is not a login
+# shell, so /etc/profile.d would not reach it.
+NPM_GLOBAL_DIR="/home/datafye/.npm-global"
+if [ ! -f /home/datafye/.npmrc ] || ! grep -q "^prefix=" /home/datafye/.npmrc 2>/dev/null; then
+    echo "prefix=${NPM_GLOBAL_DIR}" >> /home/datafye/.npmrc
+fi
+mkdir -p "${NPM_GLOBAL_DIR}/bin"
+# The npm CACHE too: if anything ever runs npm as root it creates a root-owned
+# ~/.npm, and every later install as datafye fails on it.
+mkdir -p /home/datafye/.npm
+chown -R datafye:datafye /home/datafye/.npmrc "${NPM_GLOBAL_DIR}" /home/datafye/.npm 2>/dev/null || true
+# Globally-installed CLIs land in that bin dir; put it on PATH for login shells.
+cat > /etc/profile.d/datafye-node.sh << EOF
+# npm's global prefix for the datafye user (see ~datafye/.npmrc)
+export PATH="\${PATH}:${NPM_GLOBAL_DIR}/bin"
+EOF
+chmod 0644 /etc/profile.d/datafye-node.sh
+
 ok "Workspace: ${WORKSPACE_DIR}"
 
 # ── Step: Stop existing service on upgrade ───────────────────────
