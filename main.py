@@ -215,6 +215,18 @@ MAX_BUFFER_SIZE = int(os.getenv("DATAFYE_AGENT_MAX_BUFFER_SIZE", str(16 * 1024 *
 # that would go stale the moment the envelope changes.
 READ_REFUSE_BYTES = MAX_BUFFER_SIZE // 2
 
+# Where npm puts globally-installed CLIs for the datafye user (DAT-201). The
+# installer sets this prefix in ~datafye/.npmrc so `npm install -g` does not try
+# to write into the root-owned Node tree in /opt, and adds this bin dir to PATH
+# in /etc/profile.d -- which reaches an operator's login shell but NOT the model,
+# whose Bash commands do not run in a login shell. Adding it here is what makes a
+# tool the model just installed globally actually runnable by the next command;
+# the SDK subprocess inherits os.environ. Harmless when the directory does not
+# exist (a box without Node, or before the first global install).
+_NPM_GLOBAL_BIN = os.path.expanduser("~/.npm-global/bin")
+if _NPM_GLOBAL_BIN not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _NPM_GLOBAL_BIN
+
 
 async def guard_oversized_read(
     input_data: dict[str, Any], tool_use_id: str | None, context: Any

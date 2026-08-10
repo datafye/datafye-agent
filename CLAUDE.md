@@ -108,6 +108,46 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### Node is installed, project-local by default (DAT-201)
+
+Node **v24.19.0 LTS ("Krypton")** plus npm and npx, from the official tarball into
+`/opt/node-v<ver>-linux-<arch>`, symlinked into `/usr/local/bin`. Same idiom as
+Maven above, and **pinned** — a runtime that silently differs per box is a class of
+bug already paid for (DAT-215). Both `x64` and `arm64` are handled; an unknown
+architecture warns and skips rather than aborting the install.
+
+The lifecycle tracks had been promising this all along (`dashboard`/`app`/`tool` →
+Explore → Design → Build → Ship) with nothing to build with. The concrete failure was
+smaller: the model reached for a bundled skill's palette validator, reported *"No Node
+in this sandbox"*, and proceeded on documented values instead of checking its work.
+
+**Dependencies are project-local**, mirroring the per-project `.venv`. `npm install`
+inside a project folder writes that project's `node_modules`; nothing is shared and no
+project can disturb another.
+
+⚠️ **The trap is `npm install -g`**, whose default prefix is the Node tree in `/opt` —
+root-owned, exactly like the agent's own venv and for the same deliberate reason. The
+installer sets `prefix=/home/datafye/.npm-global` in **`~datafye/.npmrc`** (npm reads it
+whatever the shell is; `/etc/profile.d` would not, since a model's Bash command is not a
+login shell) and pre-creates `~datafye/.npm` — because if anything ever runs npm as
+root, the resulting root-owned cache breaks every later install.
+
+⚠️ **`main.py` adds `~/.npm-global/bin` to `PATH`.** The profile script reaches an
+operator's login shell but not the model, so without this a tool the model just
+installed globally would not be runnable by its next command.
+
+**Disk (DAT-178).** The runtime is **209 MB extracted** (30 MB compressed) — comparable
+to the whole 292 MB quant stack, one time. The part that grows is per-project
+`node_modules`, which multiplies by project count and can be 100 MB+ each for a
+framework app. On a single root volume that is the number to watch, and it is a fresh
+argument for DAT-178 rather than something this ticket solves.
+
+**No framework baseline is pre-installed**, deliberately: pre-warming a stack would
+presume one (React? Vue? none?) on evidence that only ever showed a need to *run a JS
+file*, and it multiplies the disk above. The prompt therefore tells the model plainly
+that a first `npm install` hits the network, and points it at plain HTML or matplotlib
+when those suffice.
+
 ### The quant stack has one source of truth (DAT-210)
 
 `install/quant-stack.txt` lists the packages installed into the **system**
