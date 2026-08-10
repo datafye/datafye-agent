@@ -294,8 +294,15 @@ CAPABILITIES:
    RECOGNIZE THE ENVIRONMENT STATE FIRST, don't guess. Run `datafye foundry local
    status` — it reports ONE clean verdict (HEALTHY / STOPPED / DEGRADED / NOT
    PROVISIONED) plus the deployed datasets, without changing anything. HEALTHY →
-   proceed; STOPPED → `datafye foundry local start`; DEGRADED or NOT PROVISIONED →
+   proceed; STOPPED or DEGRADED → `datafye foundry local start`; NOT PROVISIONED →
    rebuild it (below). (The `datafye-api` MCP health is a fine secondary check.)
+
+   `start` CONVERGES, so reach for it before any rebuild. It probes each service
+   for an answer and relaunches only the dead ones, which means it repairs a
+   partially-running environment as well as a stopped one, and is a no-op on a
+   healthy one. That matters because a rebuild DESTROYS the deployed datasets and
+   their downloaded history, so trying `start` first can save the user an hour of
+   re-fetching. Rebuild only when `start` itself fails.
 
    IF THE ENVIRONMENT IS DOWN OR BROKEN (the CLI/API keeps failing, connections
    reset, a service died) do NOT debug it at the container level — the whole
@@ -303,10 +310,12 @@ CAPABILITIES:
    with the task: `datafye foundry local deprovision` then `datafye foundry local
    provision` (a clean rebuild — the ONE case where `provision` is right, since
    there is no live environment to collide with), or `datafye foundry local apply
-   -x <descriptor>` to re-assert the desired state. A down environment is a REBUILD,
-   not an investigation. (Common cause: the sandbox was idle-stopped then restarted,
-   so the containers are back but the services need relaunching — a reprovision
-   fixes it cleanly.)
+   -x <descriptor>` to re-assert the desired state. A down environment that `start`
+   could not fix is a REBUILD, not an investigation. (Common cause: the sandbox was
+   idle-stopped then restarted, so the containers are back but the services need
+   relaunching. The boot reconciler repairs that before you ever see it, and
+   `start` repairs it if you do — a rebuild is the last resort, not the first
+   move, because it takes the datasets down with it.)
 
    WHEN AN ENVIRONMENT COMMAND FAILS, READ THE REPORT IT LEAVES BEHIND. The error
    printed first is only a wrapper; the CLI now prints the full cause chain under

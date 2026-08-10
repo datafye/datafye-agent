@@ -33,7 +33,7 @@ datafye-agent/
 ├── install/
 │   ├── install_template.sh   # Installer/upgrader template (--mode hosted|standalone, --ami-cleanup)
 │   ├── first-boot.sh         # Marketplace/standalone first-boot script (reads EC2 user data, runs installer)
-│   ├── first-boot-foundry.sh # HOSTED first-boot foundry provisioner (datafye-foundry-firstboot.service)
+│   ├── foundry-boot.sh       # Foundry boot reconciler, all modes (datafye-foundry-boot.service)
 │   ├── upgrade-check.sh      # Auto-upgrade cron script
 │   └── publish_installer.sh  # Publishes versioned installer to downloads server
 ├── CLAUDE.md        # This file
@@ -107,64 +107,132 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
-### Foundry at first boot (DAT-170)
+### Foundry reconciliation at boot (DAT-199)
 
-A **hosted** sandbox provisions its own empty foundry on first boot, via the
-`datafye-foundry-firstboot.service` systemd one-shot (`install/first-boot-foundry.sh`,
-installed + enabled by the installer when `--mode hosted`). This is what makes the
-"your sandbox already has one" claim in `prompt.py` and the *pre-provisioned empty
-foundry* line above actually true.
+Every box, in every installer mode, reconciles its foundry on **every boot** through
+one systemd one-shot: `datafye-foundry-boot.service`, running
+`install/foundry-boot.sh`. This is what makes the "your sandbox already has one"
+claim in `prompt.py` and the *pre-provisioned empty foundry* line above actually
+true.
 
-It was not always. The hosted AMI bakes with `--ami-cleanup`, which deliberately
-skips provisioning (it writes instance-specific state under `~/.rumi` that must not
-be snapshotted) and deferred to a "first boot" step that **did not exist** — the
-other `first-boot.sh` is standalone/marketplace only and hard-codes
-`--mode standalone`. So every hosted sandbox came up with no foundry while the
-prompt told the agent one was already there, and the installer's own warning text
-claimed a third thing ("the agent will provision on demand" — it does not). All four
-statements now agree.
+**Why one unit and not two.** It replaces the hosted-only first-boot provisioner
+(`datafye-foundry-firstboot.service` / `first-boot-foundry.sh`, DAT-170) and
+supersedes the separate wake-restore hook DAT-124 proposed. Merging them is the
+whole point: **two boot-time actors mutating one foundry is the u1 incident**, where
+a first-boot provision, an agent `start` three minutes into it, and an `apply` on
+top of both destroyed the environment twice. Shipping a second boot-time actor would
+have moved that from every fresh boot to every wake. The hosted-only scope was wrong
+independently — a self-provisioned user stops and starts their own box and hits the
+identical app-less wake, and DAT-124's proposed `~rumi/boot.sh` is the Rumi Worker
+AMI's extension point, which a DIY box may not have either.
 
-**It leaves the foundry present but STOPPED**, not running, via `foundry local stop`
-after the provision. Two reasons, and the second is the one that matters:
+The **name changed with the job**. "first-boot" described one of the two things it
+does, and a unit whose name disagrees with its behaviour is exactly the drift that
+produced DAT-170 in the first place (an installer comment promising a first-boot step
+that did not exist).
 
-1. One uniform postcondition. After this unit runs, a foundry always exists and only
-   ever needs *starting*, so the wake path (DAT-124) has a single case to handle
-   rather than branching on "never existed" versus "existed but stopped".
-2. It keeps a fresh box out of the app-less wake state. `foundry local stop` runs each
-   system's `shutdown` admin script before stopping the environment, so the XVM apps
-   come down cleanly **and** the containers are marked EXPLICITLY stopped — which
-   `--restart unless-stopped` (what `LocalProvisioner` sets) deliberately does not
-   restart on the next daemon start. A foundry left *running* when the box stops is
-   the opposite case: its containers were never explicitly stopped, so they return as
-   bare sshd machines with no apps inside and the API never answers, which is the
-   DAT-171 wedge. Note this makes DAT-125 (graceful app-stop before an idle-box stop)
-   the same fix applied to the dormancy path.
+**What it reads, and what it does not write.** Readiness is *derived* from three
+inputs and stored as no single fact:
 
-Consequence worth tracking: something must *start* the foundry before first use. On a
-wake that is DAT-124's job; on the very first boot there is no wake event, so until
-DAT-124 lands the agent or the first environment request has to start it.
+| Input | Source |
+|---|---|
+| Intent | the local cache of the last intent accounts pushed (`~datafye/.datafye/run/foundry-intent.json`). **Absent means running** — no deviation has ever been recorded, and a sandbox exists to host a foundry |
+| Observed | interrogated on demand: are the applications **answering** |
+| In flight | the DAT-196 operation lock, plus the DAT-183 markers that report it |
 
-Three details are load-bearing:
+It **writes no state file**. An earlier cut had every lifecycle command record the
+environment's desired state; that shipped and was **reverted** (`datafye-deploy`
+PR #11). The bug: a human SSHes in to debug and runs `foundry local stop`, the engine
+records `intended=stopped`, and this unit then leaves the foundry down on every
+subsequent boot — a debugging action promoted into standing policy by a component
+with no way to tell the two apart. Intent is formed in **accounts**, where the user's
+request actually arrives, and is pushed here; the box holds a replica, never the
+record. (The push itself is DAT-198 and does not exist yet. The unit is correct
+without it, which is the design: absent cache means running.)
 
-- **It keys on real state, not a sentinel.** The script asks `foundry local status`
-  whether a foundry is provisioned rather than writing a done-marker. A marker
-  written before the work succeeded would lock a box out of ever retrying after a
-  failed provision, which is exactly the state this ticket exists to stop shipping.
-  Keying on real state also makes the unit safe to leave enabled: an ordinary reboot
-  or a dormancy wake costs a one-second no-op. `RemainAfterExit` is deliberately unset
-  for the same reason.
+**The reconcile, and the two rules that keep it safe:**
+
+```
+another operation owns the environment  -> exit cleanly, do nothing
+intent = stopped                        -> do nothing, whatever the observation
+no containers                           -> provision, and leave it RUNNING
+containers present                      -> converge via the idempotent start
+```
+
+- **Reconcile additively only.** Intent `stopped` with a fully serving foundry means
+  somebody started it by hand; never tear down live work to satisfy a record.
+- **Never act while something else owns the environment**, and exit **0** rather than
+  wait or force. A boot unit parked behind a 17-minute provision is indistinguishable
+  from a hung boot, and a red unit in `systemctl status` is a signal worth reserving
+  for the boots where the foundry really is broken.
+
+**⚠️ It leaves a fresh box RUNNING**, reversing DAT-170's provision-then-stop. Under
+the readiness model a fresh box must end up matching intent, and intent is running —
+otherwise it is permanently unready and `prompt.py`'s claim stays false on exactly
+the boxes that just built one. Both of DAT-170's original reasons survive elsewhere:
+the uniform postcondition is now this unit's job (it converges on *every* boot, not
+just the first), and staying out of the app-less wake state is **DAT-125**'s (stop
+the apps cleanly *before* the box stops).
+
+Details that are load-bearing:
+
+- **⚠️ The script cannot take the DAT-196 lock, and must not pretend to.** That lock
+  is a `FileChannel.tryLock()`, which maps to **fcntl(2)** POSIX record locks, while
+  `flock(1)` uses **flock(2)** — on Linux those are *independent lock namespaces*, so
+  a shell `flock` on the same file succeeds against a held Java lock and gives mutual
+  exclusion that silently is not. Exclusion is enforced where it always was: every
+  operation the script performs goes through the CLI, which takes the real lock for
+  its duration. The script's own check is the courtesy half — it avoids starting a
+  command that would only be refused, and names the holder in the journal. The window
+  between checking and acting is closed by the lock, not by the check.
+- **The in-flight check reads the DAT-183 marker, not the lock file.** The lock file
+  is deliberately never deleted on release (unlinking it would hand two processes
+  different inodes), so its contents describe the *last* holder, not necessarily a
+  current one. The marker's contract is the stronger one and is exactly this
+  question: present **AND** the process alive. A boot is also when **PID recycling**
+  bites — a marker left by a CLI killed before the last shutdown can name a PID this
+  boot has since reassigned — so `kill -0` is confirmed against
+  `/proc/<pid>/cmdline`.
+- **It does not skip the converge when `status` says HEALTHY.** That verdict keys on
+  the deployment API answering, and an environment with one dead service still
+  reports HEALTHY (**DAT-200**, reproduced live). Skipping on it would make the unit
+  blind to exactly the partial state it exists to repair. The serving decision belongs
+  to DAT-197's per-service prober, in one place, not duplicated in shell — which is
+  also why the only branch the script makes for itself is *does an environment exist
+  at all*.
+- **`start` is the converge primitive** (DAT-197): it probes each service for an
+  answer and launches only the dead ones, so one call covers a cleanly stopped box, an
+  app-less wake, and a partially serving one, and is a fast no-op on a healthy one.
+- **It announces by being an ordinary CLI caller.** `provision` and `start` each write
+  their own DAT-183 marker for their duration, so a boot-time provision is visible as
+  in-flight work rather than the box looking idle for seventeen minutes. Nothing here
+  changes when DAT-184 starts consuming that marker as the warm signal.
+- **It keys on real state, not a sentinel.** A done-marker written before the work
+  succeeded would lock a box out of ever retrying after a failed provision — exactly
+  the state this exists to stop shipping. `RemainAfterExit` is deliberately unset for
+  the same reason.
 - **It runs the CLI as `datafye`, always.** `rumi` is in `wheel` but NOT in `docker`,
-  so as any other user `foundry local status` cannot reach the Docker socket and
-  reports "not provisioned" — a false negative indistinguishable from an empty box,
-  which would send it on to provision on top of a live environment (DAT-172).
+  so as any other user the CLI cannot reach the Docker socket; before DAT-172 that
+  came back as "not provisioned" — a false negative indistinguishable from an empty
+  box, which sends you on to provision on top of a live environment. DAT-172 now
+  classes it as a permission failure, which is a better error but still not an answer,
+  so the script treats an indeterminate `Provisioned:` as **stop and say why**.
+- **⚠️ The installer must RETIRE the old unit, not just stop writing it.** An upgraded
+  box already has `datafye-foundry-firstboot.service` enabled and pointing at a copy
+  of the old script still on disk. Leaving it would put two boot-time actors on one
+  foundry — the incident, reintroduced by the change meant to prevent it. The
+  installer disables it, deletes the unit file *and* the old script; `disable` alone
+  is not enough, since a later `systemctl enable` by hand would resurrect it.
 - **It rides the companion-refresh loop** in `install_template.sh` alongside
   `upgrade-check.sh`, because it is executed from `INSTALL_DIR` by a systemd unit.
   Without that, a box would stay pinned to whatever version its AMI baked and a fix
   could only reach the fleet via a re-bake (the DAT-131 lesson).
 
 Failure is non-fatal: the agent is useful without a foundry (chat, docs, code and
-memory all work), so the unit logs loudly to the journal and retries next boot rather
-than leaving the agent service down.
+memory all work), so the unit logs loudly to the journal, leaves the failure report
+under `~/.datafye/logs` in place, and retries next boot rather than leaving the agent
+service down. It never auto-rebuilds — the broken environment is the only evidence of
+why it failed.
 
 ### `--version` selects what to install; `--pin` disables upgrades (DAT-187)
 
@@ -381,7 +449,7 @@ reports it, while the frontend renders whatever track it is handed.
 - **REPRESENTING DATAFYE prompt section**: a product-expert Q&A framing in `prompt.py` for when the user asks about Datafye itself — authoritative persona, accuracy/anti-confusion guard, graceful can't-answer, honesty — grounded in `{docs_dir}`
 - **Downloadable output files**: each project gets an `outputs/` folder (distinct from `uploads/`: uploads are context *into* the agent, outputs are deliverables the user takes away). `conversations.list_outputs`/`output_file_path` (path-safety-guarded); endpoints `GET …/outputs` (list) + `GET …/outputs/{filename}` (download, `FileResponse`, JWT-gated). A post-stream diff of the `outputs/` snapshot emits an `artifact` SSE event per new/changed file. The prompt tells the agent to write deliverables into `outputs/`
 - **Environment failures leave a report, and the prompt says to read it (DAT-171)**: a failed `provision`/`apply`/`start`/`stop` used to surface only `Failed to run admin script` wrapping `Command failed with exit code 1: docker exec ...`. The real error is written by the application to a log **inside the container**, and nothing pulled it out — so a root cause needed a live SSH session, which the agent does not have. Two changes outside this repo fixed that: `datafye-deploy` writes `~/.datafye/logs/foundry-<op>-<ts>.log` (cause chain + container inventory + the tail of each container's own app log, found by **searching** the container rather than assuming a path that has drifted), and `datafye-cli` tees every environment command's console output to `~/.datafye/logs/cli-<cmd>-<ts>.log` **flushing on every write** — because a provision killed mid-flight by the idle monitor raises nothing at all, so the only trace is one written as it went. The prompt now tells the agent to READ the newest report before deciding anything, to QUOTE the actual error to the user rather than saying "there is a problem with the platform", and to STOP rather than loop if a rebuild fails the same way (a second identical failure is a defect, not bad luck). ⚠️ The engine deliberately does **not** auto-roll-back a half-built environment: it is the only evidence of why the build failed, and tearing it down destroys the logs just collected. `status` remains the authority on whether the environment is actually partial
-- **Foundry resource guard + cheat sheet**: a **RESOURCE GUARD** prompt block tells the agent to estimate a fetch/replay's worst-case (high-volume-day) peak memory + disk, check the instance's real limits (`free -m`/`df -h`), and if it won't fit with headroom (peak <70% RAM, ≥5 GB disk free) STOP and ask the user to resize to a named size first — plus a hard OOM rule (a combined-ticks one-day buffer >~1.3 GB OOMs the fixed 2 GB history heap and writes zero data; resizing doesn't help — fetch trades/quotes separately or split symbols). The empirical numbers (per-symbol-day rates, formula, instance-size map, worked examples) live in a bundled reference file `reference/foundry-resource-cost-cheatsheet.md` (ships with the app clone); `CHEATSHEET_PATH` is passed to `build_system_prompt` as `cheatsheet_path` and the guard points the agent to read it on demand. Measured empirically via a Yukti project (foundry 2.0.28, 2026-07-17); re-measure if the `-Xmx2g` history heap or version changes. Also see the **dataset gotchas** in the prompt's Environment Management section: crypto symbols are **bare** (`BTCUSD`, never `X:BTCUSD` — the crypto dataset prepends `X:` itself, so `X:BTCUSD` becomes `X:X:BTCUSD` and returns zero data); crypto fetch parameters (including `dataset`) go in the **request body** — for crypto you can omit `dataset` (the `/crypto` path implies Crypto); crypto is **trades-only** (quotes come back empty) and a crypto day is **24h**; and **one dataset at a time** (multi-dataset environments are unreliable — they fail partway, often at the crypto launch step — so switch datasets with `dataset remove`/`dataset add`, not deprovision+reprovision). The sandbox boots with a **pre-provisioned empty foundry** (API + MCP up, no datasets), so the agent ADDS a dataset (`foundry local dataset add`/`apply`) rather than running `provision` (which collides with the running platform and fails — the root cause behind DAT-93's "stale container" misdiagnosis). On a **hosted** box that empty foundry comes from **`datafye-foundry-firstboot.service`** (see *Foundry at first boot* below) — for a while it came from nowhere at all, which is DAT-170
+- **Foundry resource guard + cheat sheet**: a **RESOURCE GUARD** prompt block tells the agent to estimate a fetch/replay's worst-case (high-volume-day) peak memory + disk, check the instance's real limits (`free -m`/`df -h`), and if it won't fit with headroom (peak <70% RAM, ≥5 GB disk free) STOP and ask the user to resize to a named size first — plus a hard OOM rule (a combined-ticks one-day buffer >~1.3 GB OOMs the fixed 2 GB history heap and writes zero data; resizing doesn't help — fetch trades/quotes separately or split symbols). The empirical numbers (per-symbol-day rates, formula, instance-size map, worked examples) live in a bundled reference file `reference/foundry-resource-cost-cheatsheet.md` (ships with the app clone); `CHEATSHEET_PATH` is passed to `build_system_prompt` as `cheatsheet_path` and the guard points the agent to read it on demand. Measured empirically via a Yukti project (foundry 2.0.28, 2026-07-17); re-measure if the `-Xmx2g` history heap or version changes. Also see the **dataset gotchas** in the prompt's Environment Management section: crypto symbols are **bare** (`BTCUSD`, never `X:BTCUSD` — the crypto dataset prepends `X:` itself, so `X:BTCUSD` becomes `X:X:BTCUSD` and returns zero data); crypto fetch parameters (including `dataset`) go in the **request body** — for crypto you can omit `dataset` (the `/crypto` path implies Crypto); crypto is **trades-only** (quotes come back empty) and a crypto day is **24h**; and **one dataset at a time** (multi-dataset environments are unreliable — they fail partway, often at the crypto launch step — so switch datasets with `dataset remove`/`dataset add`, not deprovision+reprovision). The sandbox boots with a **pre-provisioned empty foundry** (API + MCP up, no datasets), so the agent ADDS a dataset (`foundry local dataset add`/`apply`) rather than running `provision` (which collides with the running platform and fails — the root cause behind DAT-93's "stale container" misdiagnosis). That empty foundry comes from **`datafye-foundry-boot.service`** (see *Foundry reconciliation at boot* below), which reconciles it on every boot in every mode — for a while it came from nowhere at all, which is DAT-170
 - **Inferred per-project satisfaction**: `analyze_satisfaction` is a cheap Haiku sidecar (like `classify_lifecycle`, uses `TITLE_MODEL`) that infers a 1-5 rank + short reasons from the recent transcript, run post-stream. `_report_satisfaction_to_accounts` POSTs the *derived signal only* (never the raw conversation) to `POST /accounts/{u}/projects/{id}/satisfaction` (`source=inferred`, forwards the user JWT — the same self-scoped agent→accounts pattern the usage reporter uses). `conversations.set_satisfaction` caches it agent-side; a `"user"` source is sticky over an inferred one
 - **In-conversation reporting tools (feedback + explicit satisfaction)**: `_build_reporting_mcp` stands up an in-process SDK-MCP server (`create_sdk_mcp_server`/`@tool`) with two tools the model can call mid-chat — `submit_feedback` (logs a bug/suggestion/general note to `POST /accounts/{u}/feedback`, which routes to Slack + a tracking issue; the response's **`ticket`** key — provider-neutral, `jira` kept as a fallback for older builds — is surfaced as "A tracking ticket was opened (`DAT-NNN`)" when one opens) and `submit_satisfaction` (records an *explicit* user rating with `source=user`, which is sticky over the inferred read). Both forward the user's own JWT — the same self-host-safe channel usage/satisfaction reporting uses, so the agent holds no Slack/JIRA creds. The server is only attached when routing is possible (a platform user with a forwarded JWT); a self-hosted run without accounts skips it, so the model falls back to the app's Send-feedback button. Prompt gains FEEDBACK + SATISFACTION sections: offer to log only after the user agrees, and capture a rating only when the user genuinely gives one (never fish for it). Ported from nvx-sutra-agent `219a09d`+`a155c39` (the explicit half)
 - **Report for any registered project (not just `proj-` ids)**: the usage + satisfaction reporters and the post-stream satisfaction gate no longer require a `proj-` id prefix — accounts is the authority, so a **reconciled** browser-local project (a create that failed, imported into the registry via accounts' reconcile endpoint) also gets reported. The reporters accept any id (an unregistered one 404s and the best-effort call just logs it); the post-stream satisfaction gate keys on a **forwarded identity** (`auth_token` + `AGENT_USERNAME`) instead of the prefix, so it still skips a self-hosted run with no accounts. Ported from nvx-sutra-agent `675f63b`

@@ -21,10 +21,21 @@ a user's request onto a box three minutes into its first provision -- the agent
 even logged "Datafye API MCP: NOT REACHABLE" fifteen seconds beforehand, and
 nothing acted on it.
 
-The state file is a cross-language contract. The deploy engine writes it in Java
-from every lifecycle command; the foundry boot service writes it in shell. This
-module only reads it, and deliberately does no inference of its own: the whole
-point of the file is that layers stop guessing from side effects.
+⚠️ NOTHING WRITES THIS FILE TODAY, so `/health` reports `unknown` on every box.
+That is expected, not a defect to chase. Both writers were removed on purpose:
+the deploy engine's was shipped and then REVERTED (datafye-deploy PR #11,
+because a lifecycle command cannot tell a debugging `stop` from a policy
+decision), and the foundry boot service deliberately writes no state either
+(DAT-199 -- it acts, it does not narrate). Under the agreed model readiness is
+DERIVED by whoever asks, from intent (pushed by accounts) + observation + the
+in-flight lock, rather than stored as one fact by whoever moved last.
+
+This module is kept as the reader half so re-pointing it at the derived form is
+additive. Wiring that up is DAT-198's remaining work; until then every caller
+gets `unknown`, which is a truthful answer.
+
+It deliberately does no inference of its own: the whole point was that layers
+stop guessing from side effects.
 
 Note the file lives under the CLI's run directory (~/.datafye/run), NOT the
 agent's state root. It describes the environment on the box, which outlives and
