@@ -24,7 +24,7 @@ keeps a deployed instance's state in one predictable place.
 What lives under the state root:
   - credentials.bin        (encrypted credentials store)
   - broker_user.json       (legacy ConnectTrade user creds, migrated on load)
-  - conversations/ | strategies/   (the chat/strategy store)
+  - conversations/ | projects/   (the chat/project store)
   - plugins/user/          (writable user-global skill plugin)
 
 Each consumer keeps its own narrower override env var (e.g.

@@ -31,16 +31,16 @@ how far the knowledge reaches:
     agent writes.
 
   - USER    (<state>/memory/ + <state>/CLAUDE.md): facts about THIS user's
-    workspace that hold across their strategies — preferences, reusable
-    patterns, lessons from one strategy that apply to the next. Owned by this
+    workspace that hold across their projects — preferences, reusable
+    patterns, lessons from one project that apply to the next. Owned by this
     module. (Called GLOBAL until fleet memory made that word ambiguous.)
 
-  - STRATEGY (<strategy>/memory/ + <strategy>/CLAUDE.md): facts specific to
-    one strategy. The strategy folder and its CLAUDE.md/memory are scaffolded by
-    conversations.py; the SDK auto-loads the strategy's CLAUDE.md as project
+  - PROJECT (<project>/memory/ + <project>/CLAUDE.md): facts specific to
+    one project. The project folder and its CLAUDE.md/memory are scaffolded by
+    conversations.py; the SDK auto-loads the project's CLAUDE.md as project
     memory (setting_sources=["project"]), so this module injects only the things
     the SDK does NOT auto-load: the user notes, the user index, the fleet index,
-    and the per-strategy memory INDEX (memory/MEMORY.md is not auto-loaded;
+    and the per-project memory INDEX (memory/MEMORY.md is not auto-loaded;
     CLAUDE.md is).
 
 build_memory_context() renders the always-on block for the system prompt: the
@@ -72,7 +72,7 @@ FLEET_DIR = Path(
 )
 FLEET_INDEX = FLEET_DIR / "MEMORY.md"
 
-# USER — this user's workspace, across their strategies. Agent-writable.
+# USER — this user's workspace, across their projects. Agent-writable.
 USER_DIR = Path(paths.state_path("memory"))
 USER_INDEX = USER_DIR / "MEMORY.md"
 USER_CLAUDE_MD = Path(paths.state_path("CLAUDE.md"))
@@ -80,13 +80,13 @@ USER_CLAUDE_MD = Path(paths.state_path("CLAUDE.md"))
 _USER_INDEX_TEMPLATE = """# User Memory
 
 Memory for this user's workspace: preferences, reusable patterns, and lessons
-that apply to more than one of their strategies. One line per memory file.
+that apply to more than one of their projects. One line per memory file.
 (Empty for now.)
 """
 
 _USER_CLAUDE_TEMPLATE = """# Working Notes
 
-Durable notes for this user's Datafye workspace, across strategies. Keep it
+Durable notes for this user's Datafye workspace, across projects. Keep it
 concise. (Empty for now.)
 """
 
@@ -112,17 +112,17 @@ def _read(path: os.PathLike | str) -> str:
         return ""
 
 
-def build_memory_context(strategy_cwd: str | None) -> str:
+def build_memory_context(project_cwd: str | None) -> str:
     """Render the always-on MEMORY block for the system prompt.
 
-    `strategy_cwd` is the current strategy folder (the chat turn's cwd), or None
+    `project_cwd` is the current project folder (the chat turn's cwd), or None
     for conversation-less/fallback requests (then only fleet + user memory)."""
     user_notes = _read(USER_CLAUDE_MD) or "(none yet)"
     user_index = _read(USER_INDEX) or "(empty)"
     fleet_index = _read(FLEET_INDEX)
 
-    strat_mem_dir = os.path.join(strategy_cwd, "memory") if strategy_cwd else None
-    strat_index = _read(os.path.join(strat_mem_dir, "MEMORY.md")) if strat_mem_dir else ""
+    project_mem_dir = os.path.join(project_cwd, "memory") if project_cwd else None
+    project_index = _read(os.path.join(project_mem_dir, "MEMORY.md")) if project_mem_dir else ""
 
     # Fleet memory is optional: a self-hosted or pre-seed instance has no bank,
     # and an empty stub in the prompt would only invite the model to wonder
@@ -150,16 +150,16 @@ def build_memory_context(strategy_cwd: str | None) -> str:
         if has_fleet else ""
     )
 
-    per_strategy_line = (
-        f"- STRATEGY memory ({strat_mem_dir}) plus this strategy's CLAUDE.md: "
-        f"facts specific to the strategy you are working on now."
-        if strat_mem_dir else
-        "- STRATEGY memory is unavailable for this request (no strategy folder)."
+    per_project_line = (
+        f"- PROJECT memory ({project_mem_dir}) plus this project's CLAUDE.md: "
+        f"facts specific to the project you are working on now."
+        if project_mem_dir else
+        "- PROJECT memory is unavailable for this request (no project folder)."
     )
 
-    strat_section = (
-        f"\n\nTHIS STRATEGY'S MEMORY INDEX:\n{strat_index or '(empty)'}"
-        if strat_mem_dir else ""
+    project_section = (
+        f"\n\nTHIS PROJECT'S MEMORY INDEX:\n{project_index or '(empty)'}"
+        if project_mem_dir else ""
     )
 
     return f"""MEMORY:
@@ -167,17 +167,17 @@ You keep durable memory across sessions as plain markdown files, so you do not
 relearn the same things each time. It is organised by SCOPE — how far the
 knowledge reaches:
 {fleet_scope_line}- USER memory ({USER_DIR}): facts about this user's workspace that hold across
-  their strategies — their preferences, reusable patterns, lessons from one
-  strategy that apply to the next.
-{per_strategy_line}
+  their projects — their preferences, reusable patterns, lessons from one
+  project that apply to the next.
+{per_project_line}
 
 How to use it:
 - The indexes below list what is remembered (one line each). When a line looks
   relevant, Read that file for the detail — do not guess from the one-liner.
 - When you learn something durable and useful for a FUTURE session, write a short
   markdown file in the right memory dir and add a one-line pointer to that dir's
-  MEMORY.md. Choose USER vs STRATEGY by whether it is reusable across
-  strategies. Keep this strategy's CLAUDE.md (working memory) and PROJECT.md
+  MEMORY.md. Choose USER vs PROJECT by whether it is reusable across
+  projects. Keep this project's CLAUDE.md (working memory) and PROJECT.md
   current too.
 - Do NOT record transient, conversation-only details, secrets/API keys, or
   anything already obvious from the code and files.{fleet_write_rule}
@@ -193,8 +193,8 @@ How to use it:
   it as one. An agent has already saved a confidently wrong diagnostic rule this
   way; check fleet memory first, and if it contradicts you, it wins.
 
-WORKING NOTES (this user, across strategies):
+WORKING NOTES (this user, across projects):
 {user_notes}
 
 USER MEMORY INDEX:
-{user_index}{fleet_section}{strat_section}"""
+{user_index}{fleet_section}{project_section}"""

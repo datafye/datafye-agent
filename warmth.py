@@ -242,7 +242,7 @@ def running_apps() -> list[dict[str, Any]]:
         # Imported here, not at module load: conversations is a heavier module
         # and this keeps warmth importable on its own (the tests rely on that).
         import conversations
-        base = conversations.strategies_base()
+        base = conversations.projects_base()
         if not base.exists():
             return apps
         for project in base.iterdir():
