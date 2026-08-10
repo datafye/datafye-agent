@@ -436,6 +436,33 @@ Three branches of the truth table are worth stating because the obvious reading 
 
 **⚠️ Reading the ping right matters three times, and each fails silently in the wrong direction.** A healthy service reports an **empty** status, so a truthiness check reads exactly backwards. A healthy service actually sends `"status": null` on the wire (the ADM string is unset) — `entry.get("status") or ""` folds that in deliberately; the equivalent Java trap is that a plain `asText()` on a JSON null returns the *string* `"null"`. And a response listing **no services at all** is not a pass. The shape is `{"datasets":[{"services":{"<name>":{"status":…}}}],"trading":[…]}` — services is an object keyed by name, nested under per-system groups. All nine payloads `ServiceHealthTest` copied off a live foundry are replayed through the Python parse in the test suite, because the agent and the CLI disagreeing about one box's health would be worse than either being wrong alone.
 
+### Who may change the foundry intent, and how (DAT-214)
+
+Intent is owned by accounts (DAT-198), and working through every actor that can mutate a foundry leaves **exactly one** that may legitimately change it:
+
+| Actor | Changes intent | Why |
+|---|---|---|
+| Accounts — explicit stop/start | **No** | box-scoped: stopping your sandbox on Friday should not cost you your environment on Monday |
+| Accounts — dormancy | **No** | the decisive test; otherwise a box wakes and declines to restore what nobody asked to lose |
+| **User, through the model** | **Yes** | the only actor in the conversation, so the only one that knows |
+| User, through the Yukti SPA | **No** | its Stop is box-scoped, same as accounts' |
+| Operator, through the CLI | **No** | a debugging `stop` is not a policy statement |
+
+So the agent is the sole production caller of `POST /accounts/{u}/sandbox/foundry-intent`, forwarding the **user's own JWT** — the same self-scoped channel the usage, satisfaction and feedback reporters use. The admin console keeps it as a manual override; the SPA never calls it.
+
+**⚠️ The distinguishing factor is not the command.** `datafye foundry local stop` run because the user said *"shut it down for the month"* and the same command run because the model is working around a wedge are **byte-identical**. Inferring intent from the command is precisely the design that shipped and was reverted — it is what promotes a debugging action into standing policy.
+
+**Two mechanisms, because a prompt rule alone will not hold.** The model has to classify a request as policy *and* remember a second action after it has already performed the first, and this codebase has paid for trusting that before: the prompt told the agent how to run long operations and it backgrounded a provision anyway, which was then orphaned with the session (DAT-185).
+
+- **`set_environment_intent`** — a tool on the same in-process MCP server as `submit_feedback`/`submit_satisfaction`. The explicit path, for a decision the user actually stated.
+- **`classify_environment_intent`** — a fourth post-stream Haiku sidecar alongside `generate_title`/`classify_lifecycle`/`analyze_satisfaction`. It **always runs**, so it does not depend on the model choosing anything.
+
+They cannot fight: `_intent_recorded_this_turn` marks a turn where the tool fired, and the sidecar skips that turn and consumes the mark. **Explicit always beats inferred**, because the model's own statement is better evidence than an inference drawn from the same conversation.
+
+**⚠️ The classifier is deliberately biased towards "no decision"**, and the bias is asymmetric for a reason: a wrong `stopped` leaves the user without an environment, while a missed one only means theirs keeps running — which is the default anyway. Pinned in tests: an unrecognised value, unparseable output, an API failure and a missing key all come back as no decision rather than a guess.
+
+Everything here is best-effort and never fails the turn, in line with every other agent → accounts reporter, and a self-hosted run with no accounts routing simply does not offer the tool.
+
 ### Stopping the environment before the box (DAT-125)
 
 The accounts idle monitor used to call StopInstance on a live sandbox directly. That pulls the floor out from under a running foundry twice over: the Rumi applications are killed mid-write, risking unflushed transaction logs, and the containers are never marked stopped — so `--restart unless-stopped` faithfully restores them on the next boot **with no applications inside**, which is the DAT-171 wedge. It was observed doing exactly that on u1, sixteen minutes into a provision.
