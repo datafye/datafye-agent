@@ -613,6 +613,79 @@ _SATISFACTION_PROMPT = (
 )
 
 
+_ENVIRONMENT_INTENT_PROMPT = (
+    "You read one turn of a conversation between a user and Yukti (an AI that "
+    "builds trading strategies) and decide whether the USER stated a STANDING "
+    "DECISION about their Datafye environment -- the cloud data platform Yukti "
+    "runs their work on.\n\n"
+    "A standing decision is the user saying what should be true of their "
+    "environment from now on: 'shut it down, I'm done for the month', 'tear it "
+    "down', 'stop it until I'm back', 'bring my environment back up', 'set one up "
+    "for me'.\n\n"
+    "It is NOT a standing decision when the environment is stopped, restarted or "
+    "rebuilt as a STEP IN DOING WORK -- fixing something broken, switching "
+    "datasets, freeing memory, retrying a failed build. Yukti does that routinely "
+    "and the user has decided nothing. If you are not sure, answer none: a wrong "
+    "'stopped' leaves the user without an environment, while a missed one only "
+    "means it keeps running.\n\n"
+    "Reply with ONLY a JSON object, no markdown fences and no other text:\n"
+    '{"intended": "running" | "stopped" | "none", '
+    '"reason": "<one short plain sentence, or empty for none>"}\n\n'
+    "Turn:\n\n"
+)
+
+
+async def classify_environment_intent(transcript: str,
+                                      usage_sink: Optional[list] = None) -> Optional[str]:
+    """Infer a standing decision about the environment the model did not report.
+
+    The safety net under `set_environment_intent` (DAT-214). A prompt rule asks
+    the model to classify a request as policy AND to remember a second action
+    after it has already performed the first -- and this codebase has paid for
+    trusting that before, when the prompt's guidance on long commands did not
+    stop the agent backgrounding a provision that was then orphaned (DAT-185).
+    This runs post-stream on every turn, so it does not depend on the model
+    choosing anything.
+
+    Returns "running" / "stopped", or None for no decision. Deliberately biased
+    towards None: a wrong "stopped" leaves someone without an environment, while
+    a missed one only means theirs keeps running, which is the default anyway.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key or not transcript.strip():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": TITLE_MODEL,
+                    "max_tokens": 150,
+                    "messages": [{"role": "user",
+                                  "content": _ENVIRONMENT_INTENT_PROMPT + transcript[:6000]}],
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        if usage_sink is not None and data.get("usage"):
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"]})
+        parts = data.get("content", [])
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        obj = _extract_json_object(text)
+        if not obj:
+            return None
+        intended = str(obj.get("intended") or "none").strip().lower()
+        return intended if intended in ("running", "stopped") else None
+    except Exception as e:
+        logger.warning("Environment-intent classification failed: %s", e)
+        return None
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     """Pull the first JSON object out of a model reply, tolerant of fences/prose."""
     if not text:
@@ -844,6 +917,47 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
         logger.warning("Satisfaction report failed for %s: %s", conversation_id, e)
 
 
+# Which turns already recorded an intent explicitly. The post-stream sidecar
+# skips those, so the model's own statement is never second-guessed by an
+# inference drawn from the same conversation. Keyed by turn id and cleared as
+# the turn ends -- this is a within-turn interlock, not a store.
+_intent_recorded_this_turn: set[str] = set()
+
+
+async def _report_foundry_intent_to_accounts(intended: str, source: str,
+                                             auth_token: Optional[str]) -> bool:
+    """Best-effort: record a foundry INTENT change with accounts (DAT-214).
+
+    Accounts owns intent and pushes it back to this box as a replica, so this is
+    the agent asking the owner to change the record -- not writing it locally.
+    Writing it here would be the reverted design: the box is the most ephemeral
+    component in the system, and a rebuild destroys anything held only on it.
+
+    Forwards the user's own JWT, the same self-scoped channel the usage,
+    satisfaction and feedback reporters use. That is what makes the agent's
+    request legitimate: it is acting for the person who asked, not on its own
+    authority, and a self-hosted run with no accounts simply skips it.
+    """
+    if not auth_token or not AGENT_USERNAME or not getattr(auth, "ACCOUNTS_URL", None):
+        return False
+    if intended not in ("running", "stopped"):
+        return False
+
+    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+           f"{AGENT_USERNAME}/sandbox/foundry-intent")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json={"intended": intended, "source": source},
+                                     headers={"Authorization": f"Bearer {auth_token}"})
+        if resp.status_code // 100 == 2:
+            logger.info("Foundry intent recorded with accounts: %s (%s)", intended, source)
+            return True
+        logger.warning("Foundry intent report returned %s", resp.status_code)
+    except Exception as e:
+        logger.warning("Foundry intent report failed: %s", e)
+    return False
+
+
 def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[str]):
     """In-process tools the model can call to report to accounts, forwarding the
     user's own JWT (the self-host-safe channel usage reporting uses; accounts, not
@@ -918,7 +1032,47 @@ def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[st
         await _report_satisfaction_to_accounts(conversation_id or "", rank, reasons, "user", auth_token)
         return {"content": [{"type": "text", "text": "Thanks, I've noted your rating."}]}
 
-    return create_sdk_mcp_server("feedback", "1.0.0", tools=[submit_feedback, submit_satisfaction])
+    @tool(
+        "set_environment_intent",
+        "Record that the USER has decided what should happen to their Datafye "
+        "environment for the foreseeable future -- not what you are about to do "
+        "to it. `intended` is 'stopped' when they ask you to shut their "
+        "environment down, tear it down, or stop paying for it until they come "
+        "back, and 'running' when they ask for it back or ask you to build one. "
+        "`reason` is a short plain note in the user's words. "
+        "Call this ONLY for a standing decision the user actually expressed. Do "
+        "NOT call it when you stop, restart or rebuild the environment as part of "
+        "doing work -- that is mechanics, and recording it would leave their "
+        "environment switched off long after the task is done.",
+        {"intended": str, "reason": str},
+    )
+    async def set_environment_intent(args):
+        intended = (args.get("intended") or "").strip().lower()
+        if intended not in ("running", "stopped"):
+            return {"content": [{"type": "text",
+                                 "text": "Intent must be 'running' or 'stopped', so nothing was recorded."}]}
+        recorded = await _report_foundry_intent_to_accounts(intended, "user", auth_token)
+        if not recorded:
+            return {"content": [{"type": "text",
+                                 "text": "Could not record that decision right now. The environment itself is "
+                                         "unaffected; say so rather than claiming it was saved."}]}
+        _intent_recorded_this_turn.add(_current_turn_key(conversation_id))
+        return {"content": [{"type": "text",
+                             "text": f"Recorded: their environment should be {intended} from now on."}]}
+
+    return create_sdk_mcp_server("feedback", "1.0.0",
+                                 tools=[submit_feedback, submit_satisfaction, set_environment_intent])
+
+
+def _current_turn_key(conversation_id: Optional[str]) -> str:
+    """The interlock key for "an intent was already recorded in this turn".
+
+    Per-conversation rather than per-turn-id because the tool runs inside the
+    SDK subprocess and does not see the turn id the streamer holds. A
+    conversation is single-turn at a time, so it is the same guarantee with a
+    handle both sides can name.
+    """
+    return conversation_id or "-"
 
 
 # --- Bash command classification (feeds _tool_commentary) ---
@@ -1843,6 +1997,19 @@ async def stream_agent_response(
                 conversations.set_satisfaction(conversation_id, sat["rank"], sat["reasons"], "inferred")
                 await _report_satisfaction_to_accounts(
                     conversation_id, sat["rank"], sat["reasons"], "inferred", auth_token)
+
+            # Catch a standing decision about the environment that the model did
+            # not report itself (DAT-214). Skipped when `set_environment_intent`
+            # already fired this turn -- the model's own statement is the better
+            # evidence, and letting an inference drawn from the same conversation
+            # overwrite it is how the two mechanisms would fight.
+            turn_key = _current_turn_key(conversation_id)
+            if turn_key in _intent_recorded_this_turn:
+                _intent_recorded_this_turn.discard(turn_key)
+            else:
+                intended = await classify_environment_intent(transcript, sidecar_usage)
+                if intended:
+                    await _report_foundry_intent_to_accounts(intended, "inferred", auth_token)
 
         # Record + report this turn's usage, attributed to the stage it landed
         # in and the model that ran it. Drives the workspace telemetry (meta,
