@@ -23,11 +23,11 @@ Skills come in three tiers:
     them when relevant AND the user can invoke them explicitly.
 
   - User-global: written by the agent into ~/.datafye/agent/plugins/user.
-    Reusable across every strategy in this user's workspace.
+    Reusable across every project in this user's workspace.
 
-  - User per-strategy (Phase 1): <strategy>/.claude/skills, loaded by the SDK
-    via setting_sources=["project"] when the strategy folder is the cwd. That
-    tier is owned by the strategy store, not this module.
+  - User per-project (Phase 1): <project>/.claude/skills, loaded by the SDK
+    via setting_sources=["project"] when the project folder is the cwd. That
+    tier is owned by the project store, not this module.
 
 Both plugin tiers here are handed to the Claude Agent SDK as local plugins,
 which the SDK forwards to the CLI as --plugin-dir. Plugins are rebuilt per
@@ -59,7 +59,7 @@ SYSTEM_PLUGIN_DIR = Path(
     )
 )
 
-# User-global skills — agent-writable, reusable across strategies.
+# User-global skills — agent-writable, reusable across projects.
 USER_PLUGIN_DIR = Path(
     os.environ.get(
         "DATAFYE_AGENT_USER_PLUGIN_DIR",
@@ -73,7 +73,7 @@ _USER_PLUGIN_MANIFEST = {
     "version": "0.1.0",
     "description": (
         "User-defined skills created in this Datafye workspace, reusable "
-        "across strategies."
+        "across projects."
     ),
     "skills": ["./skills"],
 }
@@ -87,7 +87,7 @@ def ensure_user_plugin() -> None:
     """Create the writable user-skill plugin scaffold if it does not exist.
 
     The SDK can load a plugin with zero skills, so scaffolding an empty plugin
-    up front gives the agent a stable place to author cross-strategy skills
+    up front gives the agent a stable place to author cross-project skills
     without a chicken-and-egg problem. Best-effort: a failure here just means
     no user-global skills until the directory can be created."""
     skills_dir = USER_PLUGIN_DIR / "skills"
@@ -119,7 +119,7 @@ def build_plugins() -> list[dict]:
 
 
 def user_global_skills_dir() -> Path:
-    """Directory the agent writes user-global (cross-strategy) skills into."""
+    """Directory the agent writes user-global (cross-project) skills into."""
     return USER_PLUGIN_DIR / "skills"
 
 
@@ -159,12 +159,12 @@ def _scan_skills(skills_root: Path, scope: str) -> list[dict]:
     return out
 
 
-def list_skills(strategy_cwd: str | None = None) -> list[dict]:
+def list_skills(project_cwd: str | None = None) -> list[dict]:
     """All skills available to the agent, across the three tiers: system
-    (predefined), user-global (agent-authored, reusable), and user-strategy
-    (this strategy only — included when strategy_cwd is given)."""
+    (predefined), user-global (agent-authored, reusable), and user-project
+    (this project only — included when project_cwd is given)."""
     result = _scan_skills(SYSTEM_PLUGIN_DIR / "skills", "system")
     result += _scan_skills(user_global_skills_dir(), "user-global")
-    if strategy_cwd:
-        result += _scan_skills(Path(strategy_cwd) / ".claude" / "skills", "user-strategy")
+    if project_cwd:
+        result += _scan_skills(Path(project_cwd) / ".claude" / "skills", "user-project")
     return result

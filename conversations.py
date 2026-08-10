@@ -13,26 +13,24 @@
 # limitations under the License.
 
 """
-Per-user strategy store for the Datafye Agent.
+Per-user project store for the Datafye Agent.
 
 A "conversation" (what the frontend calls a project, and what the user
-thinks of as a *strategy*) is the agent workspace's top-level entity. Each
+thinks of as a *project*) is the agent workspace's top-level entity. Each
 one is now a DIRECTORY under the agent state root:
 
-    <state>/strategies/<id>/
+    <state>/projects/<id>/
       meta.json          # name, timestamps, SDK session id, messages, commentary
-      CLAUDE.md          # per-strategy durable memory (auto-loaded by the SDK
+      CLAUDE.md          # per-project durable memory (auto-loaded by the SDK
                          #   as project memory when this folder is the cwd)
-      PROJECT.md         # plain-language description of the strategy
-      memory/MEMORY.md   # index of granular per-strategy memory files
-      .claude/skills/    # per-strategy user-authored skills
-      <algo code...>     # the strategy's Python lives directly in the folder
+      PROJECT.md         # plain-language description of the project
+      memory/MEMORY.md   # index of granular per-project memory files
+      .claude/skills/    # per-project user-authored skills
+      <algo code...>     # the project's Python lives directly in the folder
 
-The folder IS the working directory for chat turns on this strategy, so the
-agent's files, its per-strategy memory, and its per-strategy skills all live
-in one place that survives a restart. This replaces the previous
-one-JSON-file-per-conversation layout (`<id>.json`); legacy files are
-migrated into folders on load.
+The folder IS the working directory for chat turns on this project, so the
+agent's files, its per-project memory, and its per-project skills all live
+in one place that survives a restart.
 
 meta.json is plain JSON, not encrypted — conversation content is not a
 secret key, and the Claude Agent SDK already writes its own session
@@ -61,22 +59,25 @@ import paths
 
 logger = logging.getLogger(__name__)
 
-# Base directory holding one sub-folder per strategy. `DATAFYE_AGENT_STRATEGIES_DIR`
-# is the modern knob; `DATAFYE_AGENT_CONVERSATIONS_DIR` is still honoured as the
-# base for back-compat. Default lives under the single agent state root.
+# Base directory holding one sub-folder per project.
+#
+# The word is PROJECT throughout, matching accounts (which mints the ids), the
+# SPA, and the user. "Strategy" was only ever the agent's private name for the
+# same thing, and the scope had outgrown it -- a project can be a dashboard, a
+# piece of research or a tool, not just a trading strategy.
+#
+# ⚠️ No back-compat: there is no migration from the old `strategies/` directory
+# and no fallback for the old env var. This ships to freshly provisioned boxes
+# (decision: Girish, 2026-08-10). An upgraded box carrying `strategies/` would
+# silently start with no projects, so it must be reprovisioned rather than
+# upgraded.
 _BASE_DIR = Path(
-    os.environ.get(
-        "DATAFYE_AGENT_STRATEGIES_DIR",
-        os.environ.get("DATAFYE_AGENT_CONVERSATIONS_DIR", paths.state_path("strategies")),
-    )
+    os.environ.get("DATAFYE_AGENT_PROJECTS_DIR", paths.state_path("projects"))
 )
 
-# Where the previous layout kept <id>.json files. Migrated into folders on load.
-_LEGACY_DIR = Path(paths.state_path("conversations"))
 
-
-def strategies_base() -> Path:
-    """The directory holding one folder per strategy.
+def projects_base() -> Path:
+    """The directory holding one folder per project.
 
     Public because `warmth` scans it for running-app markers (DAT-202) and
     reaching into `_BASE_DIR` from another module would make a private name part
@@ -94,14 +95,14 @@ _STOPWORDS = {
 # --- Scaffold templates -------------------------------------------------
 # Kept deliberately small: CLAUDE.md is auto-loaded into the model's context
 # on every turn (project memory), so boilerplate here is paid for repeatedly.
-# These are living documents the agent maintains as the strategy evolves.
+# These are living documents the agent maintains as the project evolves.
 
-_CLAUDE_MD_TEMPLATE = """# Strategy: {name}
+_CLAUDE_MD_TEMPLATE = """# Project: {name}
 
-This is your durable working memory for THIS strategy. Keep it current as the
-strategy takes shape. Prefer short bullet points over prose.
+This is your durable working memory for THIS project. Keep it current as the
+project takes shape. Prefer short bullet points over prose.
 
-- Idea: (what this strategy is trying to do)
+- Idea: (what this project is trying to do)
 - Data: (datasets / schemas / symbols in use)
 - Mode: (backtest / paper)
 - Decisions: (key choices and why)
@@ -110,9 +111,9 @@ strategy takes shape. Prefer short bullet points over prose.
 
 _PROJECT_MD_TEMPLATE = """# {name}
 
-A plain-language story of this trading strategy, written for the user to read.
-Maintain it as the strategy develops. Cover, in everyday words:
-- The idea: what this strategy is trying to capture, and the intuition behind it.
+A plain-language story of this trading project, written for the user to read.
+Maintain it as the project develops. Cover, in everyday words:
+- The idea: what this project is trying to capture, and the intuition behind it.
 - The data: which datasets, schemas, and symbols it relies on, and why.
 - How it works: the logic, in plain terms (use an analogy where it helps).
 - Results: what testing has shown so far, honestly.
@@ -121,7 +122,7 @@ Maintain it as the strategy develops. Cover, in everyday words:
 Keep it engaging and readable, not a dry spec.
 """
 
-_MEMORY_INDEX_TEMPLATE = """# Strategy Memory
+_MEMORY_INDEX_TEMPLATE = """# Project Memory
 
 One line per memory file kept in this folder. (Empty for now.)
 """
@@ -131,13 +132,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def strategy_dir(conversation_id: str) -> Path:
-    """The directory that holds everything for one strategy."""
+def project_dir(conversation_id: str) -> Path:
+    """The directory that holds everything for one project."""
     return _BASE_DIR / conversation_id
 
 
 def _meta_path(conversation_id: str) -> Path:
-    return strategy_dir(conversation_id) / "meta.json"
+    return project_dir(conversation_id) / "meta.json"
 
 
 def deduce_name(first_message: str) -> str:
@@ -156,13 +157,13 @@ def _read(conversation_id: str) -> Optional[dict]:
     try:
         return json.loads(p.read_text())
     except Exception as e:
-        logger.warning("Could not read strategy %s: %s", conversation_id, e)
+        logger.warning("Could not read project %s: %s", conversation_id, e)
         return None
 
 
 def _write(record: dict) -> None:
     """Persist meta.json atomically (temp file + rename)."""
-    d = strategy_dir(record["id"])
+    d = project_dir(record["id"])
     d.mkdir(parents=True, exist_ok=True)
     p = d / "meta.json"
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -175,9 +176,9 @@ def _write(record: dict) -> None:
 
 
 def _scaffold(conversation_id: str, name: str) -> None:
-    """Create the strategy folder's CLAUDE.md / PROJECT.md / memory / .claude/skills
+    """Create the project folder's CLAUDE.md / PROJECT.md / memory / .claude/skills
     if they don't already exist. Idempotent — never clobbers an agent's edits."""
-    d = strategy_dir(conversation_id)
+    d = project_dir(conversation_id)
     try:
         (d / "memory").mkdir(parents=True, exist_ok=True)
         (d / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
@@ -190,7 +191,7 @@ def _scaffold(conversation_id: str, name: str) -> None:
             if not path.exists():
                 path.write_text(content)
     except OSError as e:
-        logger.warning("Could not scaffold strategy folder %s: %s", conversation_id, e)
+        logger.warning("Could not scaffold project folder %s: %s", conversation_id, e)
     _ensure_venv(conversation_id)
 
 
@@ -201,7 +202,7 @@ VENV_DIRNAME = ".venv"
 
 
 def _ensure_venv(conversation_id: str) -> None:
-    """Give the strategy folder its own venv, so the agent can install packages.
+    """Give the project folder its own venv, so the agent can install packages.
 
     Built with --system-site-packages ON PURPOSE. The quant stack (pandas,
     numpy, scipy, matplotlib) is pre-installed into the system interpreter by
@@ -211,15 +212,15 @@ def _ensure_venv(conversation_id: str) -> None:
     message, on a box that may have slow or no egress to PyPI.
 
     The project keeps its OWN site-packages on top, so `pip install` works for
-    anything project-specific and one strategy cannot disturb another.
+    anything project-specific and one project cannot disturb another.
 
     Note this is NOT the agent's own venv (/opt/datafye/agent/venv, which runs
     main.py and is root-owned by design). This one belongs to the `datafye`
     user and holds project code's dependencies. The two must stay separate:
-    strategy code upgrading a shared dependency must never be able to break the
+    project code upgrading a shared dependency must never be able to break the
     agent process.
     """
-    d = strategy_dir(conversation_id)
+    d = project_dir(conversation_id)
     venv = d / VENV_DIRNAME
     if (venv / "bin" / "python").exists():
         return
@@ -240,7 +241,7 @@ def _ensure_venv(conversation_id: str) -> None:
 
 
 def meta(record: dict) -> dict:
-    """The listing view of a strategy — no message/commentary bodies."""
+    """The listing view of a project — no message/commentary bodies."""
     return {
         "id": record["id"],
         "name": record["name"],
@@ -251,8 +252,7 @@ def meta(record: dict) -> dict:
 
 
 def list_conversations() -> list:
-    """All strategies, metadata only, most-recently-updated first."""
-    _migrate_legacy()
+    """All projects, metadata only, most-recently-updated first."""
     if not _BASE_DIR.exists():
         return []
     out = []
@@ -265,7 +265,7 @@ def list_conversations() -> list:
         try:
             out.append(meta(json.loads(mp.read_text())))
         except Exception as e:
-            logger.warning("Skipping unreadable strategy %s: %s", child.name, e)
+            logger.warning("Skipping unreadable project %s: %s", child.name, e)
     out.sort(key=lambda c: c.get("updated_at", 0), reverse=True)
     return out
 
@@ -310,7 +310,7 @@ def track_for_intent(intent: str) -> list:
 _USAGE_FIELDS = ("tokens_in", "tokens_out", "cache_read", "cache_create",
                  "cost_micros", "tool_calls", "turns")
 
-# How many recent idempotency keys to remember per strategy (bounds the meta).
+# How many recent idempotency keys to remember per project (bounds the meta).
 _MAX_USAGE_KEYS = 200
 
 
@@ -324,7 +324,7 @@ def _empty_usage() -> dict:
 
 
 def _new_record(conversation_id: str, first_message: str = "") -> dict:
-    """Build a fresh, empty strategy record with the given id."""
+    """Build a fresh, empty project record with the given id."""
     now = _now_ms()
     return {
         "id": conversation_id,
@@ -416,7 +416,7 @@ def usage_public(record: dict) -> dict:
 
 
 def set_context_tokens(conversation_id: str, tokens: int) -> None:
-    """Record the strategy's context size as of the turn that just ended.
+    """Record the project's context size as of the turn that just ended.
 
     Deliberately NOT one of the additive usage fields: those are deltas summed
     across turns, and context size is a LATEST VALUE, not a sum. It is the whole
@@ -437,7 +437,7 @@ def add_usage(conversation_id: str, stage: str, model: str, delta: dict,
               idempotency_key: Optional[str] = None) -> Optional[dict]:
     """Add one turn's usage delta into the (stage × model) breakdown and the
     roll-up totals — at most once per `idempotency_key`. Returns the updated
-    usage view (or None if the strategy does not exist)."""
+    usage view (or None if the project does not exist)."""
     record = _read(conversation_id)
     if record is None:
         return None
@@ -471,7 +471,7 @@ def add_usage(conversation_id: str, stage: str, model: str, delta: dict,
 
 
 def create(first_message: str = "") -> dict:
-    """Create a new strategy with a freshly-minted id; the name is deduced from
+    """Create a new project with a freshly-minted id; the name is deduced from
     the first message.
 
     LEGACY: in the current architecture the accounts service is the
@@ -482,12 +482,12 @@ def create(first_message: str = "") -> dict:
     record = _new_record("c-" + uuid.uuid4().hex[:12], first_message)
     _write(record)
     _scaffold(record["id"], record["name"])
-    logger.info("Created strategy %s (%s)", record["id"], record["name"])
+    logger.info("Created project %s (%s)", record["id"], record["name"])
     return record
 
 
 def ensure(conversation_id: str) -> dict:
-    """Return the strategy record for `conversation_id`, creating the folder
+    """Return the project record for `conversation_id`, creating the folder
     (meta.json + scaffold) with that exact id if it does not yet exist.
 
     Unlike create(), the id is taken as given — never minted — because the
@@ -495,7 +495,6 @@ def ensure(conversation_id: str) -> dict:
     what makes chat against an accounts-minted id always persist:
     append_message / append_commentary no-op when the record is absent, so the
     agent calls ensure() first."""
-    _migrate_legacy()
     existing = _read(conversation_id)
     if existing is not None:
         # Folder may pre-date the scaffold step; ensure it's present.
@@ -504,17 +503,17 @@ def ensure(conversation_id: str) -> dict:
     record = _new_record(conversation_id)
     _write(record)
     _scaffold(conversation_id, record["name"])
-    logger.info("Materialised strategy %s for accounts-minted id", conversation_id)
+    logger.info("Materialised project %s for accounts-minted id", conversation_id)
     return record
 
 
 def get(conversation_id: str) -> Optional[dict]:
-    """Full strategy record, or None if it does not exist."""
+    """Full project record, or None if it does not exist."""
     return _read(conversation_id)
 
 
 def rename(conversation_id: str, name: str) -> Optional[dict]:
-    """Rename a strategy. Returns the updated record, or None if absent."""
+    """Rename a project. Returns the updated record, or None if absent."""
     record = _read(conversation_id)
     if record is None:
         return None
@@ -525,30 +524,30 @@ def rename(conversation_id: str, name: str) -> Optional[dict]:
 
 
 def delete(conversation_id: str) -> bool:
-    """Permanently remove a strategy: its folder and everything in it (meta,
-    algo code, per-strategy memory + skills). Returns False if there was no such
-    strategy. nvx-accounts stays the authoritative registry and deletes its own
+    """Permanently remove a project: its folder and everything in it (meta,
+    algo code, per-project memory + skills). Returns False if there was no such
+    project. nvx-accounts stays the authoritative registry and deletes its own
     project record separately."""
     base = _BASE_DIR.resolve()
     try:
-        resolved = strategy_dir(conversation_id).resolve()
+        resolved = project_dir(conversation_id).resolve()
     except Exception:
         return False
-    # safety: never rmtree anything outside the strategies base (guards a
+    # safety: never rmtree anything outside the projects base (guards a
     # malformed/hostile id like ".." even though accounts mints clean ids).
     if resolved == base or base not in resolved.parents:
-        logger.warning("Refusing to delete strategy outside base: %s", conversation_id)
+        logger.warning("Refusing to delete project outside base: %s", conversation_id)
         return False
     if not resolved.exists():
         return False
     shutil.rmtree(resolved, ignore_errors=True)
-    logger.info("Deleted strategy %s", conversation_id)
+    logger.info("Deleted project %s", conversation_id)
     return True
 
 
 # --- Uploaded files (per-project agent context) -------------------------
-# Files the user uploads to a project live in <strategy>/uploads/. That folder
-# is inside the strategy folder, so it is durable (survives restart) and
+# Files the user uploads to a project live in <project>/uploads/. That folder
+# is inside the project folder, so it is durable (survives restart) and
 # per-project isolated, and it sits under the chat turn's cwd — so the agent's
 # existing Read/Glob/Grep tools read them with no new tool. We never inline a
 # file's contents into the prompt: only a small INDEX (name/type/size) is
@@ -559,7 +558,7 @@ _UPLOADS_DIRNAME = "uploads"
 
 def uploads_dir(conversation_id: str) -> Path:
     """The directory holding a project's uploaded context files."""
-    return strategy_dir(conversation_id) / _UPLOADS_DIRNAME
+    return project_dir(conversation_id) / _UPLOADS_DIRNAME
 
 
 def safe_upload_name(filename: str) -> Optional[str]:
@@ -617,7 +616,7 @@ _OUTPUTS_DIRNAME = "outputs"
 
 def outputs_dir(conversation_id: str) -> Path:
     """The directory holding files the agent produced for the user to download."""
-    return strategy_dir(conversation_id) / _OUTPUTS_DIRNAME
+    return project_dir(conversation_id) / _OUTPUTS_DIRNAME
 
 
 def list_outputs(conversation_id: str) -> list:
@@ -657,7 +656,7 @@ def output_file_path(conversation_id: str, filename: str) -> Optional[Path]:
 def save_file(conversation_id: str, filename: str, data: bytes) -> Optional[dict]:
     """Write an uploaded file into the project's uploads/ folder (creating it),
     overwriting a same-named file. Returns the file's listing entry, or None if
-    the filename is unusable. The caller ensures the strategy folder exists."""
+    the filename is unusable. The caller ensures the project folder exists."""
     name = safe_upload_name(filename)
     if name is None:
         return None
@@ -671,7 +670,7 @@ def save_file(conversation_id: str, filename: str, data: bytes) -> Optional[dict
     except OSError:
         pass
     tmp.replace(p)
-    logger.info("Stored upload %s (%d bytes) for strategy %s", name, len(data), conversation_id)
+    logger.info("Stored upload %s (%d bytes) for project %s", name, len(data), conversation_id)
     return _file_entry(p)
 
 
@@ -692,7 +691,7 @@ def delete_file(conversation_id: str, filename: str) -> bool:
     if not resolved.is_file():
         return False
     resolved.unlink()
-    logger.info("Deleted upload %s for strategy %s", name, conversation_id)
+    logger.info("Deleted upload %s for project %s", name, conversation_id)
     return True
 
 
@@ -732,7 +731,7 @@ CSV/spec/data", look here first.
 
 
 def append_message(conversation_id: str, role: str, content: str) -> None:
-    """Append a user/assistant turn. No-op if the strategy does not exist
+    """Append a user/assistant turn. No-op if the project does not exist
     (e.g. a frontend running in local-only fallback mode)."""
     record = _read(conversation_id)
     if record is None:
@@ -747,7 +746,7 @@ def append_message(conversation_id: str, role: str, content: str) -> None:
 def set_last_message_usage(conversation_id: str, usage: dict) -> None:
     """Tag the most recent assistant message with this turn's usage roll-up
     ({tokens_in, tokens_out, cache_read, cache_create, cost_micros}) — the cost
-    of all the work that produced this reply. Best-effort: no-op if the strategy
+    of all the work that produced this reply. Best-effort: no-op if the project
     or an assistant message is absent. Additive field, so /history carries it
     through untouched for consumers that ignore it."""
     record = _read(conversation_id)
@@ -788,7 +787,7 @@ def append_commentary(conversation_id: str, text: str, kind: Optional[str] = Non
                        usage: Optional[dict] = None,
                        call_tokens: Optional[int] = None) -> dict:
     """Append one activity-log entry and return it (so the caller can also emit
-    it live over SSE). Persists only if the strategy exists. The full activity
+    it live over SSE). Persists only if the project exists. The full activity
     trail is retained (no cap): it is the analytics record of the work, paired
     with the conversation by timestamp, and accounts persists it per project. The
     activity rail replays it all.
@@ -868,35 +867,3 @@ def set_sdk_session(conversation_id: str, session_id: str) -> None:
     if record.get("sdk_session_id") != session_id:
         record["sdk_session_id"] = session_id
         _write(record)
-
-
-# --- Legacy migration ---------------------------------------------------
-
-_migrated = False
-
-
-def _migrate_legacy() -> None:
-    """One-shot: convert any old `<conversations>/<id>.json` files into the new
-    `<strategies>/<id>/meta.json` folder layout. Best-effort and idempotent;
-    runs at most once per process."""
-    global _migrated
-    if _migrated:
-        return
-    _migrated = True
-    try:
-        if not _LEGACY_DIR.exists() or _LEGACY_DIR.resolve() == _BASE_DIR.resolve():
-            return
-        for f in _LEGACY_DIR.glob("*.json"):
-            try:
-                record = json.loads(f.read_text())
-                cid = record.get("id") or f.stem
-                if _meta_path(cid).exists():
-                    continue  # already migrated
-                record["id"] = cid
-                _write(record)
-                _scaffold(cid, record.get("name", cid))
-                logger.info("Migrated legacy conversation %s into a strategy folder", cid)
-            except Exception as e:
-                logger.warning("Could not migrate legacy conversation %s: %s", f.name, e)
-    except Exception as e:
-        logger.warning("Legacy conversation migration skipped: %s", e)

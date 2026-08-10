@@ -16,7 +16,7 @@
 Datafye Agent Service
 
 A dedicated per-user FastAPI backend that wraps the Claude Agent SDK for
-algorithmic trading strategy development. Each user gets their own instance
+algorithmic trading project development. Each user gets their own instance
 with access to:
 
 - Local Datafye documentation
@@ -153,8 +153,8 @@ MCP_SERVERS_ADDITIONAL = os.getenv("DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL", "[]")
 APP_PREVIEW_HOST = os.getenv("DATAFYE_AGENT_APP_PREVIEW_HOST", "app.datafye.io")
 
 # The agent runs a single, explicit memory model (see memory.py + conversations.py):
-# global notes/index under the state root, per-strategy CLAUDE.md + memory/ in each
-# strategy folder. The claude CLI that the SDK spawns has its OWN auto-memory feature,
+# global notes/index under the state root, per-project CLAUDE.md + memory/ in each
+# project folder. The claude CLI that the SDK spawns has its OWN auto-memory feature,
 # which is ON by default and would maintain a second, uncontrolled store. Disable it
 # so there is one coherent memory system. The SDK subprocess inherits this env var.
 # Overridable by pre-setting it in the environment.
@@ -604,7 +604,7 @@ def truncate(text: str, limit: int = 150) -> str:
     return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
 
 
-# A short, cheap model used only to summarize a strategy's first message into a
+# A short, cheap model used only to summarize a project's first message into a
 # title — never the main reasoning model.
 TITLE_MODEL = os.getenv("DATAFYE_AGENT_TITLE_MODEL", "claude-haiku-4-5")
 _TITLE_PROMPT = (
@@ -614,7 +614,7 @@ _TITLE_PROMPT = (
 
 
 async def generate_title(first_message: str, usage_sink: Optional[list] = None) -> Optional[str]:
-    """Summarize the user's first message into a short strategy title via a
+    """Summarize the user's first message into a short project title via a
     cheap model call (direct Anthropic API, the key is already in the env).
     Returns None on any failure, in which case the caller keeps the provisional
     first-few-words name. If `usage_sink` is given, this call's token usage is
@@ -655,7 +655,7 @@ async def generate_title(first_message: str, usage_sink: Optional[list] = None) 
 
 # -- Lifecycle stage classification --------------------------------
 # Cheap, best-effort, post-stream — mirrors generate_title (haiku, direct
-# Anthropic call). Classifies where the strategy build is in its lifecycle so
+# Anthropic call). Classifies where the project build is in its lifecycle so
 # the workspace stepper can advance. On any failure the stepper keeps its value.
 _LIFECYCLE_PROMPT = (
     "You classify what a user is doing in an AI quant workspace and where it is "
@@ -664,7 +664,7 @@ _LIFECYCLE_PROMPT = (
     "   - chat: a general question or discussion (no artifact).\n"
     "   - research: one-off data analysis / exploration (a report, not a deployable artifact).\n"
     "   - signal: building a reusable trading-signal generator.\n"
-    "   - algo: building a full trading strategy.\n"
+    "   - algo: building a full trading project.\n"
     "   - dashboard: building an analytics dashboard or other non-trading tool.\n"
     "   Intents are NOT limited to this list — if the user is clearly doing\n"
     "   something else, name it in one lower-case word.\n\n"
@@ -744,7 +744,7 @@ async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str
 # never the raw conversation, so it is privacy-safe regardless of consent.
 _SATISFACTION_PROMPT = (
     "You gauge how SATISFIED a user is with Yukti (an AI that builds trading "
-    "strategies for them), from their conversation. Weigh the user's tone, whether "
+    "projects for them), from their conversation. Weigh the user's tone, whether "
     "their requests are being met, friction or rework, and any praise or "
     "complaints. Reply with ONLY a JSON object, no markdown fences and no other "
     "text:\n"
@@ -756,7 +756,7 @@ _SATISFACTION_PROMPT = (
 
 _ENVIRONMENT_INTENT_PROMPT = (
     "You read one turn of a conversation between a user and Yukti (an AI that "
-    "builds trading strategies) and decide whether the USER stated a STANDING "
+    "builds trading projects) and decide whether the USER stated a STANDING "
     "DECISION about their Datafye environment -- the cloud data platform Yukti "
     "runs their work on.\n\n"
     "A standing decision is the user saying what should be true of their "
@@ -896,7 +896,7 @@ async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = Non
 
 
 # -- Usage tracking ------------------------------------------------
-# Per (stage × model) token/cost/tool usage. Accumulated into the strategy's
+# Per (stage × model) token/cost/tool usage. Accumulated into the project's
 # meta (drives the workspace telemetry, survives reload via /history) AND
 # reported to accounts (billing + the hosted-tier quota meter). The accounts
 # report forwards the user's own JWT, so it writes as self-or-admin — no new
@@ -1273,12 +1273,12 @@ def _bash_activity(cmd: str):
 def _is_memory_path(path: str) -> bool:
     """True if this path is one of the agent's memory files, in ANY scope.
 
-    Fleet, user and per-strategy memory all read as simply "memory" in the rail:
+    Fleet, user and per-project memory all read as simply "memory" in the rail:
     the SCOPE is recoverable from Tool Detail, which carries the exact path, so
     the sanitized line does not need to distinguish them.
 
     Deliberately does NOT treat a bare CLAUDE.md as memory. The user-scope one is
-    matched by its exact path below, and a strategy's CLAUDE.md is auto-loaded by
+    matched by its exact path below, and a project's CLAUDE.md is auto-loaded by
     the SDK rather than Read, so a loose basename match would mostly catch a
     user's own project CLAUDE.md and mislabel it.
     """
@@ -1290,7 +1290,7 @@ def _is_memory_path(path: str) -> bool:
             return True
     if p == str(memory.USER_CLAUDE_MD).replace("\\", "/").lower():
         return True
-    # Per-strategy memory lives at <strategy>/memory/...; every scope's index is
+    # Per-project memory lives at <project>/memory/...; every scope's index is
     # MEMORY.md, which the agent may read by name.
     return "/memory/" in p or os.path.basename(p) == "memory.md"
 
@@ -1325,7 +1325,7 @@ def _tool_commentary(tool: str, tool_input: dict):
         return ("Searching for relevant details", "muted")
     if tool in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
         # Same split on the write side: recording a lesson is not editing the
-        # user's strategy, and saying so is what makes memory writes visible.
+        # user's project, and saying so is what makes memory writes visible.
         if _is_memory_path((tool_input or {}).get("file_path") or ""):
             return ("Saving to memory", "muted")
         return ("Updating a file in the workspace", "muted")
@@ -1618,15 +1618,15 @@ async def stream_agent_response(
     """Stream responses from Claude Agent SDK with structured SSE events."""
     global anthropic_key_status
 
-    # Each strategy is its own folder, and that folder is the cwd + workspace
-    # for its chat turns: the agent's files, its per-strategy CLAUDE.md memory,
-    # and its per-strategy .claude/skills all live there. ensure() materialises
+    # Each project is its own folder, and that folder is the cwd + workspace
+    # for its chat turns: the agent's files, its per-project CLAUDE.md memory,
+    # and its per-project .claude/skills all live there. ensure() materialises
     # the folder for an accounts-minted id (the accounts service is the
     # authoritative project registry; it mints the id, the agent follows).
     # Conversation-less (legacy/fallback) requests use the shared workspace.
     if conversation_id:
         conversations.ensure(conversation_id)
-        cwd = str(conversations.strategy_dir(conversation_id))
+        cwd = str(conversations.project_dir(conversation_id))
     else:
         cwd = WORKSPACE_DIR
 
@@ -1646,8 +1646,8 @@ async def stream_agent_response(
         samples_dir=SAMPLES_DIR,
         credential_summary=get_credential_summary(),
         algo_id=algo_id,
-        # Cross-session memory: global notes/index + this strategy's memory index.
-        # Per-strategy CLAUDE.md is auto-loaded by the SDK (project source).
+        # Cross-session memory: global notes/index + this project's memory index.
+        # Per-project CLAUDE.md is auto-loaded by the SDK (project source).
         memory_context=memory.build_memory_context(cwd if conversation_id else None),
         # Where to write user-authored skills (the author-skill skill uses this).
         skills_dir=str(skills.user_global_skills_dir()),
@@ -1681,8 +1681,8 @@ async def stream_agent_response(
         # System (read-only) + user-global skills, as local plugins. Rebuilt
         # per turn so a skill the agent authors mid-session is live next turn.
         plugins=skills.build_plugins(),
-        # Load the strategy folder's own context: its CLAUDE.md (per-strategy
-        # memory) and its .claude/skills (per-strategy user skills). "project"
+        # Load the project folder's own context: its CLAUDE.md (per-project
+        # memory) and its .claude/skills (per-project user skills). "project"
         # is the cwd's .claude; we deliberately do NOT load "user"/"local".
         setting_sources=["project"],
         include_partial_messages=True,
@@ -1702,9 +1702,9 @@ async def stream_agent_response(
         hooks={"PreToolUse": [HookMatcher(matcher="Read", hooks=[guard_oversized_read])]},
     )
 
-    # Persist the user's turn and resume the strategy's SDK session.
+    # Persist the user's turn and resume the project's SDK session.
     # get_sdk_session is read from disk so resume survives an agent restart;
-    # the in-memory `sessions` map covers strategies not in the store
+    # the in-memory `sessions` map covers projects not in the store
     # (a frontend running in local-only fallback mode).
     # Detect the first turn of a new conversation (no prior messages) BEFORE we
     # append this one — used below to summarize the first ask into a title.
@@ -1745,7 +1745,7 @@ async def stream_agent_response(
                                  # never glue into a run-on line on flush
         conversation_text = ""   # the final reply -> Conversation + persisted
         tool_calls_this_turn = 0
-        # The strategy's CONTEXT SIZE, refreshed every step and shown in the
+        # The project's CONTEXT SIZE, refreshed every step and shown in the
         # live ticker. It is the whole prompt at that step -- uncached input +
         # cache writes + cache read -- so it is exact, needs no summing, and
         # stays correct across turns (a later turn's prompt already carries the
@@ -1876,7 +1876,7 @@ async def stream_agent_response(
                         thinking = _ascii_fold(getattr(block, 'thinking', ''))
                         if thinking:
                             # Persisted as well as streamed: thinking used to be
-                            # live-only, so reopening a strategy lost the one
+                            # live-only, so reopening a project lost the one
                             # record of reasoning that is billed but otherwise
                             # leaves no trace.
                             if conversation_id:
@@ -2313,14 +2313,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Samples dir: {SAMPLES_DIR} (available: {samples_available})")
 
     # Skills: scaffold the writable user-skill plugin and report which plugin
-    # dirs the SDK will load (system + user-global). Per-strategy skills are
-    # wired in once the strategy folder becomes the cwd.
+    # dirs the SDK will load (system + user-global). Per-project skills are
+    # wired in once the project folder becomes the cwd.
     skills.ensure_user_plugin()
     loaded_plugins = [p["path"] for p in skills.build_plugins()]
     logger.info(f"  Skill plugins: {loaded_plugins or 'none'}")
 
-    # Memory: scaffold the global (cross-strategy) memory store. Per-strategy
-    # memory is scaffolded per strategy folder by conversations.ensure().
+    # Memory: scaffold the global (cross-project) memory store. Per-project
+    # memory is scaffolded per project folder by conversations.ensure().
     memory.ensure_user_memory()
     logger.info(f"  User memory: {memory.USER_DIR}")
     # Fleet memory ships with the build (read-only). Absent is a valid state —
@@ -2835,13 +2835,13 @@ async def activity():
 async def get_skills(conversation_id: Optional[str] = None):
     """List the skills available to the agent, across all tiers:
       - system: predefined, read-only (shipped with the agent)
-      - user-global: agent-authored, reusable across strategies
-      - user-strategy: specific to one strategy (included when conversation_id is given)
+      - user-global: agent-authored, reusable across projects
+      - user-project: specific to one project (included when conversation_id is given)
 
     The frontend uses this to show a skill list; "running" a skill is a normal
     chat turn (e.g. "use the <name> skill"), which the model services via the
     Skill tool — there is no separate execution endpoint."""
-    cwd = str(conversations.strategy_dir(conversation_id)) if conversation_id else None
+    cwd = str(conversations.project_dir(conversation_id)) if conversation_id else None
     return {"skills": skills.list_skills(cwd)}
 
 
@@ -2991,9 +2991,9 @@ async def conversation_history(conversation_id: str):
 @app.delete("/v1/conversations/{conversation_id}",
             dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def delete_conversation(conversation_id: str):
-    """Permanently delete a strategy: the agent-side folder (meta, algo code,
-    per-strategy memory + skills). 404 if the agent never materialised it.
-    Accounts deletes its project registry record separately, so a strategy that
+    """Permanently delete a project: the agent-side folder (meta, algo code,
+    per-project memory + skills). 404 if the agent never materialised it.
+    Accounts deletes its project registry record separately, so a project that
     exists in accounts but never here still deletes cleanly there."""
     if not conversations.delete(conversation_id):
         raise HTTPException(status_code=404, detail="No such conversation")
