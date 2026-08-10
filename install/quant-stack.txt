@@ -1,0 +1,47 @@
+# The quant stack for PROJECT code (DAT-186, DAT-210).
+#
+# Installed into the SYSTEM interpreter by install_template.sh. Every project
+# venv is built with --system-site-packages, so it inherits all of this in about
+# a second and at almost no disk cost, then keeps its own site-packages on top.
+#
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH. The installer installs exactly these,
+# and prompt.py reads the same file to tell the model what it already has -- so
+# the model neither reinstalls what is present nor assumes what is absent. Adding
+# a line here is the whole change; nothing else needs editing.
+#
+# ⚠️ KEEP IT CONSIDERED, NOT COMPLETE. Everything here is inherited by every
+# project and paid for in image size on a single root volume (DAT-178). The bar
+# is: the model reaches for it early, and it is small -- or it is large and
+# genuinely unavoidable. Measured incremental cost on top of an empty venv, so a
+# future addition can be argued with numbers rather than taste:
+#
+#     pandas numpy scipy matplotlib   279 MB   (the baseline itself)
+#     requests                          4 MB
+#     tabulate                          0 MB
+#     statsmodels                      55 MB   NOT installed -- see below
+#     pyarrow                         132 MB   NOT installed -- see below
+#
+# Deliberately ABSENT, and the model is told so rather than left to discover it:
+#   - pyarrow (parquet). 132 MB is 45% again on top of the whole baseline, for a
+#     storage-format convenience: CSV works, and a project that genuinely needs
+#     parquet can `pip install pyarrow` into its own venv in seconds.
+#   - statsmodels. Plausible for this domain but speculative -- no evidence the
+#     model reached for it, and scipy.stats already covers the common tests.
+# Both are one `pip install` away in a project venv, which is exactly what the
+# per-project venv exists for.
+
+pandas
+numpy
+scipy
+matplotlib
+
+# HTTP client. Not optional in practice: every REST call to the platform's own
+# API needs one, and its absence was DAT-210 -- the model's first act in a data
+# project was `pip install requests`, per project, on a box that may be behind a
+# proxy or have a cold cache.
+requests
+
+# pandas' DataFrame.to_markdown() raises without it. This agent writes its
+# findings into a chat, so a markdown table is the natural output format and the
+# failure would land at the moment of presenting results. Costs nothing.
+tabulate

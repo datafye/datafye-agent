@@ -618,8 +618,20 @@ fi
 # Deliberately NOT installed into ${VENV_DIR}: that venv runs the agent
 # service itself, and project code must never be able to break it by
 # upgrading a shared dependency.
-info "Installing the quant stack for project code (pandas, numpy, scipy, matplotlib)..."
-if ${PYTHON_BIN} -m pip install --quiet pandas numpy scipy matplotlib; then
+# The package list lives in install/quant-stack.txt, which prompt.py also reads
+# to tell the model what it already has. One list, so the two cannot drift and
+# the model neither reinstalls what is present nor assumes what is absent.
+QUANT_STACK_FILE="${AGENT_CODE_DIR}/install/quant-stack.txt"
+if [ -f "${QUANT_STACK_FILE}" ]; then
+    QUANT_PKGS=$(grep -vE '^\s*(#|$)' "${QUANT_STACK_FILE}" | tr '\n' ' ')
+else
+    # A tree without the file predates it; keep the old behaviour rather than
+    # installing nothing, since project code depends on this stack existing.
+    warn "quant-stack.txt not found; falling back to the built-in list"
+    QUANT_PKGS="pandas numpy scipy matplotlib requests tabulate"
+fi
+info "Installing the quant stack for project code (${QUANT_PKGS})..."
+if ${PYTHON_BIN} -m pip install --quiet ${QUANT_PKGS}; then
     ok "Quant stack installed for project venvs"
 else
     warn "Could not install the quant stack; project venvs will still build, but"

@@ -24,6 +24,28 @@ The prompt is assembled dynamically based on:
 
 import os
 
+# What the installer pre-installs for project code. Read from the SAME file the
+# installer installs from (DAT-210), so the prompt cannot drift from reality --
+# telling the model a package is present when it is not costs it a failed import
+# and a retry, and the opposite costs a pointless install on every project.
+_QUANT_STACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "install", "quant-stack.txt")
+# Named if the file cannot be read at all. Deliberately the long-standing four
+# rather than the current list: understating what is installed makes the model
+# check, which is recoverable; overstating it makes the model assume, which is not.
+_QUANT_STACK_FALLBACK = "pandas, numpy, scipy, matplotlib"
+
+
+def _quant_stack() -> str:
+    """The pre-installed packages, as prose for the prompt."""
+    try:
+        with open(_QUANT_STACK_FILE) as handle:
+            pkgs = [ln.strip() for ln in handle
+                    if ln.strip() and not ln.lstrip().startswith("#")]
+        return ", ".join(pkgs) if pkgs else _QUANT_STACK_FALLBACK
+    except OSError:
+        return _QUANT_STACK_FALLBACK
+
 
 def build_system_prompt(
     docs_dir: str,
@@ -50,6 +72,8 @@ def build_system_prompt(
         bash_ceiling_minutes = max(1, int(os.environ.get("BASH_MAX_TIMEOUT_MS", "600000")) // 60000)
     except (TypeError, ValueError):
         bash_ceiling_minutes = 10
+
+    quant_stack = _quant_stack()
 
     # The resource guard: always-on core rules, plus a pointer to the bundled
     # cheat sheet (per-unit rates, formula, OOM guard, instance-size map, examples).
@@ -193,10 +217,15 @@ CAPABILITIES:
 
    YOUR PROJECT HAS ITS OWN PYTHON ENVIRONMENT — USE IT. Every project folder
    contains a `.venv` built for it. Run project code with `./.venv/bin/python` and
-   install packages with `./.venv/bin/pip install <pkg>`. It already has the usual
-   quant stack available (pandas, numpy, scipy, matplotlib), so USE THEM — never
-   hand-roll dataframe logic, statistics or numerics in pure Python because you
-   think nothing is installed. A bare `pip` is not on your PATH; that does NOT mean
+   install packages with `./.venv/bin/pip install <pkg>`.
+
+   ALREADY INSTALLED — do not spend a turn installing these: {quant_stack}.
+   USE THEM, and never hand-roll dataframe logic, statistics or numerics in pure
+   Python because you think nothing is installed. Deliberately NOT installed, so
+   install them into the project venv if you actually need them: `pyarrow` (for
+   parquet — CSV is fine for most things) and `statsmodels`.
+
+   A bare `pip` is not on your PATH; that does NOT mean
    you have no package manager, it means you should use the venv's. Anything you
    install goes into this project only and cannot affect another project or the
    agent itself.
