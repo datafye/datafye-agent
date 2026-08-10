@@ -78,6 +78,17 @@ logger = logging.getLogger(__name__)
 # receives trades, a replay advances clock ticks, and a history fetch reports
 # progress as it goes -- none of them go quiet for ten minutes while still
 # running. Configurable because the idle threshold is.
+#
+# ⚠️ ZERO OR LESS DISABLES ENVIRONMENT-BASED WARMTH ENTIRELY, and it has to be
+# handled here rather than passed through. The platform reads
+# activeWithinSeconds == 0 as "use my default of 300 seconds", so forwarding a
+# zero would silently give a SHORTER window instead of none -- reaching for the
+# off switch and getting a behaviour change in the opposite direction.
+#
+# The switch exists because today's answer is not permanent: when environments
+# move to the cloud, a local foundry becomes short-lived and should stop
+# blocking dormancy. The in-flight signal is unaffected -- a command running on
+# this box must keep it awake regardless of where the environment lives.
 DATA_WINDOW_SECONDS = int(os.environ.get("DATAFYE_AGENT_WARM_DATA_WINDOW", "600"))
 
 # How often the deployment is asked. /health is polled by accounts every 60s,
@@ -105,6 +116,9 @@ async def probe_data_flowing(deployment_api_url: str) -> tuple[bool, str]:
     not fan out over HTTP and does not bake in a threshold the platform would
     also have to know.
     """
+    if DATA_WINDOW_SECONDS <= 0:
+        return False, "environment-based warmth is switched off (window <= 0)"
+
     base = deployment_api_url.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
@@ -147,6 +161,12 @@ async def refresh_forever(deployment_api_url: str) -> None:
     would let it sleep through real work.
     """
     global _data_flowing, _data_detail, _checked_at
+    if DATA_WINDOW_SECONDS <= 0:
+        # Nothing to poll, and saying so once beats a probe every minute that
+        # can only ever answer "off".
+        _data_detail = "environment-based warmth is switched off (window <= 0)"
+        logger.info("Warm signal: environment-based warmth disabled by configuration")
+        return
     while True:
         try:
             _data_flowing, _data_detail = await probe_data_flowing(deployment_api_url)
