@@ -60,8 +60,10 @@ answering.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import socket
 import time
 from typing import Any
 
@@ -99,6 +101,16 @@ REFRESH_INTERVAL_SECONDS = int(os.environ.get("DATAFYE_AGENT_WARM_REFRESH_INTERV
 # One bounded call, not a fan-out: the platform's /deployment/activity asks
 # every deployed service in Java and returns one verdict.
 PROBE_TIMEOUT_SECONDS = float(os.environ.get("DATAFYE_AGENT_WARM_PROBE_TIMEOUT", "15"))
+
+# An app the model built and started, on the reserved port band the jump server
+# routes through (DAT-202). The marker is written into the project folder by
+# whoever starts the app; a marker is a CLAIM, and only a LISTENING port makes it
+# a fact -- so a crashed app, or one whose marker was never cleaned up, stops
+# keeping the box awake by itself. That self-healing is the whole reason the
+# signal is a probe rather than a registry.
+APP_MARKER = ".datafye-app.json"
+APP_PROBE_TIMEOUT = float(os.environ.get("DATAFYE_AGENT_APP_PROBE_TIMEOUT", "0.3"))
+_private_ip_cache: str | None = None
 
 # The last data-flow reading, refreshed on a timer. Absent until the first
 # probe completes, which reads as not-flowing -- the safe direction.
@@ -177,6 +189,88 @@ async def refresh_forever(deployment_api_url: str) -> None:
         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
 
 
+def _primary_private_ip() -> str | None:
+    """This box's private address -- the one the jump server's nginx connects to.
+
+    Cached: it does not change for the life of the instance, and this sits behind
+    the /health path. Resolved by opening a UDP socket at a routable address,
+    which picks the outbound interface WITHOUT sending anything.
+    """
+    global _private_ip_cache
+    if _private_ip_cache is None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("10.255.255.255", 1))
+                _private_ip_cache = probe.getsockname()[0]
+        except OSError:
+            _private_ip_cache = ""
+    return _private_ip_cache or None
+
+
+def _port_listening(port: int) -> bool:
+    """Whether something is actually serving on that port.
+
+    ⚠️ Probes BOTH loopback AND the private interface, and this is the RUMI-369
+    lesson rather than belt-and-braces. An app bound only to the private IP is
+    reachable through the jump server -- a real, running app the user is looking
+    at -- but a loopback-only check calls it dead and the box gets stopped
+    underneath them. An app bound only to loopback is not reachable from outside,
+    but it is still work in progress on this box, so it counts too. Either
+    binding means warm; only neither means cold.
+    """
+    hosts = ["127.0.0.1"]
+    private = _primary_private_ip()
+    if private:
+        hosts.append(private)
+    for host in hosts:
+        try:
+            with socket.create_connection((host, port), timeout=APP_PROBE_TIMEOUT):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def running_apps() -> list[dict[str, Any]]:
+    """Apps the model started that are actually serving, newest marker first.
+
+    Never raises: this feeds /health, and an exception here would make a healthy
+    agent look dead to the monitor deciding whether to stop it.
+    """
+    apps: list[dict[str, Any]] = []
+    try:
+        # Imported here, not at module load: conversations is a heavier module
+        # and this keeps warmth importable on its own (the tests rely on that).
+        import conversations
+        base = conversations.strategies_base()
+        if not base.exists():
+            return apps
+        for project in base.iterdir():
+            marker = project / APP_MARKER
+            if not marker.is_file():
+                continue
+            try:
+                with open(marker) as handle:
+                    record = json.load(handle)
+                port = int(record.get("port"))
+            except Exception:
+                # A marker being written as we read it, or hand-edited into
+                # nonsense. Not evidence either way -- skip it rather than let
+                # one bad file decide whether the box stays up.
+                logger.warning("ignoring unreadable app marker: %s", marker)
+                continue
+            if not _port_listening(port):
+                continue
+            apps.append({
+                "name": str(record.get("name") or project.name),
+                "port": port,
+                "project": project.name,
+            })
+    except Exception:
+        logger.warning("app marker scan failed", exc_info=True)
+    return apps
+
+
 def active_work() -> list[str]:
     """The work currently keeping this box awake, as self-describing labels.
 
@@ -199,16 +293,23 @@ def active_work() -> list[str]:
         holder = foundry.in_flight_holder()
         if holder:
             active.append(f"env:{_operation_of(holder)}")
+
+        # 3. An app the model built, running on the reserved port band and
+        #    reachable by the user through the jump server (DAT-202). This is
+        #    the label space that was reserved here and finally has something in
+        #    it. A user watching a dashboard is not idle, and nothing else on
+        #    this list would notice them: they are not chatting, and the app is
+        #    not the environment. Reported per app so the admin panel names
+        #    which one is holding the box up.
+        #
+        #    ⚠️ Still nothing here for compute the agent started OUTSIDE a turn.
+        #    prompt.py forbids background execution outright (DAT-185), and a
+        #    turn in flight is already reported as running_jobs.
+        for app in running_apps():
+            active.append(f"compute:{app['name']}")
     except Exception as exc:
         logger.warning("Could not assemble the warm signal: %s", exc)
 
-    # 3. Compute the agent started outside a turn is NOT reported, because
-    #    there is none to report: prompt.py forbids background execution
-    #    outright (no `&`, `nohup`, `setsid`, `disown`) after a backgrounded
-    #    provision was orphaned when its session ended (DAT-185). A turn in
-    #    flight is already reported separately as running_jobs. This becomes
-    #    real when the agent can run and expose a long-lived app (DAT-202), and
-    #    the label space (`compute:<name>`) is reserved for it.
     return active
 
 

@@ -74,6 +74,16 @@ _BASE_DIR = Path(
 # Where the previous layout kept <id>.json files. Migrated into folders on load.
 _LEGACY_DIR = Path(paths.state_path("conversations"))
 
+
+def strategies_base() -> Path:
+    """The directory holding one folder per strategy.
+
+    Public because `warmth` scans it for running-app markers (DAT-202) and
+    reaching into `_BASE_DIR` from another module would make a private name part
+    of the contract by accident.
+    """
+    return _BASE_DIR
+
 # Words dropped when deducing a name from the first message.
 _STOPWORDS = {
     "the", "a", "an", "to", "of", "for", "and", "or", "with", "on", "in",

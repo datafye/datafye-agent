@@ -692,6 +692,59 @@ skips it entirely when a binary already exists** — so a box's harness can be a
 was current the day it was built, and it will never move again. A fix that depends on harness
 behavior sits on ground that drifts per box.
 
+### Letting Somebody See It (DAT-202, agent half)
+
+Giving the box Node meant the model could finally *build* a dashboard. It still could
+not show anyone. Worker instances have no public IP; everything reaches them through
+the jump server's nginx, so an app on `localhost:8501` is invisible to the person who
+asked for it, and the Ship step of the lifecycle had nothing behind it.
+
+The obvious design — the model asks accounts to register a route per app, accounts
+calls the provisioner, nginx gets a new block, something removes it later — is the one
+we did not build. It has a registry to keep correct, a removal path that must run on
+every failure mode, and orphaned routes when it doesn't.
+
+Instead: **a reserved port band the jump server already routes straight through**. The
+model binds a port in the band and the app is reachable. No registration, no
+allocation service, nothing to clean up, and nothing to leak — the routes exist whether
+or not anyone uses them. It is Sutra's refine-preview mechanism, reused deliberately
+rather than reinvented, which also inherits its hard-won lesson (below).
+
+**The warm signal is where the interesting design is.** A user watching a dashboard is
+not idle, but nothing on the box would have noticed: they are not chatting, and the app
+is not the environment. So a running app now reports `compute:<name>` — filling the
+exact label space DAT-184 reserved and left empty.
+
+The mechanism is a marker file plus a probe, and the split between them matters. **The
+marker is a claim; a listening port is the fact.** Only markers whose port actually
+answers count. A crashed app stops keeping the box awake immediately, an abandoned
+marker is inert, and nothing has to be reliably cleaned up for the system to stay
+correct. That is the whole reason this is a probe and not a registry: *prefer a design
+where being out of date is self-correcting over one where it requires discipline.*
+
+And the probe checks **both loopback and the private interface**, which is Sutra's
+RUMI-369 lesson arriving pre-paid. An app bound only to the private IP is reachable
+through the jump server — it is genuinely running, genuinely visible to the user — but
+a loopback-only check calls it dead and the idle monitor stops the box out from under
+someone who is looking at the screen. Reusing a mechanism means reusing its scar tissue,
+which is most of the value.
+
+**On authentication, the decision is the interesting part.** The band routes straight
+through, so the URL is not protected by anything. The choice (Girish) was that auth is
+the *user's* to require and the *app's* to implement, rather than something the platform
+imposes. That is defensible — these are the user's own tools on their own sandbox — but
+it only stays defensible if the model says so, so the prompt tells it in as many words:
+anyone with this URL can open it, put protection inside the app if the content warrants
+it, and tell the user what you did and did not protect. An unauthenticated URL the user
+knows about is a choice; one they assume is private is a trap.
+
+⚠️ **This is the agent half only.** nginx on the jump server still has to route the band
+to the box. Worth recording how we learned that: both `datafye-accounts` and
+`nvx-accounts` pass `proxyInfo = null` at launch, so *neither* product wires a band
+through the provisioner — Sutra's must be static bastion config. The prior art we were
+told to copy turned out to have a piece that lives somewhere else entirely, and finding
+that out was most of the work.
+
 ### A Runtime the Product Had Already Promised (DAT-201)
 
 The workspace has lifecycle tracks. Ask for a dashboard, an app or a tool and the
