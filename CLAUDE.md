@@ -303,6 +303,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
 | `/v1/credentials` | POST | REMOVED — returns 410 Gone; credential writes go through the accounts service |
 | `/v1/credentials/update` | POST | Accounts-only. Push a single credential `{provider, value}` into the encrypted store; 204 |
+| `/v1/foundry/intent` | POST | Accounts-only, `agent-lifecycle`-token-gated. Record the foundry intent accounts has decided (`{intended, source}`); written to the on-disk replica the boot service reads. Errors are reported rather than swallowed — a push that did not land must not look like one that did |
 | `/v1/foundry/stop` | POST | Accounts-only, `agent-lifecycle`-token-gated. Bring the foundry down cleanly before the box is powered off (DAT-125). Returns `{status, detail}` where status is `stopped`/`absent`/`busy`/`failed` — `busy` tells accounts to ABORT the instance stop |
 | `/v1/credentials/status` | GET | Check which credentials are configured (JWT-protected) |
 | `/v1/broker/brokers` | GET | List brokers Datafye supports (StocksBroker enum) |
@@ -398,6 +399,8 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_SYSTEM_PLUGIN_DIR` | `<app>/plugins/datafye` | Read-only system-skill plugin (ships with the app clone) |
 | `DATAFYE_AGENT_USER_PLUGIN_DIR` | `<state>/plugins/user` | Writable user-global skill plugin (agent authors skills here) |
 | `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | `1` (set by the agent) | Disables the `claude` CLI's own auto-memory so the agent runs ONE explicit memory model (see Key Design Decisions). Not a `DATAFYE_` var; `os.environ.setdefault` in main.py, overridable |
+| `DATAFYE_AGENT_FOUNDRY_OBSERVE_INTERVAL` | `60` | Seconds between background foundry observations. `/health` serves the latest snapshot rather than probing on the request |
+| `DATAFYE_AGENT_FOUNDRY_PING_TIMEOUT` | `40` | Bound on the per-dataset health ping. Deliberately ABOVE the deployment API's own 30s reply timeout: a dead service makes the API wait that long, and bounding below it would turn every partial environment into "not answering at all" |
 | `DATAFYE_AGENT_RUN_DIR` | `~/.datafye/run` | The CLI's run directory, where the DAT-196 lock and the DAT-183 in-progress markers live. Read (never written) to tell whether an environment operation is in flight. Not under the agent state root — it belongs to the environment, which outlives this process |
 | `DATAFYE_AGENT_FOUNDRY_STOP_TIMEOUT` | `240` | Upper bound (seconds) on the graceful environment stop. Deliberately BELOW accounts' own 300s read timeout so the agent is what expires and can answer with which outcome happened |
 | `DATAFYE_AGENT_JWT_LEEWAY_SECONDS` | `60` | Clock-skew tolerance applied to time-based JWT claims (iat/nbf/exp) when verifying accounts-signed tokens — avoids "token not yet valid (iat)" failures from clock drift |
@@ -405,19 +408,33 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
 
-### Foundry readiness is read, not inferred (DAT-198)
+### Foundry readiness is DERIVED, not stored (DAT-198)
 
-`foundry.py` reads `~/.datafye/run/foundry-state.json` — written by the deploy engine (Java, every lifecycle command) and the foundry boot service (shell) — and `/health` republishes it as `foundry: {state, since, operation, intended, error, reason}`.
+`/health` publishes a `foundry` block, and the model is handed the state and the reason in its prompt rather than discovering the situation by colliding with it. "Running" used to mean this Python process answers `/health` — a real fact, and almost useless: the agent can be perfectly healthy on a box whose foundry is half-built, wedged, or absent. On u1 that gap put a user's request onto a box three minutes into its first provision, and the agent had *already logged* `Datafye API MCP: NOT REACHABLE` fifteen seconds earlier. The information existed; nothing consumed it.
 
-`state` is `starting | provisioning | restoring | ready | failed | absent`, plus **`unknown`**, which is this module's own value meaning *no state file*. That is deliberately distinct from `absent`: "I don't know" and "I know there is nothing" are different answers, and only one of them means a fresh box.
+**Readiness is derived from three inputs and stored as no single fact:**
 
-**Why it exists:** "Running" used to mean this Python process answers `/health`, which says nothing about whether the box can do work. On u1 that gap put a user's request onto a box three minutes into its first provision. The agent had even logged `Datafye API MCP: NOT REACHABLE` fifteen seconds earlier — the information existed, nothing consumed it.
+| Input | Where it comes from |
+|---|---|
+| **intent** | accounts, pushed to `POST /v1/foundry/intent`, cached at `~/.datafye/run/foundry-intent.json`. **Absent means running** |
+| **in flight** | the DAT-183 marker, read with a liveness check (`in_flight_holder`) |
+| **observed** | are the applications *answering* — interrogated, cached, refreshed in the background |
 
-- **`is_ready()` is not "is it running".** It is *observed matches intended*, so a foundry the user deliberately stopped is ready. Treating that box as unready would leave it permanently unhealthy, fixable only by starting an environment they explicitly did not want.
-- **A missing file is the normal first-boot reading**, not an error: the boot unit is ordered after the agent, so the agent answers `/health` before anything has written a state. Absence only becomes meaningful after a grace period, and judging that is **accounts'** job — it knows when the box booted; this process does not.
-- **Reading never raises.** It is on the `/health` path, which must answer even when everything else is broken: an agent that cannot report its health is indistinguishable from a dead instance, which is the one distinction accounts needs most.
-- **An unrecognised `state` is passed through, not rejected**, so a newer writer can add one without this agent refusing to report it.
-- **The model is told the state and the reason** via `prompt.py`'s `FOUNDRY READINESS RIGHT NOW:` line, built by `describe_for_model()`. Mid-operation it explicitly tells the model not to start/apply/provision — a second operation on one foundry is what corrupts it. On `failed` it points at `~/.datafye/logs` and forbids an automatic rebuild, because the broken environment is the only evidence of why it failed.
+`derive()` combines them, and is a pure function precisely because the truth table is the part that is easy to get subtly backwards.
+
+**⚠️ The first version stored readiness as one fact that every lifecycle command wrote.** It shipped and was reverted (`datafye-deploy` PR #11). The bug: an engineer SSHes in to debug and runs `foundry local stop`, the engine records `intended=stopped`, and the box then stays down on *every subsequent boot* — a debugging action promoted into standing policy by a component with no way to tell the two apart. **"An operation is in flight" is a fact about a process; "this box should have a running foundry" is a policy decision**, and the component performing an action is very often not the one that decided it should happen.
+
+Three branches of the truth table are worth stating because the obvious reading is wrong:
+
+- **intent `stopped` is READY**, not unready. A foundry the user asked to stop is in good order; calling it unready leaves the box permanently unhealthy, fixable only by starting an environment they explicitly did not want. It is ready even if observation finds it *serving* — somebody started it by hand, which is more than intended, not less.
+- **in-flight beats everything.** Mid-provision the deployment reports "not serving", which is indistinguishable from a real mismatch — so anything reconciling on that would try to fix an environment that is being built. That is the u1 collision, produced by something trying to help.
+- **absent intent means running.** A sandbox exists to host a foundry, so "no deviation has ever been recorded" and "it should be running" are the same statement. Unknown would leave a fresh box permanently unready; stopped would leave it permanently empty.
+
+**The observation is refreshed in the background, not on the request.** Interrogating costs real time when something is wrong, and `/health` is polled by accounts for dormancy decisions, by the upgrade cron every minute, and by the SPA — an agent that goes quiet is indistinguishable from a dead instance. `observe_forever` refreshes on a timer and `/health` serves the snapshot with its age; the in-flight read is cheap enough to do inline, so it is always current.
+
+**⚠️ That background refresh is what buys per-service fidelity from one call.** The health ping asks the API about four services at once, and a *dead* service makes the API wait out its own 30s Rumi reply timeout. The engine dodges that by probing each service separately in parallel, because it sits on a command's critical path; here the refresh can simply afford to wait (`PING_TIMEOUT_SECONDS`, 40s). Bounding it below 30s would collapse every partial environment into "not answering at all", losing exactly the distinction the ping exists for.
+
+**⚠️ Reading the ping right matters three times, and each fails silently in the wrong direction.** A healthy service reports an **empty** status, so a truthiness check reads exactly backwards. A healthy service actually sends `"status": null` on the wire (the ADM string is unset) — `entry.get("status") or ""` folds that in deliberately; the equivalent Java trap is that a plain `asText()` on a JSON null returns the *string* `"null"`. And a response listing **no services at all** is not a pass. The shape is `{"datasets":[{"services":{"<name>":{"status":…}}}],"trading":[…]}` — services is an object keyed by name, nested under per-system groups. All nine payloads `ServiceHealthTest` copied off a live foundry are replayed through the Python parse in the test suite, because the agent and the CLI disagreeing about one box's health would be worse than either being wrong alone.
 
 ### Stopping the environment before the box (DAT-125)
 
