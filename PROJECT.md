@@ -204,6 +204,22 @@ Most of the time the user is building *with* Datafye. But sometimes they ask *ab
 
 A small but load-bearing prompt rule sits alongside it: **use plain ASCII punctuation, everywhere.** No em/en dashes, no curly quotes, no ellipsis character — in chat replies *and* in the activity/progress lines. The reason isn't stylistic: non-ASCII characters break the accounts `resultJson` storage downstream, so a stray em dash in a reply can corrupt what accounts persists. Cheaper to forbid the characters at the source than to sanitize everywhere they might land.
 
+### Knowing Whether the Box Can Actually Do Anything (DAT-198)
+
+"Running" used to mean this Python process answers `/health`. That is a real fact, and it is almost useless: the agent can be perfectly healthy on a box whose foundry is half-built, wedged, or absent. On u1 the gap put a user's request onto a box three minutes into its first provision.
+
+The detail that stings is that the agent *already knew*. Fifteen seconds before the provision started it logged `Datafye API MCP: NOT REACHABLE ... tool calls requiring the deployment will fail`. The information existed and nothing consumed it — which is a more common failure than missing information, and a lot harder to notice, because every component is individually doing its job.
+
+So `/health` now republishes a `foundry` block, and the model is handed the state and the reason in its prompt rather than being left to discover the situation by colliding with it. Mid-operation it is told explicitly not to start, apply or provision, because a second operation on one foundry is precisely what corrupts it. On a failure it is pointed at the failure report, told to quote the real error, and told **not** to rebuild automatically — the broken environment is the only evidence of why it broke.
+
+Two distinctions in the reader are load-bearing, and both are the same shape: refusing to collapse two different answers into one.
+
+**`unknown` is not `absent`.** A missing state file means *we do not know*; `absent` means *we know there is no environment*. Those demand opposite responses, and a fresh box legitimately produces the first — the boot unit is ordered after the agent, so the agent answers `/health` before anything has written a state at all. Absence only becomes meaningful after a grace period, and this process cannot judge that: it does not know when the box booted. Accounts does. So the agent reports what it sees and declines to invent a verdict.
+
+**Reading never raises.** It sits on the `/health` path, which has to answer when everything else on the box is broken. An agent that cannot report its own health is indistinguishable from a dead instance — and telling those apart is the single thing accounts most needs.
+
+A postscript on ownership, because it cost a design round. The first implementation had the *deployment engine* record intent on every lifecycle command. It reads plausibly — the command is the thing acting — and it is wrong, with a mundane counterexample: someone SSHes in to debug, runs `stop`, and the engine writes down that this environment is meant to be stopped. The box reboots and the boot service faithfully leaves the foundry down, permanently. A debugging action promoted into standing policy. **"An operation is running" is a fact about a process; "this box should have a running foundry" is a decision somebody made** — and the component performing an action is very often not the one that decided it should happen. Desired state belongs to accounts, where the user's request actually arrives; the agent reads it and reports.
+
 ### The Foundry That Nobody Built (DAT-170)
 
 Here is a small horror story about a comment.
