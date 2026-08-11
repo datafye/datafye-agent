@@ -133,6 +133,26 @@ prompt describes without touching the prompt.
 `test_prompt_audit.py` now pins every one of these, including a blanket non-ASCII
 check, so they cannot come back quietly.
 
+**A second pass checked the prompt against the docs ON DISK**, which is a different
+surface: the prompt tells the model to trust those docs, so a contradiction there is
+as damaging as a wrong prompt line. What held up: the REST-reference-is-stubs claim
+(76 pure embed pages), crypto having no quotes, every CLI command named, and the
+hostnames — which match the docs exactly, and where `-api-rest` appears in **none** of
+183 occurrences. Cross-checking the docs would have caught that bug outright.
+
+Two real problems came out of it, and the prompt now handles both:
+
+- ⚠️ **The docs are written for a self-hosted reader who provisions their own
+  environment** — the environment guides open with `foundry local provision`, which is
+  precisely what a sandbox user must not do. Telling the model "ALWAYS check the docs"
+  was pointing it at guidance that contradicts its situation. It is now told to take
+  descriptors, schemas, syntax and concepts from the docs, and **environment lifecycle
+  from the prompt**.
+- ⚠️ **The docs trail the platform**: `foundry local status` is absent entirely, and so
+  are DAT-200's `IN PROGRESS` / `PARTIAL` verdicts. The model is now told that **doc
+  silence is not evidence of absence** for recently-shipped things — check `--help` or
+  `/openapi` before declaring something unsupported. Filed as **DAT-216**.
+
 ### Projects, not strategies
 
 The entity is a **project** everywhere now. Accounts mints project ids, the SPA
