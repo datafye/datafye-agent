@@ -75,5 +75,13 @@ window, so 2 days from `2025-01-02` gets you `01-02` and `01-01`.
 it. Fetch a whole window in one call; looping day by day leaves you with only
 the last day.
 
-**Daily OHLC is unadjusted** by default (`adjusted=false`), so a stock split
-reads as a crash.
+**OHLC is UNADJUSTED by default (`adjusted=false`), and a split then reads as a
+crash.** Netflix shows an apparent -90% move on 2025-11-17: a ten-for-one split, not a
+price move. It would have wrecked every average in that analysis, and it was caught only
+because somebody was hunting for outsized gaps.
+
+Pass `adjusted: true` for anything computing a return across more than one day. Leave it
+false only when you want as-traded prices deliberately -- reconciling a broker fill, or
+replaying the tape as it happened. Nothing in the returned series marks where a corporate
+action occurred, so treat any single-day move beyond roughly 50% as a suspected split
+until you have checked it, and say so to the user rather than reporting the number.
