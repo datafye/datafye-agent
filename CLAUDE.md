@@ -108,6 +108,31 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
 
+### The prompt drifts, and only an audit finds it (2026-08-10)
+
+A full read-through of the rendered prompt against current code found **five wrong
+claims**, none of which any test or review had caught. They matter more than
+ordinary stale docs: the prompt is the model's only account of its own world, so a
+wrong line there becomes wrong behaviour.
+
+| Claim | Reality |
+|---|---|
+| `curl …local-foundry-dev-api-**rest**.datafye.local:7776/openapi` | That host does not exist. **The exact mis-guess DAT-209 was filed about** — sitting in the same prompt that now warns against it |
+| Readiness "is recorded by whatever last changed the environment" | DAT-198 made readiness **derived**; DAT-199's boot service writes nothing. This described the design that was built and *reverted* |
+| Datasets are "SIP, Crypto, Palpha, HWAI, Synthetic" | Palpha is not provisionable (DAT-155, open) and appears nowhere in the deploy engine. The `dataset add` line two lines below already said SIP/Crypto/Synthetic — the prompt contradicted itself |
+| "Algo code is stored in GitHub repos" | GitHub is optional credentials most users do not have. Stated unconditionally |
+| "PLAIN ASCII PUNCTUATION ONLY … no em dashes" | The prompt used **52 em dashes**. Models imitate the register of their instructions, and non-ASCII breaks the accounts store |
+
+⚠️ **Four of these were found earlier the same day purely as side effects** of other
+work (the `status` verdict list, "the timeout WILL kill it", "no tool to read a
+background process's output", the crypto gotchas). Accidental discovery at that rate
+is the signal that a deliberate audit is overdue — **the prompt needs re-reading in
+full whenever a batch of tickets lands**, because each ticket changes the world the
+prompt describes without touching the prompt.
+
+`test_prompt_audit.py` now pins every one of these, including a blanket non-ASCII
+check, so they cannot come back quietly.
+
 ### Projects, not strategies
 
 The entity is a **project** everywhere now. Accounts mints project ids, the SPA
