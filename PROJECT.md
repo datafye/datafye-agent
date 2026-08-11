@@ -971,16 +971,183 @@ the installer carefully installs; it is whatever `claude-agent-sdk` pins in
 lives in that gap, and we had been reasoning about the wrong binary — including, one commit
 earlier, in this very repository's notes about DAT-203.
 
+### Calling It What Everyone Else Calls It
+
+Accounts mints **project** ids. The SPA shows **projects**. The user thinks in
+**projects**. Inside this agent, the same entity was a **strategy** — in the folder
+names, the function names, the environment variables, and the memory scope the model
+reads on every turn.
+
+That was defensible once, when the thing really was a trading strategy. It stopped being
+defensible when the product grew: a project can now be a dashboard, a piece of research,
+a small tool. The word had quietly become narrower than the thing it named, which is the
+kind of drift nobody notices because each individual use still reads fine.
+
+So it is `project` everywhere now: `<state>/projects/<id>/`, `project_dir`,
+`projects_base`, `DATAFYE_AGENT_PROJECTS_DIR`, PROJECT memory, per-project skills.
+
+Two decisions inside it are worth keeping.
+
+**No back-compat, deliberately.** There is no migration from the old `strategies/`
+directory and no fallback for the old environment variables — and the *older*
+`conversations/<id>.json` migration went too, rather than being left as the one surviving
+legacy path pointing at a directory nothing else mentions. This ships to freshly
+provisioned boxes. ⚠️ An upgraded box carrying `strategies/` comes up with **no projects
+at all**: the data is still on disk, but nothing reads that path. That is a real
+operational consequence, and it is written down where the person doing the release will
+find it, because "rename it and migrate quietly" is the option that produces a silent
+half-state.
+
+**`conversation_id` stays.** It is the accounts-minted id threaded through `/v1/chat` and
+the legacy `/v1/conversations` endpoints — an API name, not the vocabulary this was
+about. Renaming it would churn the wire format for no gain, so the inconsistency is
+deliberate and is recorded *as a decision* rather than as unfinished work. There is a
+difference between a rename you did not finish and a rename you chose to stop, and only
+one of them should tempt the next person.
+
+### What the Bank Was For (DAT-176)
+
+Fleet memory had been built for weeks and contained nothing. The scope rendered as
+absent, which is exactly what an empty bank *should* look like — and also exactly what a
+missing feature looks like. Seeding it with the diagnostic traps was the obvious half.
+
+The instructive half was the rule that came with it: **a platform workaround belongs in
+fleet memory, not the prompt.** The prompt is paid on every single turn; a workaround
+only matters when the model is doing the specific thing it applies to. Moving them trades
+an always-on cost for an on-demand one.
+
+Then the actual work turned out to be neither writing nor moving, but *checking*. The
+candidate list had been drawn up weeks earlier, and the tickets shipped since had moved
+underneath it. Six items went in; two did not survive contact:
+
+- **"On DEGRADED, deprovision and rebuild"** is now the *opposite* of correct. DAT-197
+  made `start` converge, and the prompt teaches converge-first precisely because a
+  rebuild destroys deployed datasets and the history already downloaded. Copying the list
+  faithfully would have reintroduced the behaviour two tickets were spent removing.
+- **"Run the CLI as `datafye`"** is an operator fact. The agent already runs as
+  `datafye`; it would have been noise in the model's context forever.
+
+And a trap worth naming, because it will recur: **a Done ticket tells you that work
+finished, not which way it went.** DAT-107 is titled *"crypto quotes return empty —
+investigate and fix (crypto quotes must work)"* and is marked Done. Its commit is
+`Signal that crypto has no quotes`. The provider has none; the resolution was to make the
+API *say so*. Reading the title would have deleted a true warning. DAT-101 is the same
+shape — Done, with the platform fix explicitly deferred, so the constraint it documents
+is still live.
+
+The honest accounting: this saved 78 tokens a turn. The trigger line and the new index
+entry ate most of what the moved block freed. The gain was never really the tokens — it
+was that the content is now verified, and that two pieces of confidently wrong guidance
+did not get promoted into a durable bank.
+
+### Nobody Was Checking That the Three Surfaces Agreed
+
+There are three descriptions of how this system works: **the code**, **the prompt**, and
+**the docs**. The code is the truth. The prompt is what the model believes. The docs are
+what the model is told to consult when it doesn't know. Nothing had ever compared any two
+of them.
+
+A full audit of the prompt against the code found **five wrong claims**. The sharpest was
+a hostname: the `/openapi` example pointed at `local-foundry-dev-api-**rest**.datafye.local`,
+which does not exist. That is the *exact* mis-guess DAT-209 was filed about — and it was
+sitting forty lines from the block added that same day to stop the model guessing it. The
+fix and the bug coexisted happily, because nothing read the whole file.
+
+Another told the model that readiness "is recorded by whatever last changed the
+environment" — the design that was built, shipped, and then deliberately reverted. The
+prompt was teaching an architecture we had rejected.
+
+And one was pure self-contradiction: the prompt instructs "PLAIN ASCII PUNCTUATION ONLY,
+no em dashes" while itself containing fifty-two of them. Models imitate the register of
+their instructions, and non-ASCII output is precisely what forced `ESCAPE_NON_ASCII` onto
+the accounts store. An instruction the prompt visibly disobeys is worse than no
+instruction, because it teaches the opposite of what it says.
+
+A second pass, against the docs on disk, mostly vindicated them — the
+REST-reference-is-stubs claim, crypto having no quotes, every CLI command named, and the
+hostnames, which match the docs exactly. In 183 hostname occurrences across the docs, the
+phantom `-api-rest` appears **zero** times. **Cross-checking the docs would have caught
+the bug outright.** The right answer was already written down, in a place the model is
+told to read, and no process ever compared the two.
+
+The generalisable point is about *rates*, not incidents. Four stale claims had surfaced
+earlier the same day purely as side effects of unrelated work. Nine wrong claims in a day,
+eight of them found by accident, is not bad luck — it is the signature of a surface that
+nothing audits. **Every ticket changes the world the prompt describes without touching the
+prompt.** So the prompt now gets read in full whenever a batch lands, and
+`test_prompt_audit.py` pins every finding, including a blanket non-ASCII sweep.
+
+⚠️ One correction belongs here, because it is the same failure in miniature. The PR that
+introduced that test claimed it "grows to 21 assertions". It did not: two string-anchored
+insertions into the test file had silently failed to match, so those checks were never
+added and never ran. The suite reported ALL PASS because there was nothing there to fail.
+**A silent no-op edit and a successful edit look identical unless you check the result**,
+and "the tests passed" is worth nothing if the test you added is not in the file. The
+count is now verified by counting the `ok` lines the run actually prints.
+
+### One Lifecycle, Two Readers (DAT-216)
+
+`datafye foundry local status` shipped, became the first command anyone should run
+against an environment, and was never documented — not a reference page, not a mention in
+any guide. DAT-200 then added the `IN PROGRESS` and `PARTIAL` verdicts, so even the
+vocabulary was undocumented. Meanwhile the environment guides opened with `provision`,
+addressed to someone standing up their own machine.
+
+That left the agent in an awkward spot. It is told to consult the docs; the docs walked it
+straight into the one command it must never run. The first fix was to tell the model *not*
+to take lifecycle advice from the docs — a divergence note, written the same day.
+
+That was the wrong shape, and the better framing was a single sentence: **there is no
+reason the model should work differently from a human, except that a human has to boot the
+foundry.**
+
+So the docs now state the recommended way to work for everyone — provision **once**, then
+`status`, `apply` and the idempotent `start` to change and repair in place, with an
+explicit warning that reprovisioning is not a repair but a demolition. And the prompt
+shrank: the model simply joins that same lifecycle at step 2, because step 1 is already
+done for it.
+
+The divergence note went away. It had been a workaround for a documentation gap, and once
+the gap was closed there was nothing left for it to work around. **When two components
+need different instructions, it is worth asking whether the difference is real or whether
+one of them is just under-documented** — here, the genuine difference was exactly one step
+long.
+
+`start.md` got a correction in the same pass: it had listed "the deployment is currently
+stopped" as a *prerequisite*, which predated `start` becoming idempotent. The command that
+repairs things was documented as requiring the thing to be off.
+
 ### A Note on Where All This Stands
 
 The whole arc above — the graceful stop, derived readiness, intent through the model, the
-warm signal, the presence heartbeat, and the foreground-command ceiling — is **merged, but
-not yet released**. The agent
-changes travel in an agent release, so a fleet box only gets them when that release is
-published and the auto-upgrade picks it up. Until then the code is true of the repository
-and not yet true of any sandbox, which is a distinction this project has learned to state
-out loud: a fix that exists only in `main` has the same effect on a user as a fix that
-does not exist.
+warm signal, the presence heartbeat, the foreground-command ceiling, the oversized-result
+guard, the seeded fleet bank, Node, the app port band, the project rename and the prompt
+audits — is **merged, but not yet released**.
+
+Agent changes travel in an agent release, so a fleet box only gets them when that release
+is published and the auto-upgrade picks it up. Until then the code is true of the
+repository and not yet true of any sandbox, which is a distinction this project has
+learned to state out loud: **a fix that exists only in `main` has the same effect on a
+user as a fix that does not exist.**
+
+Two things make that harder than usual this time.
+
+⚠️ **The order is not free.** A box carrying the new agent but an old CLI has the boot
+reconciler without the converge `start`, and that combination degrades to
+launch-everything, which fails on a partially-running environment. The CLI release goes
+first, then the agent, then accounts, then the SPA.
+
+⚠️ **And for once, auto-upgrade is not enough.** The project rename means a box still
+carrying `strategies/` will come up with no projects at all — its data intact on disk and
+unread. Any box with real project data has to be **reprovisioned rather than upgraded**,
+which is the opposite of how agent changes normally reach the fleet, and precisely the
+kind of thing that is obvious in the repository and invisible on the box.
+
+A related honesty: a growing list of acceptance criteria across these tickets is
+unverifiable without a running hosted sandbox — the dormancy run, the intent push, the
+heartbeat, the readiness round-trip, the raised timeout ceiling against the *bundled* CLI,
+the Node install, the warm signal from a live app, and the fleet block appearing in a real
+prompt. They are not forgotten and they are not done; they are queued behind one box.
 
 ### Bootstrap: How the Agent Learns Who It Is
 
