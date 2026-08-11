@@ -128,11 +128,13 @@ data must be **reprovisioned, not upgraded**, or have the directory renamed by h
 first. Nothing outside this repo referenced the path or the env var (checked across
 accounts, Yukti, the CLI and the installer), so the blast radius is the agent alone.
 
-⚠️ `conversation_id` is deliberately **unchanged**. It is the accounts-minted id
-threaded through `/v1/chat` and the legacy `/v1/conversations` endpoints; renaming
-it is an API-surface change, not a vocabulary one, and belongs in its own piece of
-work. The `GET /v1/skills` tier value did move (`user-strategy` → `user-project`),
-which was safe because nothing consumes it.
+⚠️ **`conversation_id` STAYS — settled, not deferred** (Girish, 2026-08-10). It is the
+accounts-minted id threaded through `/v1/chat` and the legacy `/v1/conversations`
+endpoints, so it is an API name rather than the vocabulary this rename was about.
+Do not "finish the job" by renaming it later: the inconsistency is deliberate, and
+the churn would reach the wire format for no gain. The `GET /v1/skills` tier value
+did move (`user-strategy` → `user-project`), which was safe because nothing
+consumes it.
 
 ### Showing the user an app the model built (DAT-202)
 
