@@ -280,6 +280,34 @@ Three changes:
   observation or an inference, must say how it was verified, and loses to fleet
   memory on conflict.
 
+**Rule: a platform workaround belongs in fleet memory, not the prompt** (Girish,
+2026-08-10). The prompt is paid on every turn; a workaround only matters when the
+model is doing the thing it applies to. `platform-gotchas.md` now holds the crypto
+symbol form, crypto having no quotes, one-dataset-at-a-time, the tick-fetch OOM, and
+the `numDays`/replace/unadjusted fetch semantics. The prompt keeps a short trigger
+("before you touch a dataset or plan a fetch, read it") because these fail *silently
+or expensively* — an unread warning about an OOM that writes zero data is worse than
+a slightly longer prompt.
+
+⚠️ **Re-verify before moving anything, and expect some of it to be wrong.** The
+DAT-176 candidate list was written weeks ago and this week's tickets had moved under
+it. What the check found:
+- **Bare crypto symbols** — refined, not copied. Every crypto data endpoint now
+  normalises inbound symbols (DAT-32), so REST tolerates `X:BTCUSD`; the descriptor
+  does not, because history builds `"X:" + symbol` with no strip.
+- **Crypto trades-only** — true but reframed. DAT-107 did **not** make quotes work
+  (the provider has none); it made the API say so with a clear error instead of
+  returning empty. Reading the ticket title alone would have deleted a true warning.
+- **One dataset at a time** — still true. DAT-101 is *Done* but shipped only the
+  prompt workaround; the platform fix is deferred. A Done ticket is not a fixed bug.
+- **>1.3 GB tick OOM** — still true, `-Xmx2g` is still hardcoded.
+- **"Run the CLI as `datafye`"** — dropped: the agent already runs as `datafye`, so
+  it is an operator fact, not a model one.
+- ⚠️ **"On DEGRADED, deprovision and rebuild"** — dropped as **actively wrong**.
+  DAT-197 made `start` converge, and the prompt teaches converge-first; adding this
+  would have reintroduced the rebuild-happy behaviour that destroys deployed data. A
+  test now asserts it cannot come back.
+
 ⚠️ **The fleet index is paid on EVERY turn**, so the bank stays bounded: a few topic
 files rewritten as they accumulate, never one file per lesson. Seeding it moved the
 always-on memory block from ~300 to ~740 tokens; a test pins it under 1000. Bodies

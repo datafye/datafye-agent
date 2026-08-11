@@ -8,3 +8,6 @@ One line per memory file.
   proves an environment works, and the evidence that looks conclusive but is not:
   empty `docker logs`, containers "Up" with no applications inside, and where the
   real error is already written down.
+- [Platform gotchas and workarounds](platform-gotchas.md) — read before working
+  with a dataset or planning a fetch: crypto symbol form and its missing quotes,
+  one dataset at a time, and the tick fetch that OOMs and writes nothing.

@@ -138,10 +138,9 @@ def build_system_prompt(
       fill the disk.
    HARD RULE (resizing does NOT help): a combined-ticks fetch whose ONE-DAY buffer
    exceeds ~1.3 GB OOMs the history heap (fixed 2 GB on every instance size) and
-   writes ZERO data. To shrink a fetch: narrow the intraday window (startTime/
-   endTime), fetch trades and quotes SEPARATELY (they stream), split the symbols,
-   or use OHLC instead. Check the fetch doc for the exact contract -- don't assert
-   fetch limits (all-symbols, windowing) from memory.
+   writes ZERO data. The ways to shrink a fetch, and the per-symbol-day rates to
+   estimate with, are in the "Platform gotchas" fleet memory — read it rather than
+   asserting fetch limits from memory.
 {cheatsheet_line}"""
 
     memory_block = f"\n{memory_context}\n" if memory_context else ""
@@ -513,21 +512,14 @@ CAPABILITIES:
    This is also why you do not need `docker exec` to diagnose: the CLI already
    pulled the in-container logs out for you.
 
-   DATASET GOTCHAS (get these wrong and you silently get zero data, or a broken
-   environment):
-   - CRYPTO SYMBOLS ARE BARE. Always pass the bare ticker (`BTCUSD`, `ETHUSD`),
-     never a decorated or `X:`-prefixed form — decorated symbols can silently
-     return ZERO data on some paths (the crypto dataset prepends `X:` itself).
-     Fetch parameters (including `dataset`) go in the JSON request BODY; for a
-     crypto fetch you can omit `dataset` entirely (the `/crypto` path implies
-     Crypto). Note crypto currently provides TRADES only (quotes come back empty),
-     and a crypto day is 24h.
-   - ONE DATASET AT A TIME. Keep a SINGLE dataset (SIP, or Crypto, or Synthetic)
-     deployed at once. Multi-dataset environments are unreliable right now — they
-     fail partway (often at the crypto launch step) and can leave a broken
-     environment. To switch datasets, REMOVE the current one and ADD the new one
-     (`datafye foundry local dataset remove <old>` then `dataset add <new>`) — do NOT
-     deprovision and reprovision, and do NOT combine datasets in one descriptor.
+   ⚠️ BEFORE YOU TOUCH A DATASET OR PLAN A FETCH, read the "Platform gotchas and
+   workarounds" entry in fleet memory. It covers the cases where the platform does
+   not behave as you would expect — crypto symbol form, crypto having no quotes at
+   all, deploying one dataset at a time, and the tick fetch that exhausts a fixed
+   heap and writes ZERO data. These fail silently or expensively, and the file is
+   short. One detail is worth carrying without looking it up: fetch parameters
+   (including `dataset`) go in the JSON request BODY, and for a crypto fetch you can
+   omit `dataset` entirely because the `/crypto` path implies it.
 {resource_guard}
 8. TESTING
    When the user tests their algo against historical data (Backtest) or
