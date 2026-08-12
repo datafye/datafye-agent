@@ -61,6 +61,7 @@ import conversations
 import credentials as credentials_module
 import memory
 import foundry
+import harness
 import warmth
 from foundry import read_foundry_state, describe_for_model, graceful_stop
 import skills
@@ -2445,14 +2446,28 @@ async def bom():
     """Dependency bill-of-materials — the Datafye version this agent is built
     against. Datafye versions all components (platform, samples, CLI, docs)
     together, so it's a single version. Unauthenticated like /health (version
-    numbers aren't sensitive); rendered on the Yukti agent surface."""
+    numbers aren't sensitive); rendered on the Yukti agent surface.
+
+    Also reports the Claude Code CLI actually running turns (DAT-215). It
+    belongs here rather than on /health because it is a dependency fact, not a
+    liveness one — and /health is polled every minute by the upgrade cron, by
+    accounts for dormancy, and by the SPA, so it is the wrong place to add
+    anything that ever costs more than reading a variable."""
+    harness_info = harness.describe()
     try:
         with open(BOM_PATH) as f:
-            return json.load(f)
+            document = json.load(f)
     except FileNotFoundError:
-        return {"agent_version": os.getenv("DATAFYE_AGENT_VERSION", "dev"), "dependencies": {}, "note": "bom.json not present"}
+        document = {"agent_version": os.getenv("DATAFYE_AGENT_VERSION", "dev"),
+                    "dependencies": {}, "note": "bom.json not present"}
     except (OSError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=500, detail=f"could not read BOM: {e}")
+    # Added rather than merged into `dependencies`: that block is the single
+    # Datafye version, and the harness moves on a completely different cadence
+    # (a pip range, resolved whenever a box was built). Folding them together
+    # would imply a coherence that does not exist.
+    document["harness"] = harness_info
+    return document
 
 
 @app.post("/bootstrap")

@@ -506,6 +506,22 @@ fi
 # install root at runtime — so a root install + /usr/local/bin symlink
 # would not work. Install as the datafye user (the runtime user) so
 # claude lands at /home/datafye/.local/{bin,share}/claude.
+#
+# ⚠️ THIS IS NOT THE HARNESS. A turn runs the CLI bundled inside the SDK
+# (claude_agent_sdk/_bundled/claude), because SubprocessCLITransport._find_cli
+# checks there FIRST and only then falls back to `which claude`. Nothing in the
+# agent invokes this binary; it exists solely as that fallback, for a future SDK
+# that ships without a bundled one. Kept deliberately (DAT-215) rather than
+# removed: it is cheap insurance against the agent having no harness at all.
+#
+# ⚠️ It is also ~300 MB of duplicate on a single root volume, and on the box
+# that was measured it was byte-for-byte the same VERSION as the bundled one
+# (both 2.1.228) — a coincidence that made it easy to believe this was the
+# harness. If DAT-178 (disk) gets tight, this is the first thing to reconsider,
+# but do it as a decision about the fallback, not as a cleanup.
+#
+# `/v1/bom` reports both, and which one is in use, so nobody has to SSH in and
+# guess again.
 CLAUDE_BIN="/home/datafye/.local/bin/claude"
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Installing Claude Code CLI (as datafye user)..."
