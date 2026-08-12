@@ -262,3 +262,24 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --------------------------------------------------- the sidecar classifiers
+# Not part of build_system_prompt, but a prompt all the same, and one that has
+# already been wrong in production. Checked here because this file is where
+# "prompts that have been wrong" live.
+
+@check("the intent classifier knows an app is not the environment (DAT-222)")
+def _intent_classifier(_unused):
+    import main
+    text = main._ENVIRONMENT_INTENT_PROMPT
+    # A user saying "kill the app" about a dashboard was classified as a
+    # standing decision to stop their ENVIRONMENT, which makes the boot
+    # reconciler leave the foundry down on the next wake. The classifier
+    # predates the model being able to run apps at all.
+    assert "NOT THE ENVIRONMENT" in text, \
+        "the classifier is not told that an app is a different thing from the environment"
+    for phrase in ("kill the app", "dashboard"):
+        assert phrase in text, f"the classifier has no example covering {phrase!r}"
+    # The bias that makes a miss cheap and a false positive expensive.
+    assert "answer none" in text, "the classifier has lost its bias towards no decision"

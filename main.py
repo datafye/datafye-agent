@@ -786,9 +786,18 @@ _ENVIRONMENT_INTENT_PROMPT = (
     "It is NOT a standing decision when the environment is stopped, restarted or "
     "rebuilt as a STEP IN DOING WORK -- fixing something broken, switching "
     "datasets, freeing memory, retrying a failed build. Yukti does that routinely "
-    "and the user has decided nothing. If you are not sure, answer none: a wrong "
-    "'stopped' leaves the user without an environment, while a missed one only "
-    "means it keeps running.\n\n"
+    "and the user has decided nothing.\n\n"
+    "CRITICAL -- 'THE APP' IS NOT THE ENVIRONMENT. Yukti also builds and runs "
+    "small web APPS for the user: dashboards, pages, previews, tools, served on a "
+    "URL. Starting and stopping those is routine and says NOTHING about the "
+    "environment. 'kill the app', 'stop the app', 'shut the page down', 'take the "
+    "dashboard down', 'stop the second one' are all about an APP and must be "
+    "answered none. Only count it when the user is plainly talking about their "
+    "ENVIRONMENT, foundry, platform, data or datasets -- not a page they are "
+    "looking at.\n\n"
+    "If you are not sure WHICH of the two the user meant, answer none. If you are "
+    "not sure at all, answer none: a wrong 'stopped' leaves the user without an "
+    "environment, while a missed one only means it keeps running.\n\n"
     "Reply with ONLY a JSON object, no markdown fences and no other text:\n"
     '{"intended": "running" | "stopped" | "none", '
     '"reason": "<one short plain sentence, or empty for none>"}\n\n'
@@ -841,7 +850,18 @@ async def classify_environment_intent(transcript: str,
         if not obj:
             return None
         intended = str(obj.get("intended") or "none").strip().lower()
-        return intended if intended in ("running", "stopped") else None
+        if intended not in ("running", "stopped"):
+            return None
+        # Log the classifier's OWN reason whenever it decides. The reason was
+        # always asked for and always discarded, so the first misfire -- "kill
+        # the app" read as a decision to stop the environment -- left nothing
+        # behind saying why, and the only evidence was a changed field in
+        # accounts. A decision this consequential (intent 'stopped' makes the
+        # boot reconciler leave the foundry down) must say what it thought it
+        # heard.
+        logger.info("Environment intent inferred as %s: %s",
+                    intended, str(obj.get("reason") or "(no reason given)"))
+        return intended
     except Exception as e:
         logger.warning("Environment-intent classification failed: %s", e)
         return None
