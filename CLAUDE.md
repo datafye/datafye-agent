@@ -130,8 +130,29 @@ is the signal that a deliberate audit is overdue — **the prompt needs re-readi
 full whenever a batch of tickets lands**, because each ticket changes the world the
 prompt describes without touching the prompt.
 
-`test_prompt_audit.py` now pins every one of these, including a blanket non-ASCII
-check, so they cannot come back quietly.
+`tests/test_prompt_audit.py` pins every one of these, including a blanket non-ASCII
+check, so they cannot come back quietly. Run it with `python3 tests/test_prompt_audit.py`
+— no pytest, no dependencies, because a test that is awkward to run does not get run.
+It renders the REAL prompt through `build_system_prompt` rather than grepping the
+source: the quant stack, the bash ceiling and the app preview base are all composed at
+build time, so a source-level check would pass while the rendered prompt was wrong.
+
+⚠️ **That file did not exist for a day after this paragraph first claimed it did**
+(written 2026-08-11; the claim was made 2026-08-10). The checks were written as a
+throwaway script during the audit, run, and then documented as though they had been
+committed. So the whole day's findings sat unguarded behind a sentence saying they were
+pinned — **strictly worse than saying nothing**, because it stops anyone looking. Two
+things follow. **A safeguard is not real until it is committed and runs from a clean
+checkout**; "I ran the checks" and "the checks exist" are different claims, and only the
+second is worth writing down. And when it was finally written, it immediately failed
+twice — the prompt still carried 9 `⚠️` and 3 `→` after the em-dash sweep, and the port
+band still contained platform-occupied ports. Both had been "already handled".
+
+⚠️ **Every check must be proven to FAIL on the bug it guards.** Each one is run against
+the real historical defect reintroduced (wrong hostname, the reverted readiness wording,
+an em dash, a renamed marker field). This repo has already shipped a test suite whose
+assertions silently never matched and passed vacuously; a green suite is evidence of
+nothing until you have watched it go red.
 
 **A second pass checked the prompt against the docs ON DISK**, which is a different
 surface: the prompt tells the model to trust those docs, so a contradiction there is
@@ -392,16 +413,25 @@ default, parses at 16 MB, and 20 MB still dies at 16 MB. There is always a paylo
 enough.
 
 **A current CLI already guards its own tools** — it refuses huge text files, truncates
-bash output and downsizes images — so on 2.1.226 none of the obvious vectors reproduce.
-The guard is the backstop for what that does not cover: an older bundled CLI, and
-results arriving by another route.
+bash output and downsizes images — so on 2.1.226 none of the obvious vectors reproduce,
+and the shipping harness is newer than that. The guard is the backstop for results
+arriving by another route.
 
 ⚠️ **The agent's harness is the SDK's BUNDLED CLI, not the one the installer puts on
 PATH.** `_find_cli` checks `claude_agent_sdk/_bundled/claude` **first** and only falls
 back to `shutil.which("claude")`. So the harness version tracks
-`claude-agent-sdk` in `requirements.txt` (`>=0.2.128,<0.3` → Claude Code **2.1.85**),
-and the installer's `/home/datafye/.local/bin/claude` is not what runs a turn. Anything
-that depends on harness behaviour must be verified against the *bundled* binary.
+`claude-agent-sdk` in `requirements.txt` (`>=0.2.128,<0.3`), and the installer's
+`/home/datafye/.local/bin/claude` is not what runs a turn. Anything that depends on
+harness behaviour must be verified against the *bundled* binary.
+
+⚠️ **Do NOT read that version off the local `.venv`.** It carries `claude-agent-sdk`
+**0.1.51** while production resolves `>=0.2.128,<0.3`, so the two bundle very different
+CLIs. This repo shipped "the bundled CLI is 2.1.85" in a ticket, a correction to that
+ticket, and this file — all from the local bundle. Measured on RC 2.0.37, the real
+figure is **2.1.228**, and the installer's PATH copy is the same version. **A version
+derived from a pin RANGE is a guess about what resolution will do, not a fact**; only a
+provisioned box answers it. Nothing reports the harness version today, which is why the
+wrong number survived three writings (DAT-215).
 
 ### Long environment commands run in the foreground (DAT-203)
 
@@ -435,13 +465,18 @@ rather than leaving a prohibition the surface ignores — the fourth instance of
   requested at `timeout: 600000` backgrounded at 15s; with the cap at 30 minutes the
   same command finished in the foreground; and a 660s command — past the old 600s cap —
   ran to completion in the foreground.
-- ⚠️ **Verified on PATH CLI 2.1.226, but the agent runs the SDK's BUNDLED CLI** (see
-  DAT-204 above: `_find_cli` prefers `_bundled/claude`). For the current pin that is
-  **2.1.85**, an older build, and some published reports claim these env vars are inert
-  in some versions. The bundled binary could not be exercised on the dev Mac (its Bun
-  build needs AVX), so **this specific claim is unverified on the version that will
-  actually run** — confirm on a box, or by checking whether a long command still gets
-  backgrounded there.
+- **Verified on PATH CLI 2.1.226; the shipping bundled CLI is 2.1.228** — two patch
+  releases apart, measured on RC 2.0.37. This was recorded for a day as "unverified,
+  the bundled build is 2.1.85 and these env vars may be inert on it"; that version was
+  read off the local `.venv` and was wrong (see the warning under DAT-204 above). The
+  gap is now narrow enough not to be a material risk, though a direct test on a box is
+  still the only thing that closes it outright.
+- ⚠️ **`sleep` cannot be used to test this.** The harness blocks foreground `sleep`
+  outright, so the command never reaches the shell and the result says nothing about
+  the timeout ceiling. Use a long command that is not the `sleep` program (a Python
+  `time.sleep`, or better, a real environment operation — which is what the ceiling
+  exists for). The block is also a live example of the harness advertising tools this
+  agent does not have; see *The harness recommends what the prompt forbids* below.
 - **The prompt covers the residual case.** If a command is backgrounded anyway, the
   model is told to treat it as still running, to never start a second environment
   command, and to establish whether it finished from the DAT-183 marker
@@ -449,6 +484,36 @@ rather than leaving a prohibition the surface ignores — the fourth instance of
   reads exactly like a job that never started.
 - **Dormancy cannot cut it off**: a command in flight is reported warm through the
   same marker (`warmth.py`), so the box stays up for the full 30 minutes.
+
+### The harness recommends what the prompt forbids (DAT-218)
+
+Trying to test DAT-203 on a live box with `sleep 700` produced this, from the tool
+layer rather than the shell:
+
+> Blocked: `sleep 700` followed by: `echo ...`. To wait for a condition, use **Monitor**
+> with an until-loop. To wait for a command you started, use **`run_in_background: true`**.
+
+Both suggestions are unavailable here. There is no `Monitor` in `INTERNAL_TOOLS`, and
+backgrounding is banned outright (DAT-185) because with no `BashOutput` the model can
+neither read nor kill what it started. **The harness is recommending the exact technique
+that orphaned a provision on u1.**
+
+⚠️ **The DAT-185 ban has a hole: it enumerates SHELL constructs.** `prompt.py` names
+`&`, `nohup`, `setsid`, `disown` and "no detached wrapper of any kind" — all things you
+type into a command line. `run_in_background` is a **Bash tool parameter**, not a shell
+construct, and is never named. A model following an explicit instruction from its own
+tool layer would not obviously be breaking the letter of that rule.
+
+It held anyway: the model refused, said the block came from its tool layer rather than
+the box, and did not chain shorter sleeps. That is the wording working under direct
+pressure from the harness — which is evidence the rule is well written, not evidence
+the hole is safe.
+
+**This is the fifth instance of the same class**, after `AskUserQuestion`, the `Task`
+family, backgrounding itself, and `BASH_MAX_TIMEOUT_MS`: *never offer, forbid, or rely
+on a capability the surface does not control.* The new wrinkle is that the conflicting
+advice now arrives in a harness **error message**, which no amount of tool-list curation
+reaches — the prompt has to answer it directly.
 
 ### Foundry reconciliation at boot (DAT-199)
 

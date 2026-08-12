@@ -261,11 +261,24 @@ def running_apps() -> list[dict[str, Any]]:
                 continue
             if not _port_listening(port):
                 continue
-            apps.append({
+            # ⚠️ The pid is carried for the model's benefit (so a later turn can
+            # stop an app it started) and is deliberately NOT part of the
+            # liveness decision -- that is the listening port, above, and only
+            # the port. A pid can be recycled onto an unrelated process, so
+            # believing one would keep a box awake for something that is not the
+            # app; and a still-running pid whose port is dead is a crashed app,
+            # which must NOT report warm. Read it loosely: an absent or
+            # malformed pid is normal, not a reason to drop a serving app.
+            app = {
                 "name": str(record.get("name") or project.name),
                 "port": port,
                 "project": project.name,
-            })
+            }
+            try:
+                app["pid"] = int(record["pid"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            apps.append(app)
     except Exception:
         logger.warning("app marker scan failed", exc_info=True)
     return apps
