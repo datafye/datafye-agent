@@ -58,11 +58,26 @@ CONNECTTRADE_API_URL = os.getenv(
     "https://api.connecttrade.com",
 )
 
-# Redirect target hosted on the Datafye App domain (broker-callback.html in datafye-app).
+# Redirect target: broker-callback.html, served by the Yukti SPA.
 # ConnectTrade appends ?connection_id=... on success or ?error=... on failure.
+#
+# WARNING: This defaulted to https://developer.datafye.io/broker-callback.html,
+# and that domain DOES NOT RESOLVE. It was correct when the workspace and the
+# public site were one app; the workspace was then extracted into Yukti on its
+# own domain and the old host retired, and this default was left behind. The
+# installer never sets DATAFYE_AGENT_BROKER_REDIRECT_URL, so every box used the
+# dead value -- meaning brokerage linking, the first step of the entire trading
+# path, redirected into nothing on every sandbox in the fleet.
+#
+# It survived because nothing fails until a real user links a real brokerage:
+# the agent builds the URL, hands it to ConnectTrade and returns 200, so every
+# test short of completing an OAuth round trip passes. A default pointing at a
+# domain we no longer own is worse than no default -- an unset value would at
+# least have failed loudly at startup. If this host ever moves again, the page
+# lives in datafye-yukti; move them together.
 BROKER_REDIRECT_URL = os.getenv(
     "DATAFYE_AGENT_BROKER_REDIRECT_URL",
-    "https://developer.datafye.io/broker-callback.html",
+    "https://yukti.datafye.ai/broker-callback.html",
 )
 
 # Datafye's supported brokers — mirrors StocksBroker enum in

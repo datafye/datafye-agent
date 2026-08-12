@@ -1411,7 +1411,7 @@ frontend                agent                        ConnectTrade
 (user completes OAuth on ConnectTrade's hosted UI)
 ```
 
-The default `redirect_url` is `https://developer.datafye.io/broker-callback.html` — a static page that just signals the parent window that OAuth finished.
+The default `redirect_url` is `https://yukti.datafye.ai/broker-callback.html` — a static page that just signals the parent window that OAuth finished.
 
 We use `permission_mode="bypassPermissions"` which means the agent can execute anything. This is necessary for CLI operations and Python execution, but it means:
 - A malicious prompt could potentially access the host system

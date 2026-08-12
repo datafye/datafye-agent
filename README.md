@@ -10,7 +10,7 @@ This repository contains the **agent backend only**. It is the glue code that co
 
 ## How the pieces fit
 
-The Datafye App at [developer.datafye.io](https://developer.datafye.io) is a **static frontend** (HTML/CSS/JS, no backend of its own). Your browser connects **directly** to the agent over HTTP + SSE — there is no intermediary server. This is true whether you're on a Datafye-managed sandbox or your own self-hosted agent: chat messages, credentials, and broker traffic never flow through any Datafye-operated app tier. The only server-side pieces Datafye runs for you are (a) serving the static app and (b) in the hosted model, the accounts service that provisions your sandbox. Once the sandbox is up, your browser talks straight to it.
+The Datafye App at [yukti.datafye.ai](https://yukti.datafye.ai) is a **static frontend** (HTML/CSS/JS, no backend of its own). Your browser connects **directly** to the agent over HTTP + SSE — there is no intermediary server. This is true whether you're on a Datafye-managed sandbox or your own self-hosted agent: chat messages, credentials, and broker traffic never flow through any Datafye-operated app tier. The only server-side pieces Datafye runs for you are (a) serving the static app and (b) in the hosted model, the accounts service that provisions your sandbox. Once the sandbox is up, your browser talks straight to it.
 
 ```
 Browser ──HTTP + SSE──▶ Your agent (sandbox or self-hosted) ──▶ ConnectTrade, Anthropic, etc.
@@ -25,25 +25,25 @@ Browser ──HTTP + SSE──▶ Your agent (sandbox or self-hosted) ──▶ 
 - Sandbox lifecycle (provision / start / stop / idle detection) driven by the Datafye accounts service
 - Credentials pushed from the accounts service; the agent is a write-through cache, never written to directly by the browser
 - Local docs + CLI + samples integration so the agent can research, build, test, and deploy
-- Static `developer.datafye.io` frontend connects directly to the agent backend (hosted sandbox or self-hosted), no Datafye-operated app tier in the middle
+- Static `yukti.datafye.ai` frontend connects directly to the agent backend (hosted sandbox or self-hosted), no Datafye-operated app tier in the middle
 
 **Not yet wired up**
 - TradingView Lightweight Charts integration for the Test mode dashboard
-- Free-tier usage metering for `developer.datafye.io` hosted sandboxes
+- Free-tier usage metering for `yukti.datafye.ai` hosted sandboxes
 
 ## Three ways to run it
 
 The Datafye platform is free for everything up to live trading — research, signal development, algo development, backtesting, and paper trading all cost nothing. **Live trading is the sole paid tier and runs exclusively on Datafye's cloud.** The agent itself is always free and open source.
 
-| | developer.datafye.io (free tier) | developer.datafye.io (paid) | Self-hosted |
+| | yukti.datafye.ai (free tier) | yukti.datafye.ai (paid) | Self-hosted |
 |---|---|---|---|
 | **Who runs the agent** | Datafye, in a managed sandbox | Datafye, in a managed sandbox | You, on your own infra |
 | **Anthropic key** | Datafye provides | Datafye provides | You bring your own |
 | **Usage limit** | Capped by time and token quotas — whichever hits first (TBD) | None (within reason) | None — you pay Anthropic directly |
 | **Price** | Free | Subscription | Free (agent is Apache 2.0) |
-| **Frontend** | `developer.datafye.io` (static, direct to your sandbox agent) | `developer.datafye.io` (static, direct to your sandbox agent) | `developer.datafye.io` pointed at your agent URL, or call the API directly |
+| **Frontend** | `yukti.datafye.ai` (static, direct to your sandbox agent) | `yukti.datafye.ai` (static, direct to your sandbox agent) | `yukti.datafye.ai` pointed at your agent URL, or call the API directly |
 
-When you exhaust the free hours on `developer.datafye.io`, you have two graceful options: upgrade to a paid Datafye tier, or point `developer.datafye.io` at your own self-hosted backend and keep going for free. The custom-backend-URL setting in Settings is the graduation path.
+When you exhaust the free hours on `yukti.datafye.ai`, you have two graceful options: upgrade to a paid Datafye tier, or point `yukti.datafye.ai` at your own self-hosted backend and keep going for free. The custom-backend-URL setting in Settings is the graduation path.
 
 ## Self-hosted install
 
@@ -78,9 +78,9 @@ Updates are automatic — a cron job polls `downloads.n5corp.com/datafye/agent/l
 
 ## Connecting a frontend
 
-### Option 1 — Use developer.datafye.io
+### Option 1 — Use yukti.datafye.ai
 
-Sign in at [developer.datafye.io](https://developer.datafye.io), open **Settings → Agent Backend**, and enter your agent URL (e.g. `https://agent.mycompany.com`). The frontend is static HTML/JS and SSEs directly to the URL you set — there is no Datafye-operated app backend in the path, so chat messages, credentials, and broker traffic flow only between your browser and your agent.
+Sign in at [yukti.datafye.ai](https://yukti.datafye.ai), open **Settings → Agent Backend**, and enter your agent URL (e.g. `https://agent.mycompany.com`). The frontend is static HTML/JS and SSEs directly to the URL you set — there is no Datafye-operated app backend in the path, so chat messages, credentials, and broker traffic flow only between your browser and your agent.
 
 ### Option 2 — API directly
 
