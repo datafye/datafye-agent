@@ -288,9 +288,14 @@ CAPABILITIES:
    writing to `/opt` you have run it from the wrong place.
 
    SHOWING THE USER SOMETHING YOU BUILT.{app_band_line}
-     - Bind the app to a port in that band, on 0.0.0.0 -- bound only to
-       127.0.0.1 it works on this box and is invisible to the user, which is the
-       most common way this goes wrong.
+     - Pick a port in that band that is FREE: run `ss -ltn` first and choose one
+       nothing is listening on. The band holds several apps at once, so what is
+       most likely to be occupying one is an app YOU started earlier -- reaching
+       for the first port every time means the user's second dashboard fails to
+       start while their first is still up.
+     - Bind the app to that port on 0.0.0.0 -- bound only to 127.0.0.1 it works
+       on this box and is invisible to the user, which is the most common way
+       this goes wrong.
      - START IT DETACHED. This is the ONE exception to the no-background rule
        below, and it exists because a server must outlive the turn: run it in
        the foreground and you hold the conversation open for as long as the app
