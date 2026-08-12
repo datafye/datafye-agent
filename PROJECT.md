@@ -1075,7 +1075,9 @@ earlier the same day purely as side effects of unrelated work. Nine wrong claims
 eight of them found by accident, is not bad luck — it is the signature of a surface that
 nothing audits. **Every ticket changes the world the prompt describes without touching the
 prompt.** So the prompt now gets read in full whenever a batch lands, and
-`test_prompt_audit.py` pins every finding, including a blanket non-ASCII sweep.
+`tests/test_prompt_audit.py` pins every finding, including a blanket non-ASCII sweep.
+⚠️ It did not exist for a day after this sentence first claimed it did — see *The
+Safeguard That Did Not Exist* below, which is the more useful half of this story.
 
 ⚠️ One correction belongs here, because it is the same failure in miniature. The PR that
 introduced that test claimed it "grows to 21 assertions". It did not: two string-anchored
@@ -1122,7 +1124,10 @@ repairs things was documented as requiring the thing to be off.
 The whole arc above — the graceful stop, derived readiness, intent through the model, the
 warm signal, the presence heartbeat, the foreground-command ceiling, the oversized-result
 guard, the seeded fleet bank, Node, the app port band, the project rename and the prompt
-audits — is **merged, but not yet released**.
+audits — went out in **RC 2.0.37** and was verified on a live sandbox (see *The Box
+Arrives* below). What followed it — the app-server exception, the band move, the harness
+reporting and the environment column — is **merged and awaiting the next RC**, so the
+paragraph below still applies to it.
 
 Agent changes travel in an agent release, so a fleet box only gets them when that release
 is published and the auto-upgrade picks it up. Until then the code is true of the
@@ -1132,10 +1137,21 @@ user as a fix that does not exist.**
 
 Two things make that harder than usual this time.
 
-⚠️ **The order is not free.** A box carrying the new agent but an old CLI has the boot
-reconciler without the converge `start`, and that combination degrades to
-launch-everything, which fails on a partially-running environment. The CLI release goes
-first, then the agent, then accounts, then the SPA.
+⚠️ **The components must move together — but not in an order you choose.** A box carrying
+the new agent but an old CLI has the boot reconciler without the converge `start`, and
+that combination degrades to launch-everything, which fails on a partially-running
+environment. The instinct is to sequence the releases; **there is no sequence to get
+right.** A Datafye RC is a *single build chain* — platform, CLI, MCP server, samples,
+deploy engine and the agent all built at one version by one trigger — so within a release
+this skew cannot occur. (`datafye-accounts` is the one exception: its own `1.0` line, its
+own deploy.)
+
+The real skew vector is the one the single chain does not cover: **the agent auto-upgrades
+between RCs on its own cron**, so a long-lived box can end up carrying an agent newer than
+the CLI and deploy engine baked into it. A freshly provisioned box has neither problem.
+Reasoning about a release order that does not exist produced confident, wrong advice here
+before the build chain was checked — *ask how the thing is actually built before designing
+around how you assume it is built.*
 
 ⚠️ **And for once, auto-upgrade is not enough.** The project rename means a box still
 carrying `strategies/` will come up with no projects at all — its data intact on disk and
@@ -1148,6 +1164,92 @@ unverifiable without a running hosted sandbox — the dormancy run, the intent p
 heartbeat, the readiness round-trip, the raised timeout ceiling against the *bundled* CLI,
 the Node install, the warm signal from a live app, and the fleet block appearing in a real
 prompt. They are not forgotten and they are not done; they are queued behind one box.
+
+### The Box Arrives, and Four Things Fall Over
+
+RC 2.0.37 was cut and a sandbox provisioned. Most of the queue above passed on the first
+try: the boot reconciler left an empty foundry *running*, the old first-boot unit was
+properly retired, `DATAFYE_AGENT_PINNED=false` on a baked box (the fix that had silently
+frozen the entire fleet), Node and the quant stack, the fleet memory bank answering a
+question only it could answer, `active_proxied_apps: []` on an idle provisioned foundry,
+and the readiness transition rendering all the way through to the accounts console.
+
+Then four defects, and **not one of them was findable without the box.** That is the
+finding, more than any of the four.
+
+**The app you cannot start.** The prompt told the model to serve an app on the preview
+band and hand the user a URL. DAT-185 forbade backgrounding "not for environment
+operations, not for anything else". There is no third option — a foreground server holds
+the conversation open for as long as the app lives — so the band, the marker, the warm
+signal and the jump-server route had all been built around a hole where the app itself
+should be. It was found only because writing the end-to-end test required a legal first
+step and there wasn't one. Each section was correct alone; **the contradiction lived
+*between* them, a hundred and fifty lines apart, where no review of either would see it.**
+
+The fix was not a blanket exception but a reading of what the ban is *for*. All three of
+its reasons — you cannot await it, kill it, or see it finish — are supervision problems,
+and none applies to a server: orphaning is the required behaviour, finishing is failure,
+and liveness is the listening port the warm signal already probes. So: **detaching is
+forbidden because you cannot supervise what you detached, and an app server is the one
+case where the port is the supervision.** The prompt now hands the model a test rather
+than a taxonomy — *if it produces a result, run it in the foreground; if it answers on a
+port, detach it.*
+
+**The band nobody could use.** Asked to serve on 8080, the model hit `Address already in
+use`. `rumi-solace` publishes 8080 and `rumi-influxdb` publishes 8086 on every box, empty
+foundry or not. The band came from Sutra, where it is correct — there is no Datafye
+platform underneath it there. **Reusing the mechanism was right; reusing the numbers
+carried an assumption that did not survive the move.** It went to 10010-10019: out of the
+80xx neighbourhood entirely rather than shuffled within it, and starting at 10010 rather
+than 10000 because 10000 is Webmin's conventional default and putting our first port where
+something else conventionally lives is the exact mistake being fixed.
+
+**The harness that recommends what the prompt forbids.** Testing the raised timeout
+ceiling with `sleep 700` produced a refusal from the *tool layer*, offering two remedies:
+`Monitor`, which this agent does not have, and `run_in_background: true`, which is the
+technique that orphaned a provision on u1. The ban listed only shell constructs (`&`,
+`nohup`, `setsid`), and `run_in_background` is a **tool parameter** — so a model obeying
+its own harness was not obviously breaking the letter of the rule. It refused anyway and
+said why, which is the wording working under direct pressure and not a reason to leave the
+hole. Fifth instance of *never offer, forbid, or rely on a capability the surface does not
+control* — and the first where the conflicting advice arrives in an **error message**, which
+no amount of tool-list curation can reach.
+
+**A version that was never measured.** "The bundled CLI is 2.1.85" had been written into a
+ticket, a correction to that ticket, and `CLAUDE.md`. It is 2.1.228. The number had been
+read off the local dev venv, which carries SDK 0.1.51 while production resolves
+`>=0.2.128,<0.3` — a trap that was *already documented in the same ticket*, item 4, and
+walked into while writing the correction above it. **A version derived from a pin range is
+a guess about what resolution will do, not a fact.** `/v1/bom` now reports the harness, so
+it is a number anyone can read instead of one people infer.
+
+### The Safeguard That Did Not Exist
+
+The worst of it was not in the code.
+
+`CLAUDE.md` and `PROJECT.md` had said for a day that `test_prompt_audit.py` pinned every
+finding from the prompt audit, "including a blanket non-ASCII check, so they cannot come
+back quietly". **The file was never committed.** The checks had been written as a
+throwaway during that session, run once, and then documented as though they had been
+committed.
+
+So nine findings sat unguarded behind a sentence saying they were guarded — which is
+**strictly worse than saying nothing**, because a stated safeguard stops anyone looking for
+one. "I ran the checks" and "the checks exist" are different claims, and only the second
+belongs in a document.
+
+Written for real, it failed twice on its first run. The em-dash sweep had left 9 warning
+signs and 3 arrows, so the prompt was still teaching by counterexample the very thing it
+forbids. And the port band still contained platform-occupied ports. **Both had been
+recorded as already handled.**
+
+It renders the real prompt through `build_system_prompt` rather than grepping the source,
+because the quant stack, the bash ceiling and the preview base are all composed at build
+time and a source-level check would pass while the rendered prompt was wrong. And every
+check is run against the historical bug it guards, reintroduced deliberately — the wrong
+hostname, the reverted readiness wording, an em dash, a renamed marker field — because this
+repository has already shipped a suite whose assertions silently never matched and passed
+vacuously. **A green test is evidence of nothing until you have watched it go red.**
 
 ### Bootstrap: How the Agent Learns Who It Is
 
