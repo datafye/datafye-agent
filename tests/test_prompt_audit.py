@@ -168,9 +168,28 @@ def _harness_conflict(text):
 
 @check("the app marker carries name, port and pid (DAT-219)")
 def _marker_shape(text):
-    assert prompt_module.APP_MARKER in text, "the app marker filename is not named"
     for field in ('"name"', '"port"', '"pid"'):
         assert field in text, f"the app marker shape is missing {field}"
+
+
+@check("the marker is one file PER APP, named for its port (DAT-221)")
+def _marker_per_app(text):
+    # A single marker per project silently capped a project at one warm app:
+    # stopping the tracked one let the box dorm while a sibling was still
+    # serving a page the user had open. The filename must carry the port, and
+    # the model must be told not to reuse one marker for two apps.
+    assert ".datafye-app-<port>.json" in text, \
+        "the prompt does not name the per-port marker filename"
+    assert "ONE FILE PER APP" in text, \
+        "nothing stops the model reusing a single marker for several apps"
+    # The rendered example must match what warmth actually globs, or the model
+    # writes a filename the warm signal never looks at.
+    import warmth
+    example = warmth.app_marker_name(str(prompt_module.APP_PORT_RANGE).split("-")[0])
+    assert example in text, f"the rendered marker example {example} is not in the prompt"
+    import fnmatch
+    assert fnmatch.fnmatch(example, warmth.APP_MARKER_GLOB), \
+        f"{example} does not match the glob {warmth.APP_MARKER_GLOB} that warmth scans"
 
 
 @check("the app port band is rendered and matches the module constant (DAT-220)")
