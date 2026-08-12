@@ -53,7 +53,14 @@ logger = logging.getLogger(__name__)
 # restarting anyway -- an upgrade replaces the venv and restarts it.
 _CACHE: dict[str, Any] | None = None
 
-_VERSION_TIMEOUT_SECONDS = 10
+# 60s, not 10. The bundled CLI is a ~308 MB Bun binary, and its FIRST exec on a
+# box has to fault the whole thing in from a cold EBS volume before Bun even
+# starts. A warm re-run of the same binary takes about a second, which is what
+# makes this easy to under-size: every measurement you take by hand is warm,
+# because taking it is what warms it. The probe runs once per process and
+# nothing waits on it, so a generous bound costs nothing and a tight one buys
+# nothing.
+_VERSION_TIMEOUT_SECONDS = 60
 
 
 def _bundled_cli_path() -> str | None:
@@ -75,25 +82,36 @@ def _bundled_cli_path() -> str | None:
         return None
 
 
-def _version_of(cli_path: str) -> str | None:
-    """`claude --version`, or None. Never raises."""
+def _version_of(cli_path: str) -> tuple[str | None, str | None]:
+    """`(version, error)` from `claude --version`. Never raises.
+
+    ⚠️ Returns the REASON on failure, not just None. The first cut of this
+    reported a bare null, and on the first real box it did exactly that -- with
+    no way to tell a timeout from a non-zero exit from a missing binary, which
+    is the same "a fact nobody can read" problem this whole module was written
+    to fix, reproduced one level down. An unknown that cannot say why is barely
+    better than no field at all.
+    """
     try:
         result = subprocess.run(
             [cli_path, "--version"],
             capture_output=True, text=True, timeout=_VERSION_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
-            return None
+            detail = (result.stderr or result.stdout or "").strip()
+            return None, f"exit {result.returncode}" + (f": {detail[:200]}" if detail else "")
         # "2.1.228 (Claude Code)" -- keep the whole line; the parenthetical is
         # part of what the binary calls itself and trimming it would invent a
         # format the CLI never promised.
-        return (result.stdout or "").strip() or None
-    except Exception:
-        # A binary built for another architecture is the realistic failure here:
-        # the bundled CLI is a Bun build that needs AVX, so it cannot be
-        # exercised on some dev machines at all. Reporting "unknown" is the
-        # honest answer and is still better than the silence this replaces.
-        return None
+        version = (result.stdout or "").strip()
+        return (version or None), (None if version else "empty output")
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {_VERSION_TIMEOUT_SECONDS}s"
+    except Exception as exc:
+        # A binary built for another architecture is the other realistic
+        # failure: the bundled CLI is a Bun build that needs AVX, so it cannot
+        # be exercised on some dev machines at all.
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def describe() -> dict[str, Any]:
@@ -109,6 +127,7 @@ def describe() -> dict[str, Any]:
 
     info: dict[str, Any] = {
         "cli_version": None,
+        "cli_version_error": None,
         "cli_path": None,
         "cli_source": None,
         "sdk_version": None,
@@ -131,15 +150,26 @@ def describe() -> dict[str, Any]:
             info["cli_path"], info["cli_source"] = path_cli, "path"
 
         if info["cli_path"]:
-            info["cli_version"] = _version_of(info["cli_path"])
+            info["cli_version"], info["cli_version_error"] = _version_of(info["cli_path"])
+            if info["cli_version_error"]:
+                logger.warning("could not read the harness version from %s: %s",
+                               info["cli_path"], info["cli_version_error"])
 
         # Reported even when it is not the harness, because the two being
         # confused is the whole reason this module exists. When they differ,
         # an operator can see it here instead of inferring it.
         if path_cli and path_cli != info["cli_path"]:
-            info["path_cli_version"] = _version_of(path_cli)
+            info["path_cli_version"], _ = _version_of(path_cli)
     except Exception:
         logger.warning("could not determine the harness version", exc_info=True)
 
-    _CACHE = info
+    # ⚠️ CACHE SUCCESS ONLY. Caching a failure keeps the wrong answer for the
+    # life of the process, and this probe is MOST likely to fail on its first
+    # call -- cold binary, cold page cache, a box still settling after boot.
+    # The first cut cached unconditionally and did exactly that on the first
+    # real box: `cli_version: null` pinned in, while running the same binary by
+    # hand a minute later took under a second. Retrying costs one subprocess on
+    # a page that is polled rarely, and only until it works once.
+    if info["cli_version"]:
+        _CACHE = info
     return info
