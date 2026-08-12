@@ -219,11 +219,13 @@ async def observe(deployment_api_url: str) -> dict[str, Any]:
             if datasets is None:
                 return _observation(OBSERVED_DOWN, [], [],
                                     "the deployment API is not answering")
+            env_type = await _environment_type(client, base)
             if not datasets:
                 # The API serves, but nothing is deployed behind it. That is the
                 # ordinary state of a fresh empty foundry, not a fault.
                 return _observation(OBSERVED_SERVING, [], [],
-                                    "the API is answering; no datasets are deployed")
+                                    "the API is answering; no datasets are deployed",
+                                    env_type)
 
             dead: list[str] = []
             for dataset in datasets:
@@ -231,22 +233,60 @@ async def observe(deployment_api_url: str) -> dict[str, Any]:
 
             if dead:
                 return _observation(OBSERVED_PARTIAL, datasets, dead,
-                                    "not answering: " + ", ".join(dead))
+                                    "not answering: " + ", ".join(dead), env_type)
             return _observation(OBSERVED_SERVING, datasets, [],
-                                "every deployed service is answering")
+                                "every deployed service is answering", env_type)
     except Exception as exc:
         return _observation(OBSERVED_UNKNOWN, [], [],
                             f"the environment could not be interrogated: {exc}")
 
 
-def _observation(observed: str, datasets: list[str], dead: list[str], detail: str) -> dict[str, Any]:
+def _observation(observed: str, datasets: list[str], dead: list[str], detail: str,
+                 env_type: str | None = None) -> dict[str, Any]:
     return {
         "observed": observed,
         "datasets": datasets,
         "not_answering": dead,
         "checked_at": int(time.time() * 1000),
         "detail": detail,
+        # None means "could not tell", NEVER "there is no environment" (DAT-217).
+        # An admin column that renders those the same way turns "I could not
+        # look" into "it is not working", which is the distinction the whole
+        # readiness block exists to preserve.
+        "env_type": env_type,
     }
+
+
+async def _environment_type(client: httpx.AsyncClient, base: str) -> str | None:
+    """'foundry' or 'trading', or None when it cannot be determined.
+
+    Inferred from the deployed SYSTEMS rather than read from the deployment
+    descriptor. Both would work, and the descriptor is the more authoritative
+    source -- but the systems list is one call on an endpoint this function is
+    already talking to, while the descriptor means a second read whose only
+    purpose is a label. The tell is unambiguous: a trading environment stands up
+    `datafye-broker-stocks-system` alongside the data systems, and a foundry
+    never does.
+
+    NB the names carry the version (`datafye-api-system-2.0.37`), so this
+    matches on a substring rather than equality -- comparing whole names would
+    work today and break on the next release, which is exactly the kind of
+    silent version coupling this codebase keeps paying for.
+    """
+    try:
+        response = await client.get(f"{base}/datafye-api/v1/deployment/systems",
+                                    timeout=OBSERVE_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            return None
+        systems = response.json().get("systems")
+        if not systems:
+            # An empty list is a real answer -- an environment with nothing in
+            # it -- but it does not say which KIND it would be, so the honest
+            # report is still "could not tell".
+            return None
+        return "trading" if any("broker" in str(s) for s in systems) else "foundry"
+    except Exception:
+        return None
 
 
 async def _deployed_datasets(client: httpx.AsyncClient, base: str) -> list[str] | None:
@@ -390,6 +430,10 @@ def derive(intent: dict[str, Any], snapshot: dict[str, Any], in_flight: str | No
         "datasets": snapshot.get("datasets") or [],
         "not_answering": snapshot.get("not_answering") or [],
         "checked_at": snapshot.get("checked_at"),
+        # Passed straight through, null included: accounts renders this as its
+        # own column (DAT-217), and null must reach it as null so it can show
+        # "unknown" rather than defaulting to a type it was never told.
+        "env_type": snapshot.get("env_type"),
         "reason": reason,
         # Kept so a reader written against the earlier shape does not KeyError.
         # Failure detail lives in the report under ~/.datafye/logs, written by
