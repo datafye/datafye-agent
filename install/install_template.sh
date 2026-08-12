@@ -1035,7 +1035,7 @@ NGINX
 <!DOCTYPE html>
 <html><body style="background:#0a0a0a;color:#e6edf3;font-family:monospace;padding:40px;">
 <h2>Datafye Agent</h2>
-<p>Backend is running. Connect via the Datafye App at developer.datafye.io.</p>
+<p>Backend is running. Connect via Yukti at yukti.datafye.ai.</p>
 <p><a href="/health" style="color:#f59e0b;">Check health</a></p>
 </body></html>
 PLACEHOLDER
