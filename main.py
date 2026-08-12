@@ -233,8 +233,27 @@ READ_REFUSE_BYTES = MAX_BUFFER_SIZE // 2
 # the SDK subprocess inherits os.environ. Harmless when the directory does not
 # exist (a box without Node, or before the first global install).
 _NPM_GLOBAL_BIN = os.path.expanduser("~/.npm-global/bin")
-if _NPM_GLOBAL_BIN not in os.environ.get("PATH", "").split(os.pathsep):
-    os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _NPM_GLOBAL_BIN
+
+# The sbin directories, for the same reason and with a sharper symptom. systemd
+# hands a service a minimal PATH, and on this box it does not include
+# /usr/sbin -- so `ss`, which prompt.py tells the model to run before binding an
+# app and again to verify the bind, is simply not found. Observed on a live box:
+# the model's FIRST command of its FIRST app was `ss -ltn`, it failed, and the
+# next command fell back to `/usr/sbin/ss`. It recovered every time, which is
+# exactly why this would have gone unnoticed -- a wasted round trip on every
+# single app, forever, costing tokens and latency and nothing else.
+#
+# Fixed here rather than by hardcoding /usr/sbin/ss into the prompt: the path is
+# a property of the box, not of the instruction, and the next sbin tool the
+# model reaches for would hit the same wall. Adding sbin to a non-root PATH is
+# safe -- the binaries are world-executable and simply do less without
+# privileges (`ss -p` shows only this user's own pids, which is all it needs).
+_EXTRA_BIN_DIRS = [_NPM_GLOBAL_BIN, "/usr/sbin", "/sbin"]
+_current_path = os.environ.get("PATH", "").split(os.pathsep)
+for _bin_dir in _EXTRA_BIN_DIRS:
+    if _bin_dir and _bin_dir not in _current_path:
+        _current_path.append(_bin_dir)
+os.environ["PATH"] = os.pathsep.join(p for p in _current_path if p)
 
 
 async def guard_oversized_read(
