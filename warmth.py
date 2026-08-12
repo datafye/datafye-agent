@@ -108,7 +108,26 @@ PROBE_TIMEOUT_SECONDS = float(os.environ.get("DATAFYE_AGENT_WARM_PROBE_TIMEOUT",
 # a fact -- so a crashed app, or one whose marker was never cleaned up, stops
 # keeping the box awake by itself. That self-healing is the whole reason the
 # signal is a probe rather than a registry.
-APP_MARKER = ".datafye-app.json"
+# ONE MARKER PER APP, not one per project (DAT-221). The first cut had a single
+# `.datafye-app.json` per project folder, which quietly capped a project at one
+# warm app: a user with two dashboards had only one of them keeping the box
+# awake, and stopping that one let the box dorm while the other was still
+# serving a page somebody had open. It held on a live box only because the model
+# noticed, rewrote the marker to point at the survivor, and said so -- behaviour
+# that depends on the model spotting an infrastructure gap is not a guarantee.
+# The band is ten ports precisely so several apps can run at once.
+#
+# A file per app rather than a list inside one file, deliberately: starting an
+# app writes one file and stopping it deletes one file, so two apps never
+# read-modify-write anything shared and neither can lose the other's entry. It
+# also keeps the self-healing property per APP -- a stale marker whose port is
+# dead is ignored on its own, without taking a live sibling down with it.
+APP_MARKER_GLOB = ".datafye-app*.json"
+
+
+def app_marker_name(port: int) -> str:
+    """The marker filename for an app on this port."""
+    return f".datafye-app-{port}.json"
 APP_PROBE_TIMEOUT = float(os.environ.get("DATAFYE_AGENT_APP_PROBE_TIMEOUT", "0.3"))
 _private_ip_cache: str | None = None
 
@@ -245,40 +264,58 @@ def running_apps() -> list[dict[str, Any]]:
         base = conversations.projects_base()
         if not base.exists():
             return apps
+        seen: set[tuple[str, int]] = set()
         for project in base.iterdir():
-            marker = project / APP_MARKER
-            if not marker.is_file():
+            if not project.is_dir():
                 continue
-            try:
-                with open(marker) as handle:
-                    record = json.load(handle)
-                port = int(record.get("port"))
-            except Exception:
-                # A marker being written as we read it, or hand-edited into
-                # nonsense. Not evidence either way -- skip it rather than let
-                # one bad file decide whether the box stays up.
-                logger.warning("ignoring unreadable app marker: %s", marker)
-                continue
-            if not _port_listening(port):
-                continue
-            # ⚠️ The pid is carried for the model's benefit (so a later turn can
-            # stop an app it started) and is deliberately NOT part of the
-            # liveness decision -- that is the listening port, above, and only
-            # the port. A pid can be recycled onto an unrelated process, so
-            # believing one would keep a box awake for something that is not the
-            # app; and a still-running pid whose port is dead is a crashed app,
-            # which must NOT report warm. Read it loosely: an absent or
-            # malformed pid is normal, not a reason to drop a serving app.
-            app = {
-                "name": str(record.get("name") or project.name),
-                "port": port,
-                "project": project.name,
-            }
-            try:
-                app["pid"] = int(record["pid"])
-            except (KeyError, TypeError, ValueError):
-                pass
-            apps.append(app)
+            # The glob matches the per-app `.datafye-app-<port>.json` AND the
+            # older single `.datafye-app.json`, which costs nothing and closes a
+            # real window: an agent upgrade while an app is running would
+            # otherwise orphan that app's marker, and the box would go cold with
+            # the user's page still open -- the exact DAT-221 failure, caused by
+            # the DAT-221 fix. Sorted so the reported order is stable rather
+            # than filesystem-dependent.
+            for marker in sorted(project.glob(APP_MARKER_GLOB)):
+                if not marker.is_file():
+                    continue
+                try:
+                    with open(marker) as handle:
+                        record = json.load(handle)
+                    port = int(record.get("port"))
+                except Exception:
+                    # A marker being written as we read it, or hand-edited into
+                    # nonsense. Not evidence either way -- skip it rather than
+                    # let one bad file decide whether the box stays up.
+                    logger.warning("ignoring unreadable app marker: %s", marker)
+                    continue
+                # The PORT is the identity, not the filename. A leftover
+                # `.datafye-app.json` naming the same port as its per-app
+                # successor would otherwise report the app twice and show the
+                # operator two `compute:` labels for one dashboard.
+                if (project.name, port) in seen:
+                    continue
+                if not _port_listening(port):
+                    continue
+                seen.add((project.name, port))
+                # ⚠️ The pid is carried for the model's benefit (so a later turn
+                # can stop an app it started) and is deliberately NOT part of
+                # the liveness decision -- that is the listening port, above,
+                # and only the port. A pid can be recycled onto an unrelated
+                # process, so believing one would keep a box awake for something
+                # that is not the app; and a still-running pid whose port is
+                # dead is a crashed app, which must NOT report warm. Read it
+                # loosely: an absent or malformed pid is normal, not a reason to
+                # drop a serving app.
+                app = {
+                    "name": str(record.get("name") or project.name),
+                    "port": port,
+                    "project": project.name,
+                }
+                try:
+                    app["pid"] = int(record["pid"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                apps.append(app)
     except Exception:
         logger.warning("app marker scan failed", exc_info=True)
     return apps

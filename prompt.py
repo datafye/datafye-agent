@@ -51,12 +51,15 @@ _QUANT_STACK_FALLBACK = "pandas, numpy, scipy, matplotlib"
 # conventional default -- nothing here uses it, but putting our first port where
 # something else conventionally lives is the exact mistake DAT-220 was about.
 APP_PORT_RANGE = os.getenv("DATAFYE_AGENT_APP_PORT_RANGE", "10010-10019")
-# Kept in step with warmth.APP_MARKER by importing it, so the prompt cannot tell
-# the model to write a filename the warm signal does not look for.
+# Kept in step with warmth by importing the namer, so the prompt cannot tell the
+# model to write a filename the warm signal does not look for. One marker per
+# app (DAT-221) -- the name carries the port, which is what lets several apps
+# run in one project without either overwriting the other's tracking.
 try:
-    from warmth import APP_MARKER
+    from warmth import app_marker_name
 except Exception:      # warmth pulls httpx; keep prompt importable without it
-    APP_MARKER = ".datafye-app.json"
+    def app_marker_name(port):        # type: ignore[misc]
+        return f".datafye-app-{port}.json"
 
 
 def _quant_stack() -> str:
@@ -103,7 +106,11 @@ def build_system_prompt(
     # in front of this box (a self-hosted agent), and then there is no URL to
     # promise -- so the whole capability is described as local-only rather than
     # dangling a base URL that would 404.
-    app_marker = APP_MARKER
+    # Rendered with a concrete port so the model sees the SHAPE of the name
+    # rather than a placeholder it has to assemble. The band's first port is
+    # only an example; the instruction says to use the port it actually bound.
+    app_port_example = str(APP_PORT_RANGE).split("-")[0] or "10010"
+    app_marker = app_marker_name(app_port_example)
     if app_preview_base and APP_PORT_RANGE:
         app_band_line = (
             f" Your apps are reachable at {app_preview_base}:<port>, where <port>\n"
@@ -310,20 +317,27 @@ CAPABILITIES:
        (a server that died on startup leaves nothing, and `app.log` says why),
        it confirms 0.0.0.0 rather than 127.0.0.1, and it gives you the pid for
        the marker. Do not skip it and assume the launch worked.
-     - Write `{app_marker}` in the PROJECT FOLDER, containing
+     - Write a marker in the PROJECT FOLDER named for the port you bound --
+       `.datafye-app-<port>.json`, so on port {app_port_example} that is
+       `{app_marker}` -- containing
        `{{"name": "<short name>", "port": <port>, "pid": <pid>}}`. That marker
        is what stops the box being idle-stopped while the user has your app
        open. No marker means their dashboard dies under them mid-look. The pid
        is what lets a LATER turn stop the app cleanly; the port is what proves
        it is alive, so keep the port accurate above all -- if you had to move to
-       a different port, rewrite the marker.
+       a different port, write the marker for the port you ended up on.
+       ONE FILE PER APP. Never put two apps in one marker and never rewrite an
+       existing app's marker to describe a different app: each running app needs
+       its own, or the ones without a marker stop keeping the box awake and die
+       under the user while a sibling is still tracked.
      - Give the user the full URL. They cannot guess the port.
      - WARNING: THE URL IS NOT PROTECTED. Anyone who has it can open the app, so if it
        shows anything sensitive you must build the protection INTO the app --
        a password, a token in the path, whatever fits -- and tell the user plainly
        what you did and did not protect. Do not assume a login exists around it.
-     - Stop the app and delete the marker when it is no longer wanted: `kill
-       <pid>` from the marker, then remove the file. A marker whose port is dead
+     - Stop the app and delete THAT APP'S marker when it is no longer wanted:
+       `kill <pid>` from its marker, then remove that one file and leave every
+       other app's marker alone. A marker whose port is dead
        is ignored, so a crash cleans itself up, but leaving one behind for a
        live app you have abandoned keeps the box awake for nothing. If the pid
        is missing or already gone, find it by the port (`ss -ltnp`) rather than
