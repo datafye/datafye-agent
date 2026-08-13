@@ -48,6 +48,10 @@ VERSION_URL="https://downloads.n5corp.com/datafye/agent/latest/version.txt"
 LOG_PREFIX="[datafye-agent-upgrade]"
 
 STATE_FILE="${INSTALL_DIR}/.upgrade-check-state"
+# Consecutive failed install attempts, and the earliest epoch second at which
+# another may be tried. See the backoff note further down.
+FAIL_FILE="${INSTALL_DIR}/.upgrade-check-failures"
+RETRY_FILE="${INSTALL_DIR}/.upgrade-check-retry-after"
 
 # Log a decision ONLY when it changes from the last one. This runs every
 # minute, so logging every outcome would bury the interesting lines in
@@ -152,6 +156,35 @@ if [ "${JITTER_MAX}" -gt 0 ] 2>/dev/null; then
     sleep "${j}"
 fi
 
+# ── Failure backoff ──────────────────────────────────────────────
+# ⚠️ This cron runs EVERY MINUTE, and an install that fails partway leaves the
+# agent stopped -- so /health goes unreachable, which this script reads as
+# "nothing to protect, proceed". Without a brake those two rules compose into an
+# infinite loop: fail, retry a minute later, fail identically, forever. Observed
+# live on a box whose agent tree had non-root ownership; git refused it at the
+# same step on every one of dozens of attempts, and the agent stayed down
+# throughout.
+#
+# So back off on repeated failure: 1, 5, 15, 30, then 60 minutes. A genuinely
+# transient fault (a download blip) still recovers on the next tick, while a
+# deterministic one stops consuming the box and stops burying the journal in
+# identical stack traces. It never gives up entirely -- a fix published upstream
+# must still be able to reach a wedged box unattended.
+_fail_count=0
+[ -f "${FAIL_FILE}" ] && _fail_count=$(cat "${FAIL_FILE}" 2>/dev/null || echo 0)
+case "${_fail_count}" in ''|*[!0-9]*) _fail_count=0 ;; esac
+
+if [ -f "${RETRY_FILE}" ]; then
+    _retry_after=$(cat "${RETRY_FILE}" 2>/dev/null || echo 0)
+    case "${_retry_after}" in ''|*[!0-9]*) _retry_after=0 ;; esac
+    _now=$(date +%s)
+    if [ "${_now}" -lt "${_retry_after}" ]; then
+        # Deliberately silent: this fires every minute and the reason was
+        # already logged loudly when the failure happened.
+        exit 0
+    fi
+fi
+
 echo "${LOG_PREFIX} Fetching installer v${LATEST_VERSION} from downloads.n5corp.com..."
 
 # Always fetch the latest installer (which has the target version baked in);
@@ -169,7 +202,19 @@ echo "${LOG_PREFIX} Fetching installer v${LATEST_VERSION} from downloads.n5corp.
 # (The installer also swaps the file atomically via mv, which keeps our original
 # inode alive. This is the belt to that pair of braces.)
 {
-    curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | DATAFYE_AUTO_UPGRADE=1 bash
-    echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
-    exit 0
+    if curl -fsSL "https://downloads.n5corp.com/datafye/agent/${LATEST_VERSION}/install.sh" | DATAFYE_AUTO_UPGRADE=1 bash; then
+        rm -f "${FAIL_FILE}" "${RETRY_FILE}" 2>/dev/null || true
+        echo "${LOG_PREFIX} Upgrade complete: now running v${LATEST_VERSION}"
+        exit 0
+    fi
+    # The installer restarts the previous agent on its own failure, so the box
+    # should still be serving the OLD version here.
+    _fail_count=$(( _fail_count + 1 ))
+    case "${_fail_count}" in
+        1) _wait=60 ;; 2) _wait=300 ;; 3) _wait=900 ;; 4) _wait=1800 ;; *) _wait=3600 ;;
+    esac
+    printf '%s' "${_fail_count}" > "${FAIL_FILE}" 2>/dev/null || true
+    printf '%s' "$(( $(date +%s) + _wait ))" > "${RETRY_FILE}" 2>/dev/null || true
+    echo "${LOG_PREFIX} Upgrade to v${LATEST_VERSION} FAILED (attempt ${_fail_count}); next attempt in $(( _wait / 60 ))m"
+    exit 1
 }

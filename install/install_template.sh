@@ -496,6 +496,26 @@ if [ "$IS_UPGRADE" = true ]; then
     info "[${STEP}/${TOTAL_STEPS}] Stopping existing agent..."
     systemctl stop datafye-agent 2>/dev/null || true
     ok "Agent service stopped"
+    # ⚠️ FROM HERE UNTIL THE START AT THE END, A FAILURE LEAVES THE AGENT DOWN.
+    # This script runs under `set -e`, so any unguarded non-zero command exits
+    # immediately -- and everything between here and the start is the whole
+    # install. Observed live: a git failure at step 7 exited the script with the
+    # agent stopped, the once-a-minute cron saw /health unreachable (which it
+    # reads as "nothing to protect, proceed"), ran the installer again, stopped
+    # the already-stopped agent, failed at the same step, and repeated. A
+    # transient fault became permanent downtime plus an infinite retry loop.
+    #
+    # The old code is still on disk when an install fails partway, so starting
+    # it back up restores a working agent. Cleared just before the deliberate
+    # start at the end, so the normal path is unaffected.
+    _restore_agent_on_failure() {
+        local rc=$?
+        [ "${rc}" -eq 0 ] && return 0
+        warn "Install failed (exit ${rc}) -- restarting the previous agent so the box is not left down."
+        systemctl start datafye-agent 2>/dev/null || true
+        return "${rc}"
+    }
+    trap _restore_agent_on_failure EXIT
 else
     info "[${STEP}/${TOTAL_STEPS}] Fresh install (no existing service)"
 fi
@@ -629,11 +649,20 @@ clone_or_update_repo() {
     local label="$4"
 
     if [ -d "${target_dir}/.git" ]; then
+        # ⚠️ -c safe.directory on EVERY call, not a global config write. These
+        # trees are managed by root from cron but can carry another user's
+        # ownership (an AMI bake seeded with `cp -a`, a hand-fixed box), and git
+        # then refuses with "detected dubious ownership" -- which under `set -e`
+        # aborted the upgrade mid-flight with the agent stopped. Scoped to the
+        # directory we are about to touch rather than `--global --add`, so the
+        # exemption cannot silently outlive this command or widen to a repo we
+        # did not put here.
+        local safe=(-c "safe.directory=${target_dir}")
         cd "${target_dir}"
-        git remote set-url origin "${repo_url}"
-        git fetch --depth 1 origin "${git_ref}" \
+        git "${safe[@]}" remote set-url origin "${repo_url}"
+        git "${safe[@]}" fetch --depth 1 origin "${git_ref}" \
             || { error "${label}: failed to fetch ${git_ref}"; exit 1; }
-        git checkout -qf FETCH_HEAD
+        git "${safe[@]}" checkout -qf FETCH_HEAD
         cd - > /dev/null
     else
         rm -rf "${target_dir}"
@@ -677,6 +706,13 @@ if [ -n "${AGENT_SOURCE_DIR}" ]; then
     rm -rf "${AGENT_CODE_DIR}"
     mkdir -p "$(dirname "${AGENT_CODE_DIR}")"
     cp -a "${AGENT_SOURCE_DIR}" "${AGENT_CODE_DIR}"
+    # ⚠️ `cp -a` preserves ownership, so the app tree inherits whoever owned the
+    # BUILD checkout -- typically not root. Every later upgrade runs git here as
+    # root from cron, and git refuses a repo owned by another user ("detected
+    # dubious ownership"), which under `set -e` killed the whole upgrade. The
+    # tree is meant to be root-owned anyway: that is what makes it read-only to
+    # the agent (see the fleet-memory note in CLAUDE.md).
+    chown -R root:root "${AGENT_CODE_DIR}"
     git -C "${AGENT_CODE_DIR}" remote set-url origin "${AGENT_REPO}"
     ok "Agent: ${AGENT_CODE_DIR} (from ${AGENT_SOURCE_DIR}, $(git -C "${AGENT_CODE_DIR}" rev-parse --short HEAD))"
 else
@@ -1189,6 +1225,8 @@ fi
 # identity or credentials and waits for the accounts service to push them
 # (POST /bootstrap, then the Anthropic key over the credentials channel).
 # So always start it; no key is needed at install time.
+# Past every step that could fail; the start below is the deliberate one.
+trap - EXIT
 info "Starting agent..."
 systemctl start datafye-agent
 
