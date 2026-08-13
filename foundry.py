@@ -128,8 +128,24 @@ STATE_UNKNOWN = "unknown"          # not enough evidence to say
 # What the interrogation found.
 OBSERVED_SERVING = "serving"
 OBSERVED_PARTIAL = "partial"
-OBSERVED_DOWN = "down"
+OBSERVED_DOWN = "down"          # provisioned, but not answering -- wedged
+OBSERVED_ABSENT = "absent"      # nothing is provisioned at all
 OBSERVED_UNKNOWN = "unknown"
+
+# ⚠️ DOWN and ABSENT used to be the same answer, and collapsing them made
+# readiness lie. A silent deployment API is all the HTTP probe can see, so a
+# cleanly stopped foundry and one whose containers are up with a dead API were
+# indistinguishable -- and since intent=stopped short-circuits to READY, a box
+# the CLI called DEGRADED was reported as ready. Telling them apart costs one
+# CLI call, and only on the path where something is already wrong.
+
+# The last environment type we managed to read. The type is a property of what
+# is PROVISIONED, not of whether it answers, and it cannot change without the
+# environment being rebuilt -- so going blank the moment the API stops
+# answering hides it exactly when someone is looking at a broken box and asking
+# what kind it is. Remembered for the life of the process; a rebuild into a
+# different type brings the API back up to correct it.
+_last_env_type: str | None = None
 
 # The last observation, refreshed on a timer by observe_forever().
 _snapshot: dict[str, Any] = {
@@ -202,7 +218,7 @@ def write_intent(intended: str, source: str = "accounts") -> dict[str, Any]:
 # ── Observation: are the applications answering ──────────────────────────
 
 
-async def observe(deployment_api_url: str) -> dict[str, Any]:
+async def observe(deployment_api_url: str, cli_path: str = "datafye") -> dict[str, Any]:
     """Interrogate the deployment: which datasets are up, and are they serving.
 
     Keys on applications ANSWERING, never on containers being up. Rumi's local
@@ -217,8 +233,13 @@ async def observe(deployment_api_url: str) -> dict[str, Any]:
         async with httpx.AsyncClient() as client:
             datasets = await _deployed_datasets(client, base)
             if datasets is None:
-                return _observation(OBSERVED_DOWN, [], [],
-                                    "the deployment API is not answering")
+                # The API is silent. That alone does not say WHICH kind of
+                # silent, and the two are opposite findings: an environment
+                # nobody has provisioned is in good order, while one whose
+                # containers are up and whose API is dead is wedged and needs
+                # `start`. Ask the CLI, which can see the containers -- one
+                # subprocess, only on the path where something is already wrong.
+                return await _observe_without_api(cli_path)
             env_type = await _environment_type(client, base)
             if not datasets:
                 # The API serves, but nothing is deployed behind it. That is the
@@ -241,6 +262,24 @@ async def observe(deployment_api_url: str) -> dict[str, Any]:
                             f"the environment could not be interrogated: {exc}")
 
 
+async def _observe_without_api(cli_path: str) -> dict[str, Any]:
+    """What the CLI can still see when the deployment API has gone quiet."""
+    status = await _run_cli(cli_path, ["foundry", "local", "status"], timeout=60)
+    provisioned = _parse_provisioned(status["output"]) if status["code"] == 0 else None
+    if provisioned is False:
+        return _observation(OBSERVED_ABSENT, [], [],
+                            "no environment is provisioned")
+    if provisioned is True:
+        return _observation(OBSERVED_DOWN, [], [],
+                            "the containers are up but the deployment API is not "
+                            "answering; the services need relaunching")
+    # DAT-172's rule: "could not look" is not "nothing is here". Refuse to
+    # report either way rather than guessing at the one that reads as healthy.
+    return _observation(OBSERVED_UNKNOWN, [], [],
+                        "the deployment API is not answering and the environment "
+                        "state could not be established")
+
+
 def _observation(observed: str, datasets: list[str], dead: list[str], detail: str,
                  env_type: str | None = None) -> dict[str, Any]:
     return {
@@ -253,8 +292,16 @@ def _observation(observed: str, datasets: list[str], dead: list[str], detail: st
         # An admin column that renders those the same way turns "I could not
         # look" into "it is not working", which is the distinction the whole
         # readiness block exists to preserve.
-        "env_type": env_type,
+        "env_type": _remember_env_type(env_type),
     }
+
+
+def _remember_env_type(env_type: str | None) -> str | None:
+    """Report the type we last managed to read when we cannot read it now."""
+    global _last_env_type
+    if env_type:
+        _last_env_type = env_type
+    return env_type or _last_env_type
 
 
 async def _environment_type(client: httpx.AsyncClient, base: str) -> str | None:
@@ -347,7 +394,7 @@ async def _dead_services(client: httpx.AsyncClient, base: str, dataset: str) -> 
     return dead
 
 
-async def observe_forever(deployment_api_url: str) -> None:
+async def observe_forever(deployment_api_url: str, cli_path: str = "datafye") -> None:
     """Keep the observation snapshot fresh, so /health never has to wait for it.
 
     Failures are swallowed and retried: this is a background refresher, and an
@@ -358,7 +405,7 @@ async def observe_forever(deployment_api_url: str) -> None:
     global _snapshot
     while True:
         try:
-            _snapshot = await observe(deployment_api_url)
+            _snapshot = await observe(deployment_api_url, cli_path)
         except Exception as exc:
             logger.warning("Foundry observation failed: %s", exc)
         await asyncio.sleep(OBSERVE_INTERVAL_SECONDS)
@@ -405,15 +452,34 @@ def derive(intent: dict[str, Any], snapshot: dict[str, Any], in_flight: str | No
         # An operation owns the environment, so there is no settled state to
         # report and inventing one is the u1 failure. Judge nothing.
         state, reason = STATE_IN_PROGRESS, f"an operation is running: {in_flight}"
-    elif intended == INTENT_STOPPED:
+    elif intended == INTENT_STOPPED and observed in (OBSERVED_ABSENT, OBSERVED_SERVING,
+                                                     OBSERVED_UNKNOWN):
         # ⚠️ Deliberately ready. A foundry the user asked to stop is in good
         # order; calling it unready would leave the box permanently unhealthy,
         # fixable only by starting an environment they explicitly did not want.
         # It is ready even if observation finds it SERVING -- somebody started it
         # by hand, which is more than intended, not less.
+        #
+        # ⚠️ BUT NOT WHEN THE ENVIRONMENT IS WEDGED. This clause used to
+        # short-circuit before looking at the observation at all, so ANY
+        # environment on a box with intent=stopped reported ready -- including
+        # one the CLI called DEGRADED, containers up and the API dead. Seen
+        # live, and doubly misleading because the intent itself was wrong
+        # (DAT-222 read "kill the app" as a decision to stop the environment):
+        # a misclassified intent silenced the health signal that would have
+        # exposed it. "More than intended" is fine; "broken" is not a thing to
+        # call ready under any intent, because nobody asked for that either.
         state, reason = STATE_READY, "the foundry is stopped, which is what was asked for"
     elif observed == OBSERVED_SERVING:
         state, reason = STATE_READY, snapshot.get("detail") or "the environment is serving"
+    elif observed == OBSERVED_ABSENT:
+        # Reached only when intent is RUNNING (the stopped case is handled
+        # above), so this is a real mismatch: there should be an environment
+        # and there is none. Before ABSENT existed this arrived as DOWN and
+        # answered not_ready; without this branch it would fall through to
+        # UNKNOWN, which would be a quieter and less true answer than the one
+        # it replaced.
+        state, reason = STATE_NOT_READY, "no environment is provisioned, but one should be running"
     elif observed == OBSERVED_PARTIAL:
         state, reason = STATE_NOT_READY, snapshot.get("detail") or "some services are not answering"
     elif observed == OBSERVED_DOWN:
