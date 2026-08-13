@@ -1125,9 +1125,12 @@ The whole arc above — the graceful stop, derived readiness, intent through the
 warm signal, the presence heartbeat, the foreground-command ceiling, the oversized-result
 guard, the seeded fleet bank, Node, the app port band, the project rename and the prompt
 audits — went out in **RC 2.0.37** and was verified on a live sandbox (see *The Box
-Arrives* below). What followed it — the app-server exception, the band move, the harness
-reporting and the environment column — is **merged and awaiting the next RC**, so the
-paragraph below still applies to it.
+Arrives* below). What followed it (the app-server exception, the band move, the harness
+reporting, the environment column, the per-app markers, the intent-classifier fix, the
+broker redirect, the upgrade wedge and the wedged-environment readiness fix) is **merged
+and awaiting the next RC**, so the paragraph below still applies to it. The full ledger,
+including what is deferred and what is merely unverified, is in *Where This Stands, and
+What the Next Person Picks Up* at the end of this arc.
 
 Agent changes travel in an agent release, so a fleet box only gets them when that release
 is published and the auto-upgrade picks it up. Until then the code is true of the
@@ -1250,6 +1253,285 @@ check is run against the historical bug it guards, reintroduced deliberately —
 hostname, the reverted readiness wording, an em dash, a renamed marker field — because this
 repository has already shipped a suite whose assertions silently never matched and passed
 vacuously. **A green test is evidence of nothing until you have watched it go red.**
+
+### The Probe That Reproduced the Bug It Was Written to Fix (DAT-215)
+
+The fix for "nobody knows which harness a box has" was `harness.py`: `GET /v1/bom` now
+carries a `harness` block saying which Claude Code CLI runs turns, where it came from
+(`bundled` or `path`), the SDK version that chose it, and the PATH CLI's version when it
+differs.
+
+On the first real box it reported `cli_version: null`, while `path_cli_version` from the
+same subprocess call reported `2.1.228`. Running the bundled binary by hand a minute
+later took 0.996 seconds and printed the version. So the report was not merely wrong, it
+was **unfalsifiable**: nothing recorded whether the probe had timed out, exited non-zero,
+or failed to execute at all. A module written because *a fact nobody can read is one
+people guess about* had produced, one level down, a fact nobody could read. **An unknown
+that cannot say why is barely better than no field.**
+
+Three things came out of that, and each is a small general rule.
+
+**Say why.** `cli_version_error` now carries `timed out after Ns`, `exit N: <stderr>`, or
+the exception, and is logged at WARNING when set.
+
+**Size the timeout for the cold case, because you will only ever measure the warm one.**
+The bound went from 10 seconds to 60. The bundled CLI is a ~308 MB Bun binary, and its
+first exec on a box has to fault the whole thing in from a cold EBS volume before Bun
+even starts. A warm re-run takes about a second, **which is exactly what makes this easy
+to under-size: every measurement you take by hand is warm, because taking it is what
+warms it.** Nothing waits on this probe, so a generous bound costs nothing.
+
+**Cache success, never failure.** The first cut cached unconditionally, which pinned the
+wrong answer in for the life of the process. This probe is *most* likely to fail on its
+first call: cold binary, cold page cache, a box still settling after boot. Retrying costs
+one subprocess on a page nobody polls.
+
+And the number itself: the bundled CLI is **2.1.228**, running under SDK **0.2.136**. The
+figure that had been written into a ticket, a correction to that ticket, and `CLAUDE.md`
+was 2.1.85, read off a local dev venv carrying SDK 0.1.51. **A version derived from a pin
+range is a guess about what resolution will do, not a fact.** The pin that was blocked on
+measuring it is now writable: `claude-agent-sdk==0.2.136`.
+
+One question the ticket also settled: the CLI the installer puts on `PATH` is **not** the
+harness and never was. Nothing in the agent invokes it. It stays as the SDK's fallback for
+some future version that ships without a bundle, which is cheap insurance, and its ~300 MB
+of duplication is now written down against DAT-178 so the trade-off is a decision rather
+than a discovery.
+
+### The Command That Failed Every Time, and Would Never Have Been Found
+
+The model's first command of its first app was `ss -ltn`, exactly as the prompt tells it
+to run. It failed. The next command used `/usr/sbin/ss` and everything worked.
+
+systemd hands a service a minimal `PATH` with no `/usr/sbin` in it, and `ss` is what the
+prompt calls for **twice per app**, once to pick a free port and once to verify the bind.
+So the very first instruction in the app workflow was broken on every box, and the app
+still came up every time, because the model recovered.
+
+**That is the whole reason this is interesting.** Nothing failed. No exception, no error
+rate, no alarm. The cost was one wasted round trip per app for the life of the product,
+paid in tokens and latency, and the only way to find it was to **read a transcript**. A
+self-correcting agent quietly absorbs the defects in its own environment, which is
+wonderful for reliability and terrible for observability, and it means transcript reading
+is not a nicety but a distinct class of testing.
+
+The fix went on `PATH` (`_EXTRA_BIN_DIRS` in `main.py`) rather than into the prompt as
+`/usr/sbin/ss`. The path is a property of the box, not of the instruction, and the next
+sbin tool the model reaches for would hit the same wall.
+
+### One Marker, Two Dashboards (DAT-221)
+
+The keep-awake marker was one file per **project**, so a project could keep only one app's
+worth of the box awake. A user with two dashboards had one of them invisible to the warm
+signal, and stopping the tracked one let the idle monitor dorm the box while the other was
+still serving a page they had open. **The band holds ten ports precisely so several apps
+can run at once, so a one-per-project marker contradicted the reason the band exists.**
+
+How it was found is the part worth keeping. **The model noticed.** It flagged that the
+keep-awake mechanism tracks one app at a time, repointed the marker to the survivor when
+the first app was stopped, and wrote a note in that project's `CLAUDE.md` to remember the
+untracked port. It used **project memory as a substitute for a mechanism that did not
+exist**, and it was right to, and it should never have had to. Behaviour that depends on
+the model spotting an infrastructure gap is not a guarantee, and the workaround was being
+paid for in tokens on every single turn.
+
+The fix is one marker per app, `.datafye-app-<port>.json`, globbed. A **file per app
+rather than a list in one file**, deliberately: starting an app writes one file and
+stopping it deletes one file, so two apps never read-modify-write anything shared and
+neither can lose the other's entry. The self-healing property stays per app, so a stale
+marker whose port is dead is ignored on its own without taking a live sibling with it.
+
+The glob deliberately also matches the older single `.datafye-app.json`. That costs
+nothing and closes a real window: an agent upgrade while an app is running would otherwise
+orphan that app's marker and let the box go cold with the user's page open, **the exact
+failure being fixed, caused by the fix**. Entries dedupe by port so a leftover legacy
+marker cannot report one dashboard twice.
+
+### "Kill the App" Is Not "Stop My Environment" (DAT-222)
+
+A user asked Yukti to build a page, then said *"cool, kill the app"*, and later *"stop the
+first app"*. The post-stream intent classifier read that as a standing decision about
+their **environment** and recorded `foundryIntent=stopped` in accounts. The admin console
+then showed "ready Foundry, intent: stopped" for a foundry nobody had asked to stop.
+
+That is not cosmetic. `foundry-boot.sh`'s rule is that intent `stopped` means do nothing,
+whatever the observation. So the next time that box dormed and woke, the foundry would
+stay down and the user would have lost an environment they never asked to lose, which is
+precisely the harm the classifier's bias towards "no decision" exists to prevent.
+
+**Neither feature was wrong on its own.** The classifier was written when the only thing a
+user could ask to stop *was* the environment. DAT-202 and DAT-219 then gave the model the
+ability to run user-facing web apps, and with them **a whole new noun that "stop"
+attaches to**. Every negative example in the classifier's prompt was an environment
+operation performed as a step in work, so nothing in it separated an app from the platform
+underneath it. This is the same shape as DAT-219's contradiction and DAT-225's wedge:
+**the defect lives in the composition, and reviewing either half alone finds nothing.**
+
+Two changes. The classifier is now told plainly that an app is not the environment, with
+the phrasings it actually failed on. And **it logs its own reason whenever it decides**.
+The `reason` field had always been requested from the model and always thrown away, so the
+misfire left nothing behind saying what it thought it heard; the only evidence was a
+changed field in another service. **A decision that can leave somebody without an
+environment has to be able to explain itself.**
+
+### A Redirect to a Domain That Does Not Exist (DAT-224)
+
+`broker.py` defaulted `BROKER_REDIRECT_URL` to
+`https://developer.datafye.io/broker-callback.html`, and that domain **does not resolve at
+all**. The installer never sets the override. So every box in the fleet used the dead
+value: a user linking a brokerage was sent through ConnectTrade's OAuth flow to a host
+that answers nothing. That is the first step of the entire trading path.
+
+The default was correct once. The workspace and the public site were one app on
+`developer.datafye.io`; the workspace was later extracted into Yukti on its own domain and
+the old host retired, and this default was left behind with nothing pointing at it.
+
+**It survived because nothing fails until a real user links a real brokerage.** The agent
+builds the URL, hands it to ConnectTrade, and returns 200. Every test short of completing
+an OAuth round trip passes. The one component that would notice is the **user's browser**,
+at the far end of a redirect nobody on our side observes.
+
+The lesson is sharper than "keep your config current": **a default pointing at a domain we
+no longer own is worse than no default.** An unset value would have failed loudly at
+startup, in front of whoever deployed it. A stale one fails silently, in front of a
+customer, at the worst possible moment.
+
+The same pass retired the dead host from 14 README references (including a tier table that
+told self-hosting readers to point `developer.datafye.io` at their own agent), `CLAUDE.md`,
+`PROJECT.md`, and the nginx placeholder page the installer writes. And how it surfaced is
+worth remembering: somebody pulled on a mismatch between a CNAME and a `CLAUDE.md` **in a
+different repository**. The documentation discrepancy was the visible end of a broken
+product path.
+
+### The Upgrade That Took the Box Down and Kept Trying (DAT-225)
+
+An upgrade to 2.0.39 wedged a box. `git` refused the agent tree with *"detected dubious
+ownership"*, the installer died at step 7 under `set -e` with the agent already stopped at
+step 4, and the once-a-minute cron then repeated that identically for as long as anyone
+watched. The agent never came back.
+
+Three independent faults, each harmless alone:
+
+1. **`cp -a` preserves ownership.** In the AMI-bake path, `/opt/datafye/agent/app`
+   inherited whoever owned the build checkout rather than root, so every later upgrade ran
+   `git` there as root from cron, and git refuses a repository owned by another user. Fixed
+   by chowning the tree to root after the copy (which is what it should have been anyway,
+   since root ownership is what makes the tree read-only to the agent) and by passing
+   `-c safe.directory` on the git calls, **scoped per call rather than written globally**
+   so the exemption cannot outlive the command or widen to a repository we did not put
+   there.
+2. **A stop with no way back.** The installer stops the agent at step 4 and starts it at
+   step 11, with `set -e` and nothing in between to restore it. Any failure anywhere in
+   that span left the box down. There is now a trap that restarts the previous agent on a
+   non-zero exit, cleared just before the deliberate start so the normal path is untouched.
+   The old code is still on disk when an install dies partway, so starting it restores a
+   working agent.
+3. **A retry rule that read our own damage as permission.** `upgrade-check.sh` treated an
+   unreachable `/health` as "nothing to protect, proceed", which is correct in isolation
+   and exactly wrong when the thing that made `/health` unreachable was this script.
+   Failures now back off 1, 5, 15, 30, 60 minutes and log why. It never gives up entirely,
+   because a fix published upstream must still be able to reach a wedged box unattended.
+
+The composition is the lesson. A stop-then-start with no failure path, plus a gate that
+interprets our own outage as a green light, turns a one-line git complaint into indefinite
+downtime. If you keep one sentence from this section, keep the second fault's: **never
+take a service down at a point from which the script cannot guarantee it comes back.**
+
+And the second-order one, which shapes how any fix like this ships: **a fix for something
+that breaks upgrades cannot arrive by upgrade.** Boxes already carrying the bad ownership
+need a re-bake or a manual `chown`, exactly like the `--pin` bug before it.
+
+### A Wedged Environment That Called Itself Ready (DAT-226, DAT-217)
+
+The accounts panel showed **ready** for a box whose CLI said **DEGRADED**: containers up,
+deployment API not answering, services needing a relaunch. It also showed no environment
+type at all.
+
+**`derive()` short-circuited on intent.** The `intent == stopped` clause returned READY
+before looking at the observation at all, so any environment on a box with intent stopped
+read as ready, wedged or not. The clause is right about what it was written for. A foundry
+the user asked to stop is in good order, and it is still ready when found *serving*,
+because that is **more than intended rather than less**. But "broken" is neither more nor
+less than intended. Nobody asked for it, and it should never have been folded in with the
+other two.
+
+It was doubly misleading here, because the intent itself was wrong: DAT-222 had read "kill
+the app" as a decision to stop the environment. **A misclassified intent silenced the one
+signal that would have exposed it.** Two bugs from the same session, one hiding the other.
+
+**`observe()` could not tell two silences apart.** A quiet deployment API is all the HTTP
+probe sees, so a cleanly stopped foundry and one whose containers are up with a dead API
+produced the same answer. There is now an `OBSERVED_ABSENT` distinct from `OBSERVED_DOWN`,
+established by asking the CLI: one subprocess, and only on the path where something is
+already known to be wrong. Under intent stopped, ABSENT is ready and DOWN is not.
+
+**The type went blank because it is read from the deployment API, which was down.** The
+environment type is a property of what is **provisioned**, not of whether it answers, and
+it cannot change without a rebuild, so it is now remembered once read. Going blank hid it
+exactly when somebody is staring at a broken box asking what kind it is.
+
+That type is DAT-217's half: `/health`'s foundry block carries `env_type` as `foundry`,
+`trading`, or `null`, inferred from `GET /deployment/systems` because a trading environment
+stands up `datafye-broker-stocks-system` and a foundry never does. It is matched on a
+**substring**, since system names carry the version (`datafye-api-system-2.0.37`) and
+equality would break silently on the next release. And `null` means *could not tell*, never
+*there is no environment*, which is the distinction the whole readiness block exists to
+preserve.
+
+The best thing to come out of this change was a habit. **Printing the whole truth table
+caught a regression this change introduced**: `intent=running` with nothing provisioned
+fell through to UNKNOWN, where the old collapsed-DOWN behaviour had correctly said NOT
+READY. It has its own branch now. **A truth table is worth printing in full every time it
+is touched, because the row you break is never the row you were thinking about.**
+
+### Where This Stands, and What the Next Person Picks Up
+
+The section above (*A Note on Where All This Stands*) explains why "merged" and "true of a
+box" are different claims in this project. Here is the current ledger, written so it stays
+useful after everyone has forgotten the session that produced it.
+
+**Deployed.** The box in the fleet runs a build containing DAT-222. Everything after it
+(DAT-224, DAT-225, DAT-226, the sbin `PATH` fix and the harness-probe fixes) landed later
+and **needs the next RC** before it is true of any sandbox.
+
+**Merged but not yet verified on a box.** DAT-219 AC5, DAT-220 AC3, DAT-221, DAT-224,
+DAT-225, DAT-226, and DAT-203. Two of those carry a wrinkle worth stating:
+
+- **DAT-222 is only half verified.** The false-positive direction was confirmed ("kill the
+  app" no longer records `stopped`). The other direction, that a genuine *"shut my
+  environment down for the week"* still registers, is outstanding, and it matters more than
+  it looks: **a classifier that had been broken into permanent silence would also pass the
+  half that was checked.** Every "we made it stop misfiring" fix needs the positive case
+  re-proved.
+- **DAT-203 must be tested with `python3 -c "import time; time.sleep(700)"`**, never with
+  `sleep`, which the harness blocks outright before it ever reaches the shell (see DAT-218).
+
+**Known and deliberately deferred**, all four being corners of the same upgrade path:
+
+- **DAT-227.** The descriptor fetch catches only `ConnectException` and
+  `SocketTimeoutException`. It misses the `SocketException` thrown when containers are up
+  with no applications behind them, and the bare `RuntimeException` from a non-200/503
+  response.
+- **DAT-228.** A stopped upgrade names the API system after **the CLI's own version**. The
+  fix is to read `datafye.local.deployment.version`, which is already written into the
+  environment config and never read back. Blocked on **RUMI-400** for `read_config.sh` and
+  `LocalProvisioner.readConfig`.
+- **DAT-229.** An upgrade with nothing deployed calls the environment "stopped", fails on a
+  missing container, and then advises deprovision plus provision when the correct answer is
+  simply provision.
+- **DAT-231.** Deployment-versus-environment terminology: the UI surfaces are done; CLI
+  output, `prompt.py`, the fleet memory bank, the failure reports and the docs guides are
+  not.
+
+**Not filed anywhere yet**, so they live here until they are:
+
+- The `upgrade-check.sh` idle gate learns "is work in flight?" **only from `/health`**, so
+  an unreachable agent means *proceed* even while `foundry-boot.sh` is holding a provision
+  that has nothing to do with the agent process. It should read the **DAT-183 marker off
+  disk**, which needs no agent at all to answer and which `warmth.py` already consults for
+  the same question.
+- DAT-215's deliberate omission is now unblocked: pin `claude-agent-sdk==0.2.136` in
+  `requirements.txt`, the version production actually resolved.
 
 ### Bootstrap: How the Agent Learns Who It Is
 
