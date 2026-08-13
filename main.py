@@ -2385,7 +2385,12 @@ async def lifespan(app: FastAPI):
     # /health is polled by accounts for dormancy decisions, by the upgrade cron
     # every minute, and by the SPA. An agent that goes quiet is indistinguishable
     # from a dead instance, which is the one thing it must never look like.
-    observer = asyncio.create_task(foundry.observe_forever(DATAFYE_DEPLOYMENT_API_URL))
+    # CLI_PATH threaded through, not left to the "datafye" default: the
+    # observation now shells out to the CLI when the deployment API goes
+    # quiet, and an operator who configured DATAFYE_AGENT_CLI_PATH would
+    # otherwise get a different binary on that path than everywhere else.
+    observer = asyncio.create_task(
+        foundry.observe_forever(DATAFYE_DEPLOYMENT_API_URL, CLI_PATH))
     # The warm signal shares the reasoning but not the loop: it answers "is
     # work happening" rather than "is the environment usable", and accounts
     # consumes it to decide whether stopping this box would interrupt
