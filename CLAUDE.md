@@ -26,9 +26,12 @@ datafye-agent/
 ├── memory.py        # Cross-session memory: global store + the memory-protocol block injected into the prompt
 ├── skills.py        # Skill plugin wiring (system + user-global plugins) and GET /v1/skills listing
 ├── warmth.py        # Warm signal: is real work in flight (feeds /health active_proxied_apps)
+├── foundry.py       # Derived environment readiness (intent + observation + in-flight) behind /health's `foundry` block
+├── harness.py       # Which Claude Code CLI actually runs a turn (DAT-215): the `harness` block on /v1/bom
 ├── paths.py         # Single agent state-root (DATAFYE_AGENT_STATE_DIR) all per-user state derives from
 ├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
 ├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
+├── tests/test_prompt_audit.py  # Dependency-free prompt audit; renders the REAL prompt and pins every claim that has been wrong
 ├── requirements.txt # Python dependencies (incl. pyyaml for env_status descriptor parsing)
 ├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
 ├── install/
@@ -106,7 +109,40 @@ sudo ./install.sh --mode standalone --dns agent.mycompany.com
 
 ### Auto-upgrade never restarts mid-turn (`7447964`)
 
-The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect). Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
+The auto-upgrade cron runs **every minute under `flock -n`** (a tick is a no-op while a prior check or an in-flight install still holds the lock), replacing the old blind `*/5 * * * *`. `upgrade-check.sh` **idle-gates** before it downloads/runs `install.sh`: it proceeds only when the agent's own `/health` reports `running_jobs==0` AND `active_proxied_apps==[]` AND `now - last_chat_activity_at >= DATAFYE_UPGRADE_INACTIVITY_WINDOW` (default 120s); otherwise it logs "deferred" and retries next tick. It adds a download **jitter** (`DATAFYE_UPGRADE_JITTER_SECONDS`, default 60 — `downloads.n5corp.com` is a single origin/no CDN), and the **top of `install.sh` does a last-moment `running_jobs` re-check that aborts the upgrade** if a turn started in the meantime — armed ONLY on the auto-upgrade path via the env flag `DATAFYE_AUTO_UPGRADE=1` (set when upgrade-check pipes `curl install.sh | DATAFYE_AUTO_UPGRADE=1 bash`), so fresh/manual installs are never blocked. Net: the agent never restarts mid-turn (which would drop the in-flight resumable-turn buffer). Unreachable `/health` → proceed (nothing to protect), **now with a back-off; see DAT-225 below, where that rule read the script's own damage as permission to keep going**. Caveat: one transitional blind upgrade per box before it's gated; takes effect on the next publish + re-bake/auto-upgrade.
+
+⚠️ **The idle gate learns "is work in flight?" only from `/health`, which is UNFILED and still open.** An unreachable agent therefore means *proceed*, even while `foundry-boot.sh` holds a provision that has nothing to do with the agent process. The right source is the **DAT-183 marker on disk** (`~/.datafye/run/cli-*.json`), which needs no agent at all to answer, and which `warmth.py` already reads for exactly this question.
+
+### An upgrade must be able to put the box back (DAT-225)
+
+An upgrade to 2.0.39 **wedged a box for as long as anyone watched**: the agent went
+down at installer step 4 and never came back, and the once-a-minute cron repeated the
+identical failure forever. Three faults, each harmless alone:
+
+1. **`cp -a` in the AMI-bake path preserves ownership.** `/opt/datafye/agent/app`
+   inherited whoever owned the BUILD checkout, so every later upgrade ran `git` there
+   as root and git refused with *"detected dubious ownership"*. Fixed by
+   `chown -R root:root` after the copy (root ownership is what makes the tree
+   read-only to the agent, so it is what the tree should have had anyway) plus
+   `-c safe.directory` on the `git` calls in `clone_or_update_repo`, **scoped per
+   call rather than written globally** so the exemption cannot outlive the command
+   or widen to a repo we did not put there.
+2. **The installer stops the agent at step 4 and starts it at step 11**, with `set -e`
+   and nothing in between to put it back, so ANY failure in the whole install left the
+   box down. There is now a **trap** that restarts the previous agent on a non-zero
+   exit, cleared just before the deliberate start so the normal path is untouched (the
+   old code is still on disk when an install dies partway, so starting it restores a
+   working agent). ⚠️ **Never take a service down at a point from which the script
+   cannot guarantee it comes back.**
+3. **`upgrade-check.sh` read an unreachable `/health` as "nothing to protect, proceed"**,
+   correct in isolation, and exactly wrong when the thing that made `/health`
+   unreachable was this script. Failures now back off **1, 5, 15, 30, 60 minutes** and
+   log why. It never gives up entirely: a fix published upstream must still reach a
+   wedged box unattended.
+
+⚠️ **A fix for something that breaks upgrades cannot arrive by upgrade.** Boxes already
+carrying the bad ownership need a re-bake or a manual `chown`; the same shape as the
+`--pin` bug above.
 
 ### The prompt drifts, and only an audit finds it (2026-08-10)
 
@@ -130,8 +166,10 @@ is the signal that a deliberate audit is overdue — **the prompt needs re-readi
 full whenever a batch of tickets lands**, because each ticket changes the world the
 prompt describes without touching the prompt.
 
-`tests/test_prompt_audit.py` pins every one of these, including a blanket non-ASCII
-check, so they cannot come back quietly. Run it with `python3 tests/test_prompt_audit.py`
+`tests/test_prompt_audit.py` pins every one of these in **14 checks**, including a
+blanket non-ASCII check and (since DAT-222) the intent classifier's own prompt (that
+file is for prompts that have **been wrong**, and the classifier now qualifies), so they
+cannot come back quietly. Run it with `python3 tests/test_prompt_audit.py`
 — no pytest, no dependencies, because a test that is awkward to run does not get run.
 It renders the REAL prompt through `build_system_prompt` rather than grepping the
 source: the quant stack, the bash ceiling and the app preview base are all composed at
@@ -209,12 +247,71 @@ band** the jump server routes straight through, so there is no per-app route to
 register, nothing to allocate centrally and nothing to leak.
 
 - **`https://<username>.app.datafye.io:<port>`**, port from
-  `DATAFYE_AGENT_APP_PORT_RANGE` (`8080-8089`). Host is
-  `DATAFYE_AGENT_APP_PREVIEW_HOST`; the base is composed **per turn** in `main.py`
-  because it needs the bootstrapped username.
-- **`.datafye-app.json`** in the project folder — `{"name": …, "port": …}` — is
-  what makes the app a warm signal. `warmth.running_apps()` reports each as
-  **`compute:<name>`**, finally filling the label space DAT-184 reserved.
+  `DATAFYE_AGENT_APP_PORT_RANGE` (**`10010-10019`**, moved off `8080-8089` by
+  DAT-220, see below). Host is `DATAFYE_AGENT_APP_PREVIEW_HOST`; the base is
+  composed **per turn** in `main.py` because it needs the bootstrapped username.
+- **`.datafye-app-<port>.json`** in the project folder,
+  `{"name": …, "port": …, "pid": …}`, is what makes the app a warm signal.
+  `warmth.running_apps()` globs `APP_MARKER_GLOB` (`.datafye-app*.json`) and reports
+  each as **`compute:<name>`**, finally filling the label space DAT-184 reserved.
+
+**⚠️ ONE MARKER PER APP, not one per project (DAT-221).** The marker used to be a
+single `.datafye-app.json`, so a project could keep only one app's worth of the box
+awake: a user with two dashboards had one invisible to the warm signal, and stopping
+the tracked one let the idle monitor dorm the box while the other was still serving a
+page they had open. **The band holds ten ports precisely so several apps can run at
+once, so a one-per-project marker contradicted the reason the band exists.**
+
+- **A file per app, deliberately, rather than a list inside one file.** Starting an
+  app writes one file and stopping it deletes one file, so two apps never
+  read-modify-write anything shared and neither can lose the other's entry. The
+  self-healing property stays *per app*: a stale marker whose port is dead is ignored
+  on its own, without taking a live sibling with it.
+- **The glob also matches the legacy single `.datafye-app.json`, on purpose.** An agent
+  upgrade while an app is running would otherwise orphan that app's marker and let the
+  box go cold with the user's page open, the exact failure this fixes, caused by the
+  fix. Entries are **deduped by port**, so a leftover legacy marker naming the same
+  port as its successor cannot report one dashboard twice.
+- ⚠️ **Found only because the model noticed.** It flagged that the keep-awake mechanism
+  tracks one app at a time, repointed the marker to the survivor by hand, and wrote a
+  note in the project's `CLAUDE.md` to remember the untracked port. **It used project
+  memory as a substitute for a mechanism that did not exist.** Behaviour that depends
+  on the model spotting an infrastructure gap is not a guarantee, and it paid tokens
+  for the workaround on every turn.
+
+**⚠️ The app server is the ONE carve-out from the no-background rule (DAT-219).** The
+prompt told the model to serve an app that outlives the turn while DAT-185 forbade
+backgrounding "not for anything else", so there was **no legal way to start it**, and
+every piece around the app (band, marker, warm signal, jump-server route) had been
+built around a hole where the app itself should be. The exception is narrow and follows
+from what the ban is *for*: all three of its reasons (you cannot await it, kill it, or
+see it finish) are supervision problems, and none holds for a server. Orphaning is the
+required behaviour, finishing is failure, and liveness is the listening port `warmth.py`
+already probes. The rule the model is given: **if it produces a result, run it in the
+foreground; if it answers on a port, detach it.**
+
+The prompt prescribes the exact shape:
+
+```
+setsid nohup <command> > app.log 2>&1 < /dev/null &
+sleep 2
+ss -ltnp | grep :<port>
+```
+
+- **That `ss` line is not a formality.** It proves the app is really listening, confirms
+  it bound `0.0.0.0` rather than loopback, and yields the **pid** (`$!` is unreliable
+  because `setsid` forks).
+- **The pid in the marker is ADVISORY ONLY.** It exists so a later turn can stop the app
+  cleanly instead of guessing with `pkill -f`. `warmth.running_apps()` carries it and
+  **never lets it influence liveness**: a recycled pid would pin a box awake for an
+  unrelated process, and a live pid whose port is dead is a crashed app that must not
+  report warm. **The port remains the sole liveness test.**
+- **The model picks a FREE port first** (`ss -ltn` before it binds, DAT-220 AC). Without
+  that its own second app collides with its first, and the recovery is a failed start,
+  the same experience the band move was meant to end, with the model as the cause rather
+  than the platform. The check deliberately does not grep for the band's digits: a
+  hardcoded `':1001[0-9]'` would silently stop matching the day the band moves again,
+  and `APP_PORT_RANGE` is the single place the band is written down.
 
 ⚠️ **A marker is a claim; a listening port is the fact.** Only markers whose port
 actually answers are reported, so a crashed app or an abandoned marker stops
@@ -236,8 +333,20 @@ to say what it did and did not protect. Sutra's band has the same posture today.
 route, so an empty preview host makes the prompt describe the app as local-only
 rather than handing the user a link that cannot resolve.
 
+⚠️ **The band moved 8080-8089 → 10010-10019 (DAT-220), and the jump server must move
+with it.** `rumi-solace` publishes **8080** and `rumi-influxdb` publishes **8086** on
+every box, empty foundry or not, so the band's first port (the one anything picks by
+default) could never bind. The band came from Sutra, where it is correct because no
+Datafye platform runs underneath it: **reusing the mechanism was right; reusing the
+numbers carried an assumption that did not survive the move.** The platform sprawls
+across 8000/8001/8008/8080/8086/8443/8883, so the fix leaves the neighbourhood entirely
+rather than shuffling within it. **Not 10000**, because that is Webmin's conventional
+default, and putting our first port where something else conventionally lives is the
+exact mistake being fixed. A fully provisioned box publishes nothing in 1001x (its REST
+services are in the 7xxx range).
+
 ⚠️ **The jump-server half is NOT in this repo and is not done.** nginx must route
-`<username>.app.datafye.io:8080-8089` → `<username>.rumi.local:<port>` and the
+`<username>.app.datafye.io:10010-10019` → `<username>.rumi.local:<port>` and the
 jump SG must allow the band. Note both `datafye-accounts` and `nvx-accounts` pass
 `proxyInfo = null` at launch, so neither wires a band today — this is a bastion
 config change, not an accounts code change.
@@ -281,6 +390,28 @@ presume one (React? Vue? none?) on evidence that only ever showed a need to *run
 file*, and it multiplies the disk above. The prompt therefore tells the model plainly
 that a first `npm install` hits the network, and points it at plain HTML or matplotlib
 when those suffice.
+
+### systemd's PATH is not a login PATH, and `ss` lived in `/usr/sbin`
+
+`_EXTRA_BIN_DIRS` in `main.py` is now `[~/.npm-global/bin, /usr/sbin, /sbin]`, prepended
+to the process `PATH` the model's Bash tool inherits.
+
+The model's **first command of its first app** was `ss -ltn`, exactly as `prompt.py`
+tells it to run. It failed. systemd hands a service a minimal `PATH` with no `/usr/sbin`
+in it, and `ss` is what the prompt calls for **twice per app**, once to pick a free port
+and once to verify the bind.
+
+⚠️ **It recovered every time, which is why this would never have surfaced.** The next
+command fell back to `/usr/sbin/ss` and the app came up fine, so the whole cost was a
+wasted round trip on every app for the life of the product: tokens and latency and
+nothing else. **Only visible by reading a transcript, never by a check**, because
+nothing fails.
+
+**Fixed on `PATH`, not by hardcoding `/usr/sbin/ss` into the prompt.** The path is a
+property of the box, not of the instruction, and the next sbin tool the model reaches for
+would hit the same wall. Adding sbin to a non-root `PATH` is safe: the binaries are
+world-executable and simply do less without privileges (`ss -p` shows this user's own
+pids, which is all it needs).
 
 ### The quant stack has one source of truth (DAT-210)
 
@@ -427,11 +558,53 @@ harness behaviour must be verified against the *bundled* binary.
 ⚠️ **Do NOT read that version off the local `.venv`.** It carries `claude-agent-sdk`
 **0.1.51** while production resolves `>=0.2.128,<0.3`, so the two bundle very different
 CLIs. This repo shipped "the bundled CLI is 2.1.85" in a ticket, a correction to that
-ticket, and this file — all from the local bundle. Measured on RC 2.0.37, the real
-figure is **2.1.228**, and the installer's PATH copy is the same version. **A version
-derived from a pin RANGE is a guess about what resolution will do, not a fact**; only a
-provisioned box answers it. Nothing reports the harness version today, which is why the
-wrong number survived three writings (DAT-215).
+ticket, and this file, all from the local bundle. Measured on a real box, the bundled
+CLI is **2.1.228** and production's `sdk_version` is **0.2.136** (the installer's PATH
+copy happened to be the same CLI version, which is exactly the sort of coincidence that
+lets a wrong mental model survive). **A version derived from a pin RANGE is a guess
+about what resolution will do, not a fact**; only a provisioned box answers it.
+
+### `harness.py`: the box now says which CLI runs its turns (DAT-215)
+
+`GET /v1/bom` carries a `harness` block: `cli_version`, `cli_version_error`,
+`cli_path`, `cli_source` (`bundled`|`path`), `sdk_version`, `path_cli_version`. The
+wrong number above survived three writings because **a fact nobody can read without SSH
+is one people will guess about instead**; `sdk_version` alone now shows at a glance that
+you are looking at a dev venv rather than production.
+
+- **On `/v1/bom`, not `/health`.** This is a dependency fact, not a liveness one, and
+  `/health` is polled every minute by the upgrade cron, by accounts for dormancy and by
+  the SPA. The probe is a subprocess, computed **once per process**, not merely for
+  speed: `/v1/bom` is unauthenticated, and an endpoint that forks a 300 MB binary on
+  demand is a free denial of service. The answer cannot change without a restart anyway.
+- ⚠️ **Report the REASON, never a bare `null`.** The first cut returned `cli_version:
+  null` on a real box with no way to tell a timeout from a non-zero exit from a missing
+  binary, *the exact "a fact nobody can read" problem this module exists to fix,
+  reproduced one level down.* `cli_version_error` now carries `timed out after Ns` /
+  `exit N: <stderr>` / the exception, and is logged at WARNING when set. **An unknown
+  that cannot say why is barely better than no field.**
+- ⚠️ **60s timeout, not 10.** The bundled CLI is a ~308 MB Bun binary whose FIRST exec
+  has to fault the whole thing in from a cold EBS volume; a warm re-run is about a
+  second. **That is what makes it easy to under-size: every measurement you take by hand
+  is warm, because taking it is what warms it.** Nothing waits on this probe, so a
+  generous bound costs nothing.
+- ⚠️ **Cache success ONLY.** Caching a failure pins the wrong answer for the life of the
+  process, and this probe is most likely to fail on its *first* call (cold binary, cold
+  page cache, a box still settling after boot). The first cut cached unconditionally and
+  did exactly that.
+- **The bundled path is derived from the installed package** the same way the SDK derives
+  it, so it follows the venv and cannot drift. **Mirrored rather than imported**:
+  `_find_bundled_cli` is a method on `SubprocessCLITransport` under `_internal`, and
+  standing up a transport to ask it a question is a heavier and more fragile coupling
+  than eight lines saying the same thing.
+- **What the installer's PATH CLI is for:** nothing in the agent invokes it. It exists
+  only as the SDK's fallback for a future version that ships without a bundle: cheap
+  insurance, kept deliberately, with its **~300 MB of duplicate** noted for DAT-178 so
+  the trade-off is a decision rather than a discovery.
+- **The pin is now unblocked and NOT yet done.** `requirements.txt` still allows
+  `>=0.2.128,<0.3`; the exact pin to write is `claude-agent-sdk==0.2.136`, the version
+  production actually resolved. Writing a number before it was measurable would have
+  repeated the mistake the block exists to prevent.
 
 ### Long environment commands run in the foreground (DAT-203)
 
@@ -513,7 +686,20 @@ the hole is safe.
 family, backgrounding itself, and `BASH_MAX_TIMEOUT_MS`: *never offer, forbid, or rely
 on a capability the surface does not control.* The new wrinkle is that the conflicting
 advice now arrives in a harness **error message**, which no amount of tool-list curation
-reaches — the prompt has to answer it directly.
+reaches, so the prompt has to answer it directly, and now does:
+
+- The ban **names `run_in_background`** as a Bash tool *parameter*, saying plainly that
+  it is not a shell trick but detaches just the same, and that it is the form the model
+  is most likely to reach for **because its tool layer suggests it**.
+- **`Monitor` joins the absent-tools list** alongside `BashOutput`, `KillShell` and
+  `Task`, so the "you cannot await or kill one" reason names every tool the harness
+  might offer.
+- A standing rule: **WHEN YOUR TOOL LAYER SUGGESTS SOMETHING THIS PROMPT FORBIDS, THIS
+  PROMPT WINS.** The block is real; the suggested workaround is not available. The model
+  is told to report what was blocked rather than route around it, with foreground
+  `sleep` named as the known case.
+- Pinned in `tests/test_prompt_audit.py`, because a rule that answers a message from
+  outside the repo has nothing else watching it.
 
 ### Foundry reconciliation at boot (DAT-199)
 
@@ -705,8 +891,8 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals, and `foundry` (recorded foundry readiness, see below). Always available, including before bootstrap |
-| `/v1/bom` | GET | Dependency bill-of-materials — the single Datafye version this agent is built against (platform/samples/CLI/docs share one version). Reads `bom.json`; unauthenticated like `/health`; rendered on the Yukti agent surface |
+| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals, and `foundry` (derived environment readiness, see below — including **`env_type`**: `foundry`/`trading`/`null`, DAT-217). Always available, including before bootstrap |
+| `/v1/bom` | GET | Dependency bill-of-materials — the single Datafye version this agent is built against (platform/samples/CLI/docs share one version). Reads `bom.json`; also carries the **`harness`** block from `harness.py` (which Claude Code CLI actually runs turns, DAT-215). Unauthenticated like `/health`; rendered on the Yukti agent surface |
 | `/bootstrap` | POST | Accounts-only. Bootstrap the agent's identity + credentials-store key from an accounts-signed JWT (`Authorization: Bearer`, `purpose=agent-bootstrap`). Idempotent for the same user; 409 on rebind |
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
 | `/v1/credentials` | POST | REMOVED — returns 410 Gone; credential writes go through the accounts service |
@@ -800,7 +986,7 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_GITHUB_ORG` | `datafye` | GitHub org for algo repos |
 | `DATAFYE_AGENT_MCP_SERVERS_ADDITIONAL` | `[]` | Additional MCP servers (JSON) |
 | `DATAFYE_AGENT_CONNECTTRADE_API_URL` | `https://api.connecttrade.com` | ConnectTrade REST base URL |
-| `DATAFYE_AGENT_BROKER_REDIRECT_URL` | `https://yukti.datafye.ai/broker-callback.html` | OAuth redirect target |
+| `DATAFYE_AGENT_BROKER_REDIRECT_URL` | `https://yukti.datafye.ai/broker-callback.html` | OAuth redirect target — the static page that tells the parent window OAuth finished. ⚠️ **This defaulted to `https://developer.datafye.io/broker-callback.html` until DAT-224, and that domain does not resolve at all.** The installer never sets this var, so every box in the fleet used the dead value and brokerage linking (the first step of the entire trading path) was broken everywhere. See *A default pointing at a domain we no longer own* below |
 | `DATAFYE_AGENT_BROKER_STATE_FILE` | `~/.datafye/agent/broker_user.json` | Where the ConnectTrade user_id / user_secret are persisted (TODO: migrate to accounts-manager) |
 | `DATAFYE_AGENT_DEPLOYMENT_API_URL` | `http://local-foundry-dev-api.datafye.local:7776` | Datafye deployment REST API base URL — read after a chat turn to derive `descriptor` / `env_status` from the deployment descriptor (`GET .../deployment/{descriptor,datasets,symbols}`) |
 | `DATAFYE_AGENT_STATE_DIR` | `~/.datafye/agent` | Single root for ALL per-user writable state (credentials, projects, user-skill plugin, user memory). Relocate everything with one var — used by local tests to avoid polluting `~/.datafye`. Each narrower var below still overrides when set |
@@ -821,6 +1007,33 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AUTO_UPGRADE` | - | Set to `1` by `upgrade-check.sh` when it runs the freshly-downloaded `install.sh`. Arms the last-moment `running_jobs` re-check at the top of `install.sh` that aborts a mid-turn restart. Unset on fresh/manual installs (never blocked) |
 | `DATAFYE_AGENT_MAX_BUFFER_SIZE` | `16777216` | The SDK's `max_buffer_size` (DAT-204) — the largest single message accepted off the CLI's stdout. The SDK default of 1 MB is small enough for one chart to exceed, and exceeding it ends the **turn**, not just the tool call. `READ_REFUSE_BYTES` (half this) is where `guard_oversized_read` refuses a `Read` outright |
 | `DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS` | `1800000` | The value `main.py` puts in the harness's own `BASH_MAX_TIMEOUT_MS` (DAT-203) — the ceiling on how long a foreground Bash command may run before the harness moves it to the background. 30 minutes, clearing the ~17-minute cold provision. A pre-set `BASH_MAX_TIMEOUT_MS` wins over both. See *Long environment commands run in the foreground* |
+
+### A default pointing at a domain we no longer own (DAT-224)
+
+`broker.py`'s `BROKER_REDIRECT_URL` defaulted to
+`https://developer.datafye.io/broker-callback.html`, and **that domain does not resolve**.
+Nothing sets the override, so every box sent a user linking a brokerage through
+ConnectTrade's OAuth flow to a host that answers nothing.
+
+The default was correct once: the workspace and the public site were one app on
+`developer.datafye.io`, the workspace was later extracted into **Yukti** on its own
+domain and the old host retired, and this default was left behind. The callback page
+went with the workspace and is live at `https://yukti.datafye.ai/broker-callback.html`.
+
+⚠️ **It survived because nothing fails until a real user links a real brokerage.** The
+agent builds the URL, hands it to ConnectTrade and returns 200, so every test short of
+completing an OAuth round trip passes, and the one component that would notice is the
+**user's browser**, at the far end of a redirect nobody on our side observes.
+
+⚠️ **A default pointing at a domain we no longer own is worse than no default.** An unset
+value would have failed loudly at startup instead of silently at the worst possible
+moment. The dead host is also retired from the 14 README references (including the tier
+table, which told readers to point `developer.datafye.io` at a self-hosted agent), this
+file, `PROJECT.md`, and the nginx placeholder page the installer writes.
+
+Found by pulling on a domain mismatch between a CNAME and a `CLAUDE.md` in a *different*
+repo. Worth remembering: **the doc discrepancy was the visible end of a broken product
+path.**
 
 ### Presence: a reading user is still a user (DAT-169)
 
@@ -848,7 +1061,7 @@ Two signals today:
 - **Data flowing** — one call to `GET /deployment/activity?activeWithinSeconds=N`, which fans out across every deployed dataset's feed/agg/history/reference **inside the platform** and returns a single verdict against the window we supply. The agent does not fan out over HTTP, and no threshold is baked into the platform. Cached and refreshed on a timer, never on the `/health` path.
 - **A lifecycle command in flight** — the DAT-183 marker with a liveness check, read **live** rather than cached: it is a couple of small local files, and this is the signal covering a 17-minute provision, where being a minute stale at the wrong moment is exactly the u1 failure. **A hung command counts as warm on purpose** — a box with a wedged CLI is precisely the one you want left running so somebody can log in and find out why.
 
-The third category from the ticket — compute the agent started outside a turn — reports nothing, because **there is none to report**: `prompt.py` forbids background execution outright after a backgrounded provision was orphaned with its session (DAT-185), and a turn in flight is already reported as `running_jobs`. The `compute:<name>` label space is reserved for when the agent can run and expose a long-lived app (DAT-202).
+The third category from the ticket — compute the agent started outside a turn — reports nothing, because **there is none to report**: `prompt.py` forbids background execution outright after a backgrounded provision was orphaned with its session (DAT-185), and a turn in flight is already reported as `running_jobs`. The `compute:<name>` label space was reserved for when the agent could run and expose a long-lived app; **that is now live** (DAT-202/219/221): `warmth.running_apps()` globs one `.datafye-app-<port>.json` per app and reports each by name, with the **listening port as the only liveness test** and the marker's pid deliberately ignored.
 
 Three decisions worth not relitigating:
 
@@ -876,7 +1089,7 @@ Three decisions worth not relitigating:
 
 Three branches of the truth table are worth stating because the obvious reading is wrong:
 
-- **intent `stopped` is READY**, not unready. A foundry the user asked to stop is in good order; calling it unready leaves the box permanently unhealthy, fixable only by starting an environment they explicitly did not want. It is ready even if observation finds it *serving* — somebody started it by hand, which is more than intended, not less.
+- **intent `stopped` is READY**, not unready. A foundry the user asked to stop is in good order; calling it unready leaves the box permanently unhealthy, fixable only by starting an environment they explicitly did not want. It is ready even if observation finds it *serving* — somebody started it by hand, which is more than intended, not less. ⚠️ **But NOT when the environment is wedged (DAT-226)**, see below.
 - **in-flight beats everything.** Mid-provision the deployment reports "not serving", which is indistinguishable from a real mismatch — so anything reconciling on that would try to fix an environment that is being built. That is the u1 collision, produced by something trying to help.
 - **absent intent means running.** A sandbox exists to host a foundry, so "no deviation has ever been recorded" and "it should be running" are the same statement. Unknown would leave a fresh box permanently unready; stopped would leave it permanently empty.
 
@@ -885,6 +1098,63 @@ Three branches of the truth table are worth stating because the obvious reading 
 **⚠️ That background refresh is what buys per-service fidelity from one call.** The health ping asks the API about four services at once, and a *dead* service makes the API wait out its own 30s Rumi reply timeout. The engine dodges that by probing each service separately in parallel, because it sits on a command's critical path; here the refresh can simply afford to wait (`PING_TIMEOUT_SECONDS`, 40s). Bounding it below 30s would collapse every partial environment into "not answering at all", losing exactly the distinction the ping exists for.
 
 **⚠️ Reading the ping right matters three times, and each fails silently in the wrong direction.** A healthy service reports an **empty** status, so a truthiness check reads exactly backwards. A healthy service actually sends `"status": null` on the wire (the ADM string is unset) — `entry.get("status") or ""` folds that in deliberately; the equivalent Java trap is that a plain `asText()` on a JSON null returns the *string* `"null"`. And a response listing **no services at all** is not a pass. The shape is `{"datasets":[{"services":{"<name>":{"status":…}}}],"trading":[…]}` — services is an object keyed by name, nested under per-system groups. All nine payloads `ServiceHealthTest` copied off a live foundry are replayed through the Python parse in the test suite, because the agent and the CLI disagreeing about one box's health would be worse than either being wrong alone.
+
+### A stopped intent must not hide a wedged environment (DAT-226)
+
+The accounts panel showed **"ready"** for a box whose CLI said **DEGRADED** (containers
+up, deployment API not answering, services needing a relaunch), and showed no environment
+type at all. Two causes.
+
+**`derive()` short-circuited on intent.** The `intent == stopped` clause returned READY
+**before looking at the observation at all**, so *any* environment on a box with intent
+stopped read as ready, wedged or not. The clause is right about what it was written for:
+a stopped foundry found SERVING is still ready, because that is **more than intended
+rather than less**. But **"broken" is neither more nor less than intended**: nobody
+asked for it, and it should never have been folded in with the other two. It was doubly
+misleading here because the intent itself was wrong (DAT-222 below): **a misclassified
+intent silenced the one signal that would have exposed it.**
+
+**`observe()` could not tell two silences apart.** A quiet deployment API is all the HTTP
+probe sees, so a cleanly stopped foundry and one whose containers are up with a dead API
+produced the same answer. There is now **`OBSERVED_ABSENT` distinct from `OBSERVED_DOWN`**,
+established by asking the CLI, one subprocess, and only on the path where something is
+already known to be wrong. Under intent `stopped`, ABSENT is ready and DOWN is not.
+
+**`env_type` is remembered once read** (`_remember_env_type`). It is read from the
+deployment API, which was down, so it went blank exactly when someone is staring at a
+broken box asking what kind it is. It is a property of what is **PROVISIONED**, not of
+whether it answers, and it cannot change without a rebuild.
+
+⚠️ **A truth table is worth printing in full every time it is touched: the row you break
+is never the row you were thinking about.** Printing it caught a regression *this* change
+introduced: `intent=running` with nothing provisioned fell through to UNKNOWN, where the
+old collapsed-DOWN behaviour had correctly said NOT READY. It has its own branch now.
+
+`CLI_PATH` is threaded through `observe_forever` rather than left to the `"datafye"`
+default, so an operator who configured `DATAFYE_AGENT_CLI_PATH` does not get a different
+binary on this path than everywhere else.
+
+### The environment reports its TYPE alongside its readiness (DAT-217)
+
+`/health`'s `foundry` block carries **`env_type`**: `foundry`, `trading`, or `null`. The
+accounts sandbox list used to stack two subjects in one cell (the BOX's status, and
+underneath it the ENVIRONMENT's readiness); giving the environment its own column needs it
+to carry its own type.
+
+- **Inferred from the deployed SYSTEMS** (`GET /deployment/systems`), not read from the
+  deployment descriptor. The descriptor is more authoritative, but the systems list is one
+  call on an endpoint the observation is already talking to. The tell is unambiguous: a
+  trading environment stands up `datafye-broker-stocks-system` alongside the data systems
+  and a foundry never does.
+- ⚠️ **Matched on a SUBSTRING**, because system names carry the version
+  (`datafye-api-system-2.0.37`). Comparing whole names would work today and break silently
+  on the next release.
+- ⚠️ **`null` means "could not tell", never "there is no environment"**, and it is passed
+  through `derive()` as null rather than defaulted. A column that renders those the same
+  way turns "I could not look" into "it is not working", the exact distinction the
+  readiness block exists to preserve. An empty systems list is unknown for the same reason:
+  it is a real answer about an environment with nothing in it, but it does not say which
+  KIND it would be.
 
 ### Who may change the foundry intent, and how (DAT-214)
 
@@ -910,6 +1180,28 @@ So the agent is the sole production caller of `POST /accounts/{u}/sandbox/foundr
 They cannot fight: `_intent_recorded_this_turn` marks a turn where the tool fired, and the sidecar skips that turn and consumes the mark. **Explicit always beats inferred**, because the model's own statement is better evidence than an inference drawn from the same conversation.
 
 **⚠️ The classifier is deliberately biased towards "no decision"**, and the bias is asymmetric for a reason: a wrong `stopped` leaves the user without an environment, while a missed one only means theirs keeps running — which is the default anyway. Pinned in tests: an unrecognised value, unparseable output, an API failure and a missing key all come back as no decision rather than a guess.
+
+⚠️ **An APP is not the ENVIRONMENT (DAT-222).** A user asked Yukti to build a page, then
+said *"cool, kill the app"* and later *"stop the first app"*. `_ENVIRONMENT_INTENT_PROMPT`
+read that as a standing decision about their environment and recorded
+`foundryIntent=stopped` in accounts. That is not cosmetic: `foundry-boot.sh`'s rule is
+**intent stopped means do nothing, whatever the observation**, so the next time that box
+dorms and wakes, the foundry stays down and the user has lost an environment they never
+asked to lose, exactly the harm the classifier's bias exists to prevent.
+
+- **Neither feature is wrong alone.** The classifier was written when the only thing a
+  user could ask to stop *was* the environment; DAT-202 and DAT-219 then gave the model
+  user-facing web apps, **a whole new noun that "stop" attaches to**. The prompt's
+  negative examples were all environment operations performed as a step in work, so
+  nothing in it separated an app from the platform underneath it. A composition failure,
+  the same shape as DAT-225's.
+- The classifier is now told plainly that an app is not the environment, carries the
+  phrasings this actually failed on, and answers `none` when it cannot tell which of the
+  two the user meant. Pinned by a check in `tests/test_prompt_audit.py`.
+- **It now LOGS ITS OWN REASON whenever it decides.** The `reason` field was always asked
+  for and always discarded, so the misfire left nothing behind saying what it thought it
+  heard: the only evidence was a changed field in another service. **A decision that can
+  leave someone without an environment has to be able to explain itself.**
 
 Everything here is best-effort and never fails the turn, in line with every other agent → accounts reporter, and a self-hosted run with no accounts routing simply does not offer the tool.
 
@@ -955,7 +1247,7 @@ The engine half is in `datafye-deploy`: `stop` no longer aborts when one applica
 - **Accounts is the project registry**: Accounts mints conversation/project ids; the agent's own `POST`/`GET /v1/conversations` are legacy/unused. New chat threads arrive with an accounts-minted `conversation_id`, and `/v1/chat` materialises a local chat-layer record via `conversations.ensure()`
 - **Persistent conversations**: `conversations.py` stores each conversation as one JSON file (name, message history, commentary audit trail, SDK session id). `/v1/chat` persists user+assistant turns and resumes the SDK session from disk, so chat survives an agent restart
 - **No `AskUserQuestion` tool**: It's the Claude Code harness's structured-prompt tool with no UI handler in the Datafye workspace, so the model's question would silently vanish. Dropped from `INTERNAL_TOOLS`; the model asks inline in chat text instead
-- **No background execution at all (DAT-185)**: `prompt.py` forbids `&`, `nohup`, `setsid`, `disown` and any detached wrapper, and requires long environment operations to run in the **foreground** with a generous timeout. The prompt used to offer backgrounding as an alternative, and the agent took it: on a live RC sandbox a backgrounded provision was **orphaned when the session ended**, leaving containers up with their apps never deployed — the DAT-171 wedge, produced by the technique meant to avoid it. It cannot work here for a structural reason as well: `INTERNAL_TOOLS` has no `BashOutput` and no `KillShell`, so there is no way to read a background job's output or kill it — the agent can only poll side effects with shell tricks, and it was observed getting that wrong (a substring match that fired on the deprovision line). This is the same lesson as `AskUserQuestion` and the `Task` family for the third time: **never offer a capability the surface cannot service**. It is also wrong for the product — the user is watching one conversation, and work continuing invisibly after the turn ends appears nowhere in it
+- **No background execution, with exactly one carve-out (DAT-185, DAT-219)**: `prompt.py` forbids `&`, `nohup`, `setsid`, `disown`, any detached wrapper **and the Bash tool's own `run_in_background` parameter** (DAT-218), and requires long environment operations to run in the **foreground** with a generous timeout. The prompt used to offer backgrounding as an alternative, and the agent took it: on a live RC sandbox a backgrounded provision was **orphaned when the session ended**, leaving containers up with their apps never deployed — the DAT-171 wedge, produced by the technique meant to avoid it. It cannot work here for a structural reason as well: `INTERNAL_TOOLS` has no `BashOutput` and no `KillShell`, so there is no way to read a background job's output or kill it — the agent can only poll side effects with shell tricks, and it was observed getting that wrong (a substring match that fired on the deprovision line). This is the same lesson as `AskUserQuestion` and the `Task` family for the third time: **never offer a capability the surface cannot service**. It is also wrong for the product — the user is watching one conversation, and work continuing invisibly after the turn ends appears nowhere in it. **The single exception is a user-facing app server** (DAT-219): every reason for the ban is a *supervision* problem, and for a server orphaning is the required behaviour, finishing is failure, and the listening port is the supervision. The rule handed to the model is *if it produces a result, run it in the foreground; if it answers on a port, detach it* (see *Showing the user an app the model built* above)
 - **No `Task` family in `INTERNAL_TOOLS`**: the `Task`/`TaskCreate`/`TaskUpdate`/`TaskList`/`TaskGet`/`TaskStop`/`TaskOutput` tools are harness-only with no backend handler in this agent, so they're removed from `INTERNAL_TOOLS` (which feeds `allowed_tools`) to avoid offering the model dead tools
 - **Project = folder**: each conversation/project is a directory under `<state>/projects/<id>/` holding `meta.json` + scaffolded `CLAUDE.md` (per-project memory), `PROJECT.md` (plain-language project narrative), `memory/`, and `.claude/skills/`. That folder is the chat turn's **cwd/workspace**, so the project's code, memory, and skills live together and survive a restart. `conversations.ensure()` materialises the folder for an accounts-minted id; legacy `<id>.json` records migrate into folders on load
 - **Skills, three tiers**: the native `Skill` tool is enabled, with skills discovered from local plugins + project source. **System** skills ship read-only in `plugins/datafye` (installer/app-clone managed); **user-global** skills the agent authors into `<state>/plugins/user`; **per-project** skills in the project's `.claude/skills` (loaded via `setting_sources=["project"]`). The `author-skill` system skill teaches scope-aware authoring. Listing via `GET /v1/skills`; execution is chat-driven. We keep the engine-native mechanism for quality (Claude is post-trained for it) — the `SKILL.md` artifacts are engine-portable if we ever hand-roll the loader for another engine
