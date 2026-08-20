@@ -74,6 +74,7 @@ import time
 from typing import Any
 
 import httpx
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -243,10 +244,13 @@ async def observe(deployment_api_url: str, cli_path: str = "datafye") -> dict[st
             env_type = await _environment_type(client, base)
             if not datasets:
                 # The API serves, but nothing is deployed behind it. That is the
-                # ordinary state of a fresh empty foundry, not a fault.
+                # ordinary state of a fresh empty foundry, not a fault. No
+                # descriptor read: there is nothing deployed to describe.
                 return _observation(OBSERVED_SERVING, [], [],
                                     "the API is answering; no datasets are deployed",
                                     env_type)
+
+            facts = await _descriptor_facts(client, base)
 
             dead: list[str] = []
             for dataset in datasets:
@@ -254,9 +258,9 @@ async def observe(deployment_api_url: str, cli_path: str = "datafye") -> dict[st
 
             if dead:
                 return _observation(OBSERVED_PARTIAL, datasets, dead,
-                                    "not answering: " + ", ".join(dead), env_type)
+                                    "not answering: " + ", ".join(dead), env_type, facts)
             return _observation(OBSERVED_SERVING, datasets, [],
-                                "every deployed service is answering", env_type)
+                                "every deployed service is answering", env_type, facts)
     except Exception as exc:
         return _observation(OBSERVED_UNKNOWN, [], [],
                             f"the environment could not be interrogated: {exc}")
@@ -280,14 +284,67 @@ async def _observe_without_api(cli_path: str) -> dict[str, Any]:
                         "state could not be established")
 
 
+async def _descriptor_facts(client: httpx.AsyncClient, base: str) -> dict[str, Any]:
+    """What was ASKED for: the symbols, the broker and the mode.
+
+    These live only in the deployment descriptor, not in any of the endpoints
+    the readiness probe already calls, so this is one more GET and a YAML parse
+    on a path that runs once a minute in the background.
+
+    ⚠️ Deliberately does NOT touch `env_type`. The descriptor's `mode` would
+    give a second, independently-derived answer for the same field, and DAT-217
+    chose to infer the type from the SYSTEMS actually deployed instead -- what
+    is running beats what was requested, and two derivations of one field is a
+    disagreement waiting to be reported to an operator as fact.
+
+    Never raises: this is enrichment on a readiness probe, and a descriptor that
+    cannot be read must not turn a serving environment into an unknown one.
+    Empty values mean "not read", which is why the caller only publishes them
+    when the API answered at all.
+    """
+    facts: dict[str, Any] = {"symbols": [], "broker": None, "mode": None}
+    try:
+        response = await client.get(f"{base}/datafye-api/v1/deployment/descriptor",
+                                    timeout=OBSERVE_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            return facts
+        text = (response.json() or {}).get("descriptor", "")
+        if not text or not text.strip():
+            return facts
+        descriptor = yaml.safe_load(text) or {}
+    except Exception as exc:
+        logger.debug("could not read the deployment descriptor: %s", exc)
+        return facts
+
+    symbols: list[str] = []
+    for entry in descriptor.get("datasets") or []:
+        for ticker in ((entry.get("symbols") or {}).get("tickers")) or []:
+            if ticker not in symbols:
+                symbols.append(ticker)
+    facts["symbols"] = symbols
+    facts["broker"] = (descriptor.get("broker") or {}).get("provider")
+    facts["mode"] = descriptor.get("mode")
+    return facts
+
+
 def _observation(observed: str, datasets: list[str], dead: list[str], detail: str,
-                 env_type: str | None = None) -> dict[str, Any]:
+                 env_type: str | None = None,
+                 facts: dict[str, Any] | None = None) -> dict[str, Any]:
+    facts = facts or {}
     return {
         "observed": observed,
         "datasets": datasets,
         "not_answering": dead,
         "checked_at": int(time.time() * 1000),
         "detail": detail,
+        # What was asked for, alongside what is running. Carried here so a
+        # reader does not have to wait for a chat turn to learn what is
+        # deployed: the SPA's sidebar was fed only by a POST-TURN event, so a
+        # freshly opened workspace showed an empty panel and a partial one
+        # showed as complete.
+        "symbols": facts.get("symbols") or [],
+        "broker": facts.get("broker"),
+        "mode": facts.get("mode"),
         # None means "could not tell", NEVER "there is no environment" (DAT-217).
         # An admin column that renders those the same way turns "I could not
         # look" into "it is not working", which is the distinction the whole
@@ -494,6 +551,12 @@ def derive(intent: dict[str, Any], snapshot: dict[str, Any], in_flight: str | No
         "observed": observed,
         "in_flight": in_flight,
         "datasets": snapshot.get("datasets") or [],
+        # The descriptor's view of the same environment: what was asked for.
+        # Empty/None means "not read", not "none configured" -- they are only
+        # populated on a snapshot where the deployment API answered.
+        "symbols": snapshot.get("symbols") or [],
+        "broker": snapshot.get("broker"),
+        "mode": snapshot.get("mode"),
         "not_answering": snapshot.get("not_answering") or [],
         "checked_at": snapshot.get("checked_at"),
         # Passed straight through, null included: accounts renders this as its
