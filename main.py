@@ -391,6 +391,12 @@ class HealthResponse(BaseModel):
     docs_available: bool
     cli_available: bool
     api_mcp_available: bool
+    # The installed agent version, so an operator can see which build a box is
+    # actually running without SSH. Read once at import (see AGENT_VERSION) --
+    # /health may only ever report things that cost no more than reading a
+    # variable. None on a build that predates this field, which is itself the
+    # answer: that box has not taken an upgrade since it shipped.
+    agent_version: Optional[str] = None
     credentials: dict[str, bool]
     username: Optional[str] = None              # None until bootstrapped
     credentials_generation: Optional[str] = None  # None until bootstrapped
@@ -2457,6 +2463,7 @@ async def health():
         bootstrapped=_bootstrapped,
         configured=(anthropic_key_status != "missing"),
         anthropic_key_status=anthropic_key_status,
+        agent_version=AGENT_VERSION,
         workspace=WORKSPACE_DIR,
         docs_available=os.path.isdir(DOCS_DIR),
         cli_available=shutil.which(CLI_PATH) is not None,
@@ -2483,6 +2490,32 @@ async def health():
 
 
 BOM_PATH = os.getenv("DATAFYE_AGENT_BOM_PATH", "/opt/datafye/agent/bom.json")
+
+
+def _read_agent_version() -> Optional[str]:
+    """The installed version, from the BOM the installer writes.
+
+    Read ONCE at import, deliberately. /health is polled every minute by the
+    upgrade cron, by accounts for dormancy and by the SPA, so it may only carry
+    facts that cost no more than reading a variable -- the same rule that keeps
+    the harness probe on /v1/bom instead. Caching is also exact rather than
+    merely cheap here: an upgrade replaces the code and restarts the service,
+    so the version cannot change under a running process.
+    """
+    try:
+        with open(BOM_PATH) as f:
+            version = json.load(f).get("agent_version")
+        if version:
+            return str(version)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    # A local run has no BOM. Fall back to the env var the installer also sets,
+    # then to None -- never to a made-up number, since the whole point of the
+    # field is to say which build is on the box.
+    return os.getenv("DATAFYE_AGENT_VERSION") or None
+
+
+AGENT_VERSION = _read_agent_version()
 
 
 @app.get("/v1/bom")
