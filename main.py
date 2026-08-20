@@ -1551,11 +1551,15 @@ def _tool_command_text(tool: str, tool_input: dict) -> str:
 
 def _is_env_changing_tool(tool: str, tool_input: dict) -> bool:
     """True if a tool call is likely to CHANGE the deployed environment (provision,
-    apply, dataset add/remove, deprovision, morph, start/stop). The streamer emits
-    a transitioning env_status when one starts and re-reads the environment right
-    after it finishes -- so the workspace env panel updates the moment the agent
-    spins up / reconfigures an environment, instead of waiting for turn end (which
-    on a long turn can be minutes later)."""
+    apply, dataset add/remove, deprovision, morph, start/stop). The streamer uses it
+    to re-read the descriptor right after such a tool finishes, so the accounts
+    record reflects the new environment instead of waiting for turn end (which on a
+    long turn can be minutes later).
+
+    It no longer drives anything the USER sees. Showing "Applying..." from a guess
+    about a tool name was replaced by the workspace polling /health, whose in-flight
+    half comes from the DAT-183 marker -- a real running command rather than an
+    inference from tool text."""
     _ENV_VERBS = ("apply", "provision", "deprovision", "dataset", "morph",
                   "upgrade", "start", "stop", "deploy", "create")
     if tool == "Bash":
@@ -1622,48 +1626,6 @@ async def _fetch_deployment_state() -> Optional[dict]:
     except Exception as e:
         logger.warning("Could not read deployment state: %s", e)
         return None
-
-
-def _derive_env_status(state: dict) -> dict:
-    """Derive the frontend-facing env_status payload from a deployment state
-    snapshot (the output of _fetch_deployment_state).
-
-    Shape: {status, env_type, datasets, symbols, broker, mode}
-      - mode     — the descriptor's `mode` ("backtest" | "paper")
-      - env_type — "Foundry" for backtest, "Trading" for paper. Named
-                   `env_type`, not `type`, so it does not collide with the
-                   SSE frame's own `type` discriminator that sse_event sets.
-      - datasets — dataset names (live deployment list if present, else the
-                   descriptor's datasets section)
-      - symbols  — union of tickers across the descriptor's datasets sections
-      - broker   — the descriptor's broker.provider, or None
-    """
-    descriptor = state.get("descriptor") or {}
-    mode = descriptor.get("mode")
-    type_ = {"backtest": "Foundry", "paper": "Trading"}.get(mode, "Foundry")
-
-    descriptor_datasets = descriptor.get("datasets") or []
-    datasets = state.get("datasets") or [
-        d.get("dataset") for d in descriptor_datasets if d.get("dataset")
-    ]
-
-    symbols: list = []
-    for d in descriptor_datasets:
-        tickers = ((d.get("symbols") or {}).get("tickers")) or []
-        for t in tickers:
-            if t not in symbols:
-                symbols.append(t)
-
-    broker = (descriptor.get("broker") or {}).get("provider")
-
-    return {
-        "status": "running",
-        "env_type": type_,
-        "datasets": datasets,
-        "symbols": symbols,
-        "broker": broker,
-        "mode": mode,
-    }
 
 
 async def tracked_stream_agent_response(
@@ -2030,12 +1992,14 @@ async def stream_agent_response(
                                 'call_tokens': call_tokens,
                             })
 
-                        # An environment-changing tool just STARTED: show the panel
-                        # a transitioning state (e.g. "Applying...") right away, and
-                        # remember its id so we re-read the environment when it ends.
+                        # An environment-changing tool just STARTED: remember its id
+                        # so the descriptor is re-read when it ends. No longer pushes
+                        # a "transitioning" frame -- the workspace polls /health, whose
+                        # in-flight half is read live from the DAT-183 marker, so it
+                        # shows the operation that is ACTUALLY running rather than one
+                        # inferred from a tool name.
                         if _is_env_changing_tool(tool_name, tool_input):
                             pending_env_tool_id = getattr(block, 'id', '') or True
-                            yield sse_event('env_status', {'status': 'transitioning'})
 
                     # Tool result
                     elif hasattr(block, 'tool_use_id'):
@@ -2071,29 +2035,17 @@ async def stream_agent_response(
                             })
 
                         # An environment-changing tool just FINISHED: re-read the
-                        # deployment now and push fresh descriptor + env_status, so
-                        # the panel reflects the new environment mid-turn instead of
-                        # waiting for turn end. Best-effort; never breaks the turn.
+                        # deployment now so the accounts record reflects the new
+                        # environment mid-turn instead of waiting for turn end.
+                        # Best-effort; never breaks the turn.
                         if pending_env_tool_id and (pending_env_tool_id is True
                                                     or pending_env_tool_id == result_tool_id):
                             pending_env_tool_id = None
                             try:
                                 dep = await _fetch_deployment_state()
                                 if dep:
-                                    # Reported straight to accounts (DAT-235). The
-                                    # SSE frame is still emitted for an SPA that
-                                    # predates this; both PATCH the same value, so
-                                    # the overlap is idempotent and ends when the
-                                    # fleet has upgraded.
                                     await _report_descriptor_to_accounts(
                                         conversation_id or "", dep['descriptor_text'], auth_token)
-                                    yield sse_event('descriptor', {'descriptor': dep['descriptor_text']})
-                                    yield sse_event('env_status', _derive_env_status(dep))
-                                else:
-                                    yield sse_event('env_status', {
-                                        'status': 'idle', 'env_type': None,
-                                        'datasets': [], 'symbols': [], 'broker': None, 'mode': None,
-                                    })
                             except Exception as e:
                                 logger.warning("Mid-turn env read failed: %s", e)
 
@@ -2183,20 +2135,7 @@ async def stream_agent_response(
             # CLI-driven change never writes at all.
             await _report_descriptor_to_accounts(
                 conversation_id or "", deployment_state['descriptor_text'], auth_token)
-            # Still emitted for an SPA that predates the direct report.
-            yield sse_event('descriptor', {'descriptor': deployment_state['descriptor_text']})
-            # Derived environment status for the frontend's env display.
-            yield sse_event('env_status', _derive_env_status(deployment_state))
-        else:
-            # No environment is up (torn down, switched away from, or not yet
-            # reachable). Emit a CLEARED status so the panel doesn't keep showing a
-            # stale environment from an earlier dataset (e.g. SIP after the user has
-            # moved to a Crypto foundry). A running env re-asserts itself on the
-            # next turn's read.
-            yield sse_event('env_status', {
-                'status': 'idle', 'env_type': None,
-                'datasets': [], 'symbols': [], 'broker': None, 'mode': None,
-            })
+
 
         # Collect the two cheap Haiku sidecars' token usage so it's counted in
         # the turn's per-model roll-up (they run outside the SDK session, so
