@@ -1104,6 +1104,39 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
         logger.warning("Satisfaction report failed for %s: %s", conversation_id, e)
 
 
+async def _report_descriptor_to_accounts(conversation_id: str, descriptor_text: str,
+                                        auth_token: Optional[str]) -> None:
+    """Best-effort: PATCH the deployed descriptor onto the accounts project record.
+
+    This used to travel through the BROWSER -- the agent emitted a `descriptor`
+    SSE frame and the SPA relayed it onward -- so a server-to-server fact was
+    recorded only if a tab happened to be open, stayed open past the end of the
+    turn, and the PATCH succeeded. A headless or CLI-driven change never reached
+    accounts at all. The agent already talks to accounts directly for usage,
+    satisfaction, feedback and foundry intent; this is the same channel, with
+    the user's own JWT, self-scoped.
+
+    Never raises and never fails the turn, in line with every other reporter. A
+    self-hosted run with no accounts routing has no token and simply does not
+    report.
+    """
+    if not auth_token or not AGENT_USERNAME or not conversation_id:
+        return
+    if not descriptor_text or not descriptor_text.strip():
+        return
+    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+           f"{AGENT_USERNAME}/projects/{conversation_id}")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(url, json={"deployment_descriptor": descriptor_text},
+                                      headers={"Authorization": f"Bearer {auth_token}"})
+            if resp.status_code >= 400:
+                logger.warning("Descriptor report returned %s for %s",
+                               resp.status_code, conversation_id)
+    except Exception as e:
+        logger.warning("Descriptor report failed for %s: %s", conversation_id, e)
+
+
 # Which turns already recorded an intent explicitly. The post-stream sidecar
 # skips those, so the model's own statement is never second-guessed by an
 # inference drawn from the same conversation. Keyed by turn id and cleared as
@@ -2047,6 +2080,13 @@ async def stream_agent_response(
                             try:
                                 dep = await _fetch_deployment_state()
                                 if dep:
+                                    # Reported straight to accounts (DAT-235). The
+                                    # SSE frame is still emitted for an SPA that
+                                    # predates this; both PATCH the same value, so
+                                    # the overlap is idempotent and ends when the
+                                    # fleet has upgraded.
+                                    await _report_descriptor_to_accounts(
+                                        conversation_id or "", dep['descriptor_text'], auth_token)
                                     yield sse_event('descriptor', {'descriptor': dep['descriptor_text']})
                                     yield sse_event('env_status', _derive_env_status(dep))
                                 else:
@@ -2138,7 +2178,12 @@ async def stream_agent_response(
         # emit nothing.
         deployment_state = await _fetch_deployment_state()
         if deployment_state:
-            # Raw descriptor text so the frontend can relay it to accounts.
+            # Straight to accounts, rather than by way of the browser (DAT-235):
+            # a record that depends on a tab being open is one that a headless or
+            # CLI-driven change never writes at all.
+            await _report_descriptor_to_accounts(
+                conversation_id or "", deployment_state['descriptor_text'], auth_token)
+            # Still emitted for an SPA that predates the direct report.
             yield sse_event('descriptor', {'descriptor': deployment_state['descriptor_text']})
             # Derived environment status for the frontend's env display.
             yield sse_event('env_status', _derive_env_status(deployment_state))

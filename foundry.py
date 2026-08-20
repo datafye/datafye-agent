@@ -101,7 +101,16 @@ STOP_TIMEOUT_SECONDS = int(os.environ.get("DATAFYE_AGENT_FOUNDRY_STOP_TIMEOUT", 
 # per-service probe bound is well under the deployment API's own 30s
 # request/reply timeout, so a dead service costs us seconds rather than the
 # API's full wait.
-OBSERVE_INTERVAL_SECONDS = int(os.environ.get("DATAFYE_AGENT_FOUNDRY_OBSERVE_INTERVAL", "60"))
+#
+# 20s, down from 60. This snapshot is what /health serves, so it -- not the
+# reader's poll -- is the binding constraint on how fresh a deployment reading
+# can be: a UI polling every 15s against a 60s snapshot re-reads the same value
+# four times. Safe to lower because `observe_forever` sleeps AFTER each pass
+# completes, so passes can never stack; a slow one (a dead service costs up to
+# PING_TIMEOUT_SECONDS) simply pushes the next out, which self-limits exactly
+# when something is wrong. The box is single-tenant and every call is to a
+# container on the same host.
+OBSERVE_INTERVAL_SECONDS = int(os.environ.get("DATAFYE_AGENT_FOUNDRY_OBSERVE_INTERVAL", "20"))
 # The datasets call is fast or the API is down, so it gets a short bound.
 OBSERVE_TIMEOUT_SECONDS = float(os.environ.get("DATAFYE_AGENT_FOUNDRY_OBSERVE_TIMEOUT", "5"))
 # ⚠️ The health ping is a different animal: it asks the API about four services
