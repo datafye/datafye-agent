@@ -134,9 +134,10 @@ DATAFYE_API_MCP_URL = os.getenv(
 # Datafye deployment REST API — part of the same datafye-api service the MCP
 # server fronts, but the plain HTTP REST surface (Jersey/Jetty on port 7776).
 # The CLI writes a /etc/hosts entry mapping this hostname to 127.0.0.1 on the
-# agent machine. Used to read the running environment's deployment descriptor
-# (GET /datafye-api/v1/deployment/descriptor) and derive env_status after a
-# chat turn. If no environment is up the agent simply emits nothing.
+# agent machine. Read by foundry.py's background observation (readiness,
+# datasets, type, and the descriptor's symbols/broker/mode), and after a chat
+# turn to report the deployed descriptor to accounts. If no environment is up,
+# nothing is reported and the readiness block says so.
 DATAFYE_DEPLOYMENT_API_URL = os.getenv(
     "DATAFYE_AGENT_DEPLOYMENT_API_URL",
     "http://local-foundry-dev-api.datafye.local:7776",
@@ -2744,11 +2745,11 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
     - commentary: Background activity line for the activity panel {text, kind}
       (kind: narration = the agent's own voice; muted/notable/check = machine
       tool-labels; error = a failed step)
-    - ticker: Running NEW-token count for the live status ticker {tokens},
-      emitted per model round; a live estimate reconciled by `usage` at turn end
+    - ticker: The conversation's CONTEXT SIZE for the live status ticker {tokens},
+      emitted per model round as new + carried -- the whole prompt at that step.
+      The field name predates the meaning: it used to be a running new-token
+      tally, which reads in the tens once the prefix is cached
     - result: Final result {text, session_id, duration_ms, cost_usd}
-    - descriptor: Raw deployment-descriptor YAML text {descriptor} (relayed to accounts)
-    - env_status: Environment state {status, env_type, datasets, symbols, broker, mode}
     - scorecard_update: Test results {return, winRate, trades, sharpe, drawdown, profitFactor}
     - chart_data: Chart data push {type, series, indicators}
     - error: Error {message, error_type}
