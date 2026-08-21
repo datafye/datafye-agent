@@ -32,7 +32,7 @@ datafye-agent/
 ├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
 ├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
 ├── tests/test_prompt_audit.py  # Dependency-free prompt audit; renders the REAL prompt and pins every claim that has been wrong
-├── requirements.txt # Python dependencies (incl. pyyaml for env_status descriptor parsing)
+├── requirements.txt # Python dependencies (incl. pyyaml for deployment-descriptor parsing)
 ├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
 ├── install/
 │   ├── install_template.sh   # Installer/upgrader template (--mode hosted|standalone, --ami-cleanup)
@@ -606,6 +606,29 @@ you are looking at a dev venv rather than production.
   production actually resolved. Writing a number before it was measurable would have
   repeated the mistake the block exists to prevent.
 
+### `/health` now says which agent build the box is running
+
+`GET /health` carries **`agent_version`**, read from the `agent_version` key of the
+installer-written `bom.json` (`DATAFYE_AGENT_BOM_PATH`), falling back to
+`DATAFYE_AGENT_VERSION` and then to `None`. Accounts renders it in the admin console's
+Hosting cell, so "which build is that box on?" stops being an SSH question — the same
+complaint DAT-215 answered one level down for the CLI.
+
+- **Read ONCE at import**, into the module constant `AGENT_VERSION`. `/health` is polled
+  every minute by the upgrade cron, by accounts for dormancy and by the SPA, so it may
+  only carry facts costing **no more than a variable read** — the identical rule that
+  keeps the harness probe on `/v1/bom`. Here the caching is **exact** rather than merely
+  cheap: an upgrade replaces the code and restarts the service, so the version cannot
+  change under a running process.
+- **Never an invented number.** No BOM and no env var reports `None`, because a made-up
+  version defeats the only purpose the field has.
+- ⚠️ **An absent `agent_version` is an ANSWER, not a gap: that box has not upgraded since
+  before this shipped.** A reader that renders it as "unknown" throws away the one thing
+  it is telling you.
+
+Verified against all four states a box can be in: BOM present, BOM absent with the env var
+set, BOM corrupt, and neither.
+
 ### Long environment commands run in the foreground (DAT-203)
 
 `main.py` raises the harness's `BASH_MAX_TIMEOUT_MS` to **30 minutes**. That single
@@ -891,7 +914,7 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals, and `foundry` (derived environment readiness, see below — including **`env_type`**: `foundry`/`trading`/`null`, DAT-217). Always available, including before bootstrap |
+| `/health` | GET | Health check — `bootstrapped`, `anthropic_key_status`, credential status, idle signals, **`agent_version`** (which build is on this box; read once at import from the installer's `bom.json`), and `foundry` (derived environment readiness — **`env_type`**: `foundry`/`trading`/`null`, DAT-217, plus the descriptor's `symbols`/`broker`/`mode`, DAT-233). Since DAT-234 this is **the** source of deployment state for the workspace, which polls it rather than being pushed events. Always available, including before bootstrap |
 | `/v1/bom` | GET | Dependency bill-of-materials — the single Datafye version this agent is built against (platform/samples/CLI/docs share one version). Reads `bom.json`; also carries the **`harness`** block from `harness.py` (which Claude Code CLI actually runs turns, DAT-215). Unauthenticated like `/health`; rendered on the Yukti agent surface |
 | `/bootstrap` | POST | Accounts-only. Bootstrap the agent's identity + credentials-store key from an accounts-signed JWT (`Authorization: Bearer`, `purpose=agent-bootstrap`). Idempotent for the same user; 409 on rebind |
 | `/v1/chat` | POST | SSE streaming chat with agent. JWT-protected; 503 if no Anthropic key, 502 if invalid |
@@ -968,6 +991,8 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_LOG_USAGE` | - | Set to `1` to dump the raw per-round usage object (and the usage-bearing stream events) from the SDK. **Off by default** — it is one line per model round, hundreds per build turn. Logged at INFO deliberately: the service runs at INFO, so a debug-level line would be silently swallowed and the diagnostic would look broken rather than disabled |
 | `DATAFYE_AGENT_TITLE_MODEL` | `claude-haiku-4-5` | Cheap model used only by `generate_title()` to summarize a new project's first message into a title (direct Anthropic `/v1/messages` httpx call, never the main reasoning model) |
 | `DATAFYE_AGENT_PORT` | `18780` | HTTP port |
+| `DATAFYE_AGENT_BOM_PATH` | `/opt/datafye/agent/bom.json` | The BOM the installer writes. Backs `/v1/bom` and `/health`'s **`agent_version`**, which is read ONCE at import into `AGENT_VERSION` — `/health` may only carry facts costing a variable read, and a version cannot change under a running process anyway |
+| `DATAFYE_AGENT_VERSION` | - | Fallback for `agent_version` when there is no BOM (a local run). With neither, the field is `None` — never an invented number |
 | `DATAFYE_AGENT_WORKSPACE` | `/home/datafye/workspace` | User workspace directory |
 | `DATAFYE_AGENT_DOCS_DIR` | `/home/datafye/docs` | Path to Datafye docs |
 | `DATAFYE_AGENT_CLI_PATH` | `datafye` | Path to Datafye CLI |
@@ -1155,6 +1180,65 @@ to carry its own type.
   it is a real answer about an environment with nothing in it, but it does not say which
   KIND it would be.
 
+### The readiness block also reports what was ASKED for (DAT-233)
+
+The observation says what is *running*. It said nothing about what was *requested*, so the
+symbols, the broker and backtest-vs-paper reached the workspace only as a turn event (see
+below). `foundry._descriptor_facts()` now reads `GET /deployment/descriptor` on the same
+once-a-minute observation pass and derives **`symbols`** (deduped across the descriptor's
+`datasets` sections), **`broker`** (`broker.provider`) and **`mode`**; `_observation()`
+carries them and `derive()` publishes them.
+
+- **Only on paths where the deployment API demonstrably answered**, and **skipped entirely
+  when no datasets are deployed** — there is nothing deployed to describe, and an empty
+  foundry is the ordinary state of a fresh box, not a fault.
+- ⚠️ **It deliberately does NOT touch `env_type`.** The descriptor's `mode` would be a
+  second, independently-derived answer for a field DAT-217 chose to infer from the SYSTEMS
+  actually deployed. **What is running beats what was requested**, and two derivations of
+  one field is a disagreement waiting to be reported to an operator as fact.
+- **Never raises** — enrichment on a readiness probe must not turn a serving environment
+  into an unknown one. Verified against a 404, an empty descriptor, malformed YAML and a
+  refused connection. (`foundry.py` gained `import yaml` for it.)
+
+### Deployment state is polled, not published (DAT-234, DAT-235)
+
+The `env_status` and `descriptor` SSE frames are **gone** — deleted at every emit site,
+along with the cleared-`env_status` branch and the `transitioning` frame — and
+`_derive_env_status` was **deleted rather than left unreferenced**, because it was a second
+independently-derived view of an environment the readiness block already describes.
+
+⚠️ **The category error is worth naming, because it is easy to repeat.** Every other frame
+on that stream is something that HAPPENED during the turn — `content`, `thinking`,
+`tool_result`, `step`, `ticker`, `stage`, `usage`, `artifact`. These two were **snapshots
+of BOX state**, riding a turn stream because that was the pipe that happened to be open.
+The consequence: state that exists continuously was published on an occasional trigger, so
+**a workspace that had not run a turn knew nothing about its deployment, and one that had
+knew something possibly minutes stale.** Deployment state is now read by polling `/health`,
+whose `foundry` block carries readiness, type, datasets and (DAT-233) symbols, broker and
+mode, refreshed every 20s.
+
+**Losing `transitioning` is an UPGRADE, not a regression.** It announced "Applying..." from
+a **guess about a tool name**; the poll reports the operation actually in flight from the
+DAT-183 marker, which is a fact — and that half is read live on every `/health` call, so it
+carries no observation lag at all.
+
+**The descriptor now goes agent → accounts directly (DAT-235).**
+`_report_descriptor_to_accounts()` PATCHes it onto the accounts project record at **both**
+points the agent reads the deployment: mid-turn when an environment-changing tool finishes,
+and at turn end. Same forwarded-JWT channel as the usage, satisfaction, feedback and
+foundry-intent reporters; best-effort, never fails the turn, absent on a self-hosted run.
+⚠️ **It used to travel through the BROWSER** — the agent emitted a `descriptor` frame and
+the SPA PATCHed it onward — so a **server-to-server fact was recorded only if a tab was
+open, stayed open past turn end, and the PATCH succeeded**, and a headless or CLI-driven
+change never reached accounts at all.
+
+`_is_env_changing_tool` survives, but **ONLY** to decide when to re-read the descriptor
+mid-turn; it no longer drives anything a user sees.
+
+**Deleting outright was safe because Yukti is not released and has no users** — there was no
+client to keep working, so no deprecation window, no dual-write and no compatibility shim.
+That window closes exactly once.
+
 ### Who may change the foundry intent, and how (DAT-214)
 
 Intent is owned by accounts (DAT-198), and working through every actor that can mutate a foundry leaves **exactly one** that may legitimately change it:
@@ -1266,6 +1350,8 @@ The engine half is in `datafye-deploy`: `stop` no longer aborts when one applica
 - **Inferred per-project satisfaction**: `analyze_satisfaction` is a cheap Haiku sidecar (like `classify_lifecycle`, uses `TITLE_MODEL`) that infers a 1-5 rank + short reasons from the recent transcript, run post-stream. `_report_satisfaction_to_accounts` POSTs the *derived signal only* (never the raw conversation) to `POST /accounts/{u}/projects/{id}/satisfaction` (`source=inferred`, forwards the user JWT — the same self-scoped agent→accounts pattern the usage reporter uses). `conversations.set_satisfaction` caches it agent-side; a `"user"` source is sticky over an inferred one
 - **In-conversation reporting tools (feedback + explicit satisfaction)**: `_build_reporting_mcp` stands up an in-process SDK-MCP server (`create_sdk_mcp_server`/`@tool`) with two tools the model can call mid-chat — `submit_feedback` (logs a bug/suggestion/general note to `POST /accounts/{u}/feedback`, which routes to Slack + a tracking issue; the response's **`ticket`** key — provider-neutral, `jira` kept as a fallback for older builds — is surfaced as "A tracking ticket was opened (`DAT-NNN`)" when one opens) and `submit_satisfaction` (records an *explicit* user rating with `source=user`, which is sticky over the inferred read). Both forward the user's own JWT — the same self-host-safe channel usage/satisfaction reporting uses, so the agent holds no Slack/JIRA creds. The server is only attached when routing is possible (a platform user with a forwarded JWT); a self-hosted run without accounts skips it, so the model falls back to the app's Send-feedback button. Prompt gains FEEDBACK + SATISFACTION sections: offer to log only after the user agrees, and capture a rating only when the user genuinely gives one (never fish for it). Ported from nvx-sutra-agent `219a09d`+`a155c39` (the explicit half)
 - **Report for any registered project (not just `proj-` ids)**: the usage + satisfaction reporters and the post-stream satisfaction gate no longer require a `proj-` id prefix — accounts is the authority, so a **reconciled** browser-local project (a create that failed, imported into the registry via accounts' reconcile endpoint) also gets reported. The reporters accept any id (an unregistered one 404s and the best-effort call just logs it); the post-stream satisfaction gate keys on a **forwarded identity** (`auth_token` + `AGENT_USERNAME`) instead of the prefix, so it still skips a self-hosted run with no accounts. Ported from nvx-sutra-agent `675f63b`
+- **Deployment state is polled, never published (DAT-234, DAT-235)**: the `env_status` and `descriptor` SSE frames are gone, and `_derive_env_status` with them. An event stream carries what HAPPENED during a turn; box state that exists continuously belongs on `/health`, whose `foundry` block carries readiness, type, datasets and (DAT-233) the descriptor's symbols/broker/mode, refreshed every 20s. The old shape meant a workspace that had not run a turn knew nothing about its deployment. The descriptor itself is now PATCHed **agent → accounts directly** on the forwarded JWT (`_report_descriptor_to_accounts`, at both read points) instead of being relayed by the browser, so a headless or CLI-driven change is recorded whether or not a tab was open
+- **`agent_version` on `/health`**: read once at import from the installer's `bom.json` (then `DATAFYE_AGENT_VERSION`, then `None` — never a made-up number), so accounts can show which build a box is on without SSH. Absent means the box predates the field, which is itself the answer
 - **Python-only algos**: No SDK/Java algos - all projects are pure Python using REST/WebSocket APIs
 - **Conversational config**: Datasets, schemas, and environments are configured through chat, not forms
 
