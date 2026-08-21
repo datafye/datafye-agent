@@ -129,6 +129,8 @@ The key semantic flip: **a dropped connection no longer cancels the turn.** That
 
 ### Reflecting the Environment Back to the Frontend
 
+> **Superseded (DAT-234, DAT-235)** — the `descriptor` and `env_status` events described here no longer exist. Deployment state is read by polling `/health`, and the agent PATCHes the descriptor to accounts itself instead of routing it through the browser. Two things in this section still hold: the `env_type`-not-`type` rule below governs every remaining frame, and the "no change to report" versus "the thing is gone" problem is what a polled block solves for free. The story of why the shape was wrong is in [State Is Not an Event](#state-is-not-an-event-dat-234-dat-235).
+
 The agent can spin up a Datafye environment, but the frontend needs to *show* what's running — which datasets, which symbols, backtest vs paper-trading, which broker. Rather than try to track that state by parsing the agent's own tool calls (fragile), we read it from the source of truth: after each chat turn, `_fetch_deployment_state()` makes a best-effort call to the deployed environment's deployment REST API (`GET .../deployment/{descriptor,datasets,symbols}` at `DATAFYE_AGENT_DEPLOYMENT_API_URL`). If no environment is up — connection refused, 404, no descriptor — it returns `None`. The `descriptor` call is load-bearing; `datasets` and `symbols` are enrichment and tolerated to fail.
 
 Early on, a `None` read emitted *nothing* — and that turned out to be a bug: after a user tore down a foundry or switched datasets, the panel kept showing the *old* environment (SIP lingering after a move to Crypto) because no event ever arrived to correct it. So a `None` read now emits a **CLEARED** `env_status` — `status:'idle'`, `env_type:None`, empty dataset/symbol lists — which resets the panel. A still-running environment simply re-asserts itself on the next turn's read. The lesson: "no change to report" and "the thing is gone" are different messages, and a stateful UI panel needs the second one explicitly.
@@ -1127,10 +1129,12 @@ guard, the seeded fleet bank, Node, the app port band, the project rename and th
 audits — went out in **RC 2.0.37** and was verified on a live sandbox (see *The Box
 Arrives* below). What followed it (the app-server exception, the band move, the harness
 reporting, the environment column, the per-app markers, the intent-classifier fix, the
-broker redirect, the upgrade wedge and the wedged-environment readiness fix) is **merged
-and awaiting the next RC**, so the paragraph below still applies to it. The full ledger,
-including what is deferred and what is merely unverified, is in *Where This Stands, and
-What the Next Person Picks Up* at the end of this arc.
+broker redirect, the upgrade wedge, the wedged-environment readiness fix and the retirement
+of the deployment events) went out in **RC 2.0.46** and is **released but almost entirely
+unverified on a box**, so the paragraph below still applies to it — a released fix is only
+true of a sandbox once that sandbox's auto-upgrade has run and somebody has looked. The
+full ledger, including what is deferred and what is merely unverified, is in *Where This
+Stands, and What the Next Person Picks Up* at the end of this arc.
 
 Agent changes travel in an agent release, so a fleet box only gets them when that release
 is published and the auto-upgrade picks it up. Until then the code is true of the
@@ -1484,19 +1488,111 @@ fell through to UNKNOWN, where the old collapsed-DOWN behaviour had correctly sa
 READY. It has its own branch now. **A truth table is worth printing in full every time it
 is touched, because the row you break is never the row you were thinking about.**
 
+### State Is Not an Event (DAT-234, DAT-235)
+
+For most of this agent's life, the way the workspace learned what environment it had was
+this: you sent a message, the agent finished the turn, and on its way out it read the
+deployment and pushed two frames down the same stream your reply had just arrived on —
+`env_status`, a parsed summary of what was deployed, and `descriptor`, the raw YAML for the
+browser to relay onward to accounts.
+
+It worked, in the sense that the panel usually showed the right thing. But look at what was
+actually going down that pipe. Every other frame on it is *a thing that happened during the
+turn*: some text, a thought, a tool result, a cost badge, a lifecycle stage, a deliverable.
+Those two were **photographs of the box**, taken at whatever moment the turn happened to
+end, sent down a stream whose only real qualification was that it was already open.
+
+The symptom follows from the shape, and it is completely undramatic, which is why it
+survived so long: **a workspace that had not run a turn knew nothing at all about its
+deployment, and one that had knew something that might be minutes old.** Open a project you
+last touched yesterday and the panel sits blank until you say something. Provision a
+dataset over SSH and the workspace never hears about it. Nothing errors, nothing looks
+broken — you simply have to *talk to the agent* to find out what the box has, which is a
+strange precondition for a fact the box could be asked directly at any moment.
+
+The descriptor half had a second problem stacked on the first, and it is the better story.
+The descriptor is a fact the **agent** holds and **accounts** needs to record: a
+server-to-server write between two components on the same network. It was being routed
+**through the user's browser**. The agent emitted it, the SPA caught it, the SPA PATCHed it
+onward. So the record was kept only when a tab happened to be open, happened to stay open
+past the end of the turn, and happened to complete the PATCH — and every headless or
+CLI-driven change was never recorded at all. It is rather like posting a letter to your
+neighbour by handing it to whoever walks past your door. It usually arrives, and you will
+never be able to explain the days it does not.
+
+So both frames are gone, along with `_derive_env_status`, which had been quietly
+maintaining a second, independently-derived view of an environment the readiness block
+already describes. The descriptor now goes agent → accounts directly, on the same
+forwarded-JWT channel that usage, satisfaction, feedback and foundry-intent already use, at
+both points the agent reads the deployment (mid-turn when an environment-changing tool
+finishes, and at turn end). And deployment state is read the way state ought to be read: by
+**polling `/health`**, whose `foundry` block carries readiness, environment type, datasets
+and — since DAT-233, on the same once-a-minute pass — the descriptor's symbols, broker and
+mode. That block now refreshes every 20 seconds rather than every 60, because the snapshot
+`/health` serves is the binding constraint on freshness, *not* the reader's poll: a UI
+asking every 15 seconds against a 60-second snapshot is reading one value four times over.
+Lowering it is safe because the observation loop sleeps *after* each pass, so passes can
+never stack — and a slow pass, which is what a dead service produces, pushes the next one
+out. It self-limits exactly when something is wrong.
+
+One casualty is worth defending, because on paper it reads as a loss. There used to be a
+`transitioning` frame that put "Applying..." on the screen while an environment change ran.
+It came from **guessing at a tool name** — the agent watched what the model was about to
+call and inferred the box was busy. The poll replaces it with the operation *actually* in
+flight, read from the DAT-183 marker on disk, and that half is not subject to the
+observation lag at all: it is read live on every `/health` call. A guess was traded for a
+fact.
+
+Two smaller things landed under the same rule about what `/health` is allowed to be. It now
+reports **`agent_version`**, read once at import out of the installer's `bom.json`, so
+"which build is that box on?" stops being an SSH question. Caching it is not a shortcut but
+an exactness: an upgrade replaces the code and restarts the service, so the version cannot
+change under a running process. And ⚠️ **an absent `agent_version` is an answer rather than
+a gap** — it means that box has not upgraded since before the field shipped, which is
+precisely what you were trying to find out. The rule both obey is the one that has kept
+this endpoint honest since DAT-198: **`/health` is polled every minute by the upgrade cron,
+by accounts for dormancy and by the SPA, so it may carry only facts that cost no more than
+reading a variable.** Anything expensive belongs on `/v1/bom`, or behind the background
+observation loop.
+
+The general lesson is short enough to carry into any system with a stream in it: **state
+that exists continuously should be polled; an event stream should carry what happened, not
+what is.** The tell that you have the shape wrong is exactly the one here — *the reader's
+knowledge depends on whether some unrelated activity recently occurred*. If a panel only
+knows something because a turn ran, a build finished or a job was submitted, what you have
+built is a cache with no invalidation and a refresh policy made of coincidence.
+
+A footnote on how cheap this was to do properly. **Yukti is not released and has no users**,
+so both frames could simply be deleted — no deprecation window, no dual-write, no
+compatibility shim for a client that had to keep working. That window closes exactly once,
+and the version of this same fix shipped a year later would have been three releases and a
+feature flag. Which is the real argument for looking hard at the *shape* of your events
+before anything depends on them.
+
 ### Where This Stands, and What the Next Person Picks Up
 
 The section above (*A Note on Where All This Stands*) explains why "merged" and "true of a
 box" are different claims in this project. Here is the current ledger, written so it stays
 useful after everyone has forgotten the session that produced it.
 
-**Deployed.** The box in the fleet runs a build containing DAT-222. Everything after it
-(DAT-224, DAT-225, DAT-226, the sbin `PATH` fix and the harness-probe fixes) landed later
-and **needs the next RC** before it is true of any sandbox.
+**Released.** **RC 2.0.46** is cut and green across the whole build chain — platform,
+deploy engine, CLI, samples, agent, MCP and docs — with `datafye-mcp-api@2.0.46` published
+to npm. It was cut from `a4159f7`, so it carries everything this arc has been waiting on:
+DAT-224, DAT-225, DAT-226, the sbin `PATH` fix and the harness-probe fixes, plus
+`agent_version` on `/health`, DAT-233's descriptor facts, the 20-second observation
+interval, and DAT-234/DAT-235's retirement of the deployment events. The line that used to
+sit here — *everything after DAT-222 needs the next RC* — is now spent; a fleet box is
+still only carrying it once its auto-upgrade cron has run.
 
 **Merged but not yet verified on a box.** DAT-219 AC5, DAT-220 AC3, DAT-221, DAT-224,
-DAT-225, DAT-226, and DAT-203. Two of those carry a wrinkle worth stating:
+DAT-225, DAT-226, DAT-203, and DAT-234. Three of those carry a wrinkle worth stating:
 
+- ⚠️ **DAT-234's user-visible behaviour has NEVER been observed on a box, and could not
+  have been** — the polled deployment panel needs an RC that contains it, and 2.0.46 is
+  the first one there has been. The removal half is proved by the code being gone; the
+  replacement half — a workspace that has run no turn at all showing its deployment
+  correctly, and a CLI-driven change appearing without one — is entirely unwitnessed. It
+  is the first thing to look at on the next sandbox.
 - **DAT-222 is only half verified.** The false-positive direction was confirmed ("kill the
   app" no longer records `stopped`). The other direction, that a genuine *"shut my
   environment down for the week"* still registers, is outstanding, and it matters more than
@@ -1530,8 +1626,10 @@ DAT-225, DAT-226, and DAT-203. Two of those carry a wrinkle worth stating:
   that has nothing to do with the agent process. It should read the **DAT-183 marker off
   disk**, which needs no agent at all to answer and which `warmth.py` already consults for
   the same question.
-- DAT-215's deliberate omission is now unblocked: pin `claude-agent-sdk==0.2.136` in
-  `requirements.txt`, the version production actually resolved.
+- DAT-215's deliberate omission is now unblocked and **still unwritten as of 2.0.46**:
+  `requirements.txt` says `>=0.2.128,<0.3` to this day, so what a box resolves is still a
+  guess about what resolution will do. The exact pin to write is
+  `claude-agent-sdk==0.2.136`, the version production actually resolved.
 
 ### Bootstrap: How the Agent Learns Who It Is
 
@@ -1722,7 +1820,7 @@ Two deployment modes:
 - **Hosted**: Pre-baked AMI in a Rumi private cloud. Each user gets a sandbox instance at `{username}.app.datafye.io`, proxied through a jump server with wildcard SSL. Managed by the datafye-accounts service (elastic stop/start based on activity). The AMI carries no user-specific data — identity, credentials, and the Anthropic key are all delivered at runtime by accounts over HTTP (`POST /bootstrap` and `POST /v1/credentials/update`).
 - **Standalone (Marketplace)**: Minimal AMI with a first-boot script. User provides DNS via EC2 user data; everything downloads and installs on first boot.
 
-The installer no longer takes an `--anthropic-key` flag, and `first-boot.sh` no longer reads an Anthropic key out of EC2 user data. The Anthropic key now arrives the same way every other credential does — over the accounts credentials channel — for *both* hosted and standalone. That collapses what used to be two key-delivery paths into one and lets the installer do something simpler: it just **always starts the agent**, which boots into the awaiting-bootstrap holding state and waits for accounts to push it identity and credentials. There's no longer any "do we have a key to start with?" branch in the install flow. (`pyyaml` was added to `requirements.txt` to parse the deployment descriptor for `env_status`.)
+The installer no longer takes an `--anthropic-key` flag, and `first-boot.sh` no longer reads an Anthropic key out of EC2 user data. The Anthropic key now arrives the same way every other credential does — over the accounts credentials channel — for *both* hosted and standalone. That collapses what used to be two key-delivery paths into one and lets the installer do something simpler: it just **always starts the agent**, which boots into the awaiting-bootstrap holding state and waits for accounts to push it identity and credentials. There's no longer any "do we have a key to start with?" branch in the install flow. (`pyyaml` was added to `requirements.txt` to parse the deployment descriptor — originally for the `env_status` event, and still what `foundry.py` uses to derive the readiness block's symbols, broker and mode.)
 
 The agent source is open source — the value is in the Datafye platform, not the glue code. Power users can fork and customize the prompt, add tools, tweak behavior.
 
