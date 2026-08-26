@@ -187,6 +187,40 @@ async def require_accounts_lifecycle_jwt(authorization: str | None = Header(defa
     return claims
 
 
+def _require_mfa_satisfied(claims: dict) -> None:
+    """A token accounts itself refuses must not be honoured here.
+
+    Two states, both minted by accounts and both meaning "not a usable session":
+
+    * ``purpose=mfa-pending`` proves a password and nothing else. Accounts
+      rejects it on every endpoint; it is redeemable only at the accounts
+      verify endpoints, in exchange for a real session token.
+    * ``mfa_verified=false`` is a session whose second-factor obligation is
+      unmet. Accounts lets such a token reach its own enrolment endpoints and
+      nothing else.
+
+    Neither is this agent's business to second-guess, but honouring one would
+    mean a token means different things depending on which service is asked --
+    which is how a real gap gets introduced later, even though the blast radius
+    here is only the user's own sandbox.
+
+    An ABSENT ``mfa_verified`` reads as SATISFIED, deliberately. A missing claim
+    is "no news", not "not verified": treating it as false would reject every
+    token minted before MFA existed, and every token from an accounts deployment
+    that does not issue the claim at all.
+    """
+    if claims.get("purpose") == "mfa-pending":
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Token is not a session token",
+        )
+    if claims.get("mfa_verified") is False:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "MFA enrollment required",
+        )
+
+
 async def require_self_jwt(authorization: str | None = Header(default=None)) -> dict:
     """
     FastAPI dependency: validates the inbound Bearer JWT and ensures its
@@ -201,4 +235,5 @@ async def require_self_jwt(authorization: str | None = Header(default=None)) -> 
     """
     claims = _decode_bearer(authorization)
     _require_subject_is_self(claims)
+    _require_mfa_satisfied(claims)
     return claims
