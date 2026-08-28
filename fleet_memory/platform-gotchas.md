@@ -85,3 +85,67 @@ false only when you want as-traded prices deliberately -- reconciling a broker f
 replaying the tape as it happened. Nothing in the returned series marks where a corporate
 action occurred, so treat any single-day move beyond roughly 50% as a suspected split
 until you have checked it, and say so to the user rather than reporting the number.
+
+## The Day bar is a SESSION bar, not a calendar-day accumulator
+
+This is the single easiest thing to get backwards from the outside, because the
+API returns a plausible bar either way and nothing in the response says which
+one you are looking at.
+
+**The day bar opens on the official opening print** -- the trade carrying the
+`MarketCenterOfficialOpen` sale condition -- and its `open` is that print's
+price. It does not open on the first trade of the calendar day, and it does not
+open on the first trade you happen to replay.
+
+**An aggregation service that never saw the opening print produces NO day bar
+at all.** That is deliberate: a half-session bar would look authoritative and
+would not be. So if you replay a window starting after 09:30, expect no day bar
+rather than a partial one.
+
+Two consequences for replay work:
+
+- **Replay from before the open** if you want a day bar. Start at 04:00 (or any
+  point before 09:30) so the opening print is inside your window.
+- ⚠️ **A day bar whose `open` is NOT the official opening print is a BUG, not a
+  semantic to work around.** If you replay 04:00->09:40 and get an open equal to
+  the 04:00 pre-market print, the session-open signal did not fire and a bar was
+  built from residual state. Report it; do not rewrite your analysis around it,
+  and do not conclude the platform aggregates calendar days.
+
+Once the official close (`MarketCenterOfficialClose`) is seen, later
+extended-hours trades may still extend `high`, `low` and `volume`, but they must
+NOT move `close`. Only a corrected consolidated close does. So a day bar that
+keeps moving its close after 16:00 is also a bug.
+
+The day bar can additionally be **sealed at configured intraday cutoffs** and
+published as its own series, so a "day" bar carrying a mid-session timestamp is
+expected rather than truncated data.
+
+## Never drive Datafye services with Docker directly
+
+To start or stop a Datafye **service** (the application inside a container), use the
+Rumi admin scripts. To start or stop the **container**, use the Rumi
+`LocalProvisioner`. Reaching for `docker` yourself is the last resort, not the
+first, and usually the wrong tool entirely.
+
+⚠️ **`docker restart rumi-<svc>` brings the container back with NO application
+inside it.** The container runs a wrapper that does not relaunch the Rumi XVM on
+container start, so `docker ps` shows the service "Up" while the application log
+simply stops at the last line before the restart and nothing is serving. That is
+the same wedged state a half-failed provision leaves -- containers healthy, API
+answering nothing -- and it is easy to create by accident and hard to recognise
+afterwards.
+
+The repair is `datafye <mode> local start`, which converges only the services that
+are not answering and relaunches the application properly.
+
+So:
+
+| To do this | Use |
+|---|---|
+| start/stop a Datafye service | the Rumi admin scripts (via the CLI) |
+| start/stop/terminate a container | Rumi `LocalProvisioner` |
+| inspect state, read a file in a volume, list containers | `docker` is fine -- it is read-only |
+
+Reading with `docker` (`ps`, `logs`, `exec ... cat`) is fine and often the fastest
+way to see what is true. It is *mutating* lifecycle with Docker that breaks things.
