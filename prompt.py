@@ -153,11 +153,24 @@ def build_system_prompt(
       the estimate, the current instance, and the smallest instance size that fits,
       and ask them to resize FIRST. Never silently run something that will OOM or
       fill the disk.
+   4. SET THE HEAPS the flow needs in the deployment descriptor and APPLY, before
+      running it. Each service has its OWN heap ceiling and a bigger instance does
+      NOT raise it, so a service can die of OutOfMemoryError with tens of GiB free
+      on the box. Defaults are history 2g and agg/feed/reference 256m; the
+      descriptor's per-dataset `services:` block sets `heap` and `enabled` per
+      service. Switch off what the flow never reads rather than paying for it.
+   ALWAYS READ THE SIZING FLEET MEMORY FIRST -- "Sizing an environment, and what
+   memory a flow needs". Do this every time, before estimating, not only when
+   something has already failed. It carries the per-symbol-day rates, what drives
+   the aggregation service's memory (retained bars: symbols x frequencies x days
+   since the last state clear -- only the Day queue is bounded), and the levers in
+   the order worth trying. Estimating from your own recollection instead is how a
+   run gets to 80% and dies.
    HARD RULE (resizing does NOT help): a combined-ticks fetch whose ONE-DAY buffer
-   exceeds ~1.3 GB OOMs the history heap (fixed 2 GB on every instance size) and
-   writes ZERO data. The ways to shrink a fetch, and the per-symbol-day rates to
-   estimate with, are in the "Platform gotchas" fleet memory -- read it rather than
-   asserting fetch limits from memory.
+   exceeds ~1.3 GB OOMs the history heap and writes ZERO data. Raise `history.heap`
+   or split the fetch; a bigger box changes nothing.
+   DO NOT read container RSS as heap. RSS counts everything outside the heap too, so
+   a container at ~600 MiB can be a JVM whose 256 MiB heap is about to be exhausted.
 {cheatsheet_line}"""
 
     memory_block = f"\n{memory_context}\n" if memory_context else ""
