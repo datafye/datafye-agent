@@ -910,6 +910,64 @@ sudo ./install.sh --mode hosted --ami-cleanup
 /home/datafye/workspace/ # User workspace
 ```
 
+### Disk layout: two volumes, and the root size is not a free choice (DAT-178)
+
+The hosted AMI bakes **8 GB root (`/dev/xvda`) + 100 GB data (`/dev/sdb`)**. The base Rumi
+Worker AMI mounts `/dev/sdb` at `/home/rumi`; the packer template simply declares the device
+in both `launch_block_device_mappings` and `ami_block_device_mappings`, and the mount comes
+free. Everything that grows lives on the data volume:
+
+| On the data volume | Via | Why |
+|---|---|---|
+| Docker's `data-root` | `/etc/docker/daemon.json` | holds `rumi-<ds>-history-shared`, i.e. **every tick and OHLC log**. This is the whole point. |
+| `/opt/datafye` | bind mount → `/home/rumi/datafye-opt` | agent, venv, docs, samples |
+| `/home/datafye` | bind mount → `/home/rumi/datafye-home` | the user workspace and its exports |
+
+Bind mounts, not relocation and not symlinks. Both paths appear in the docs, in the agent's
+own system prompt, in systemd units and in the CLI's foundry provisioning, and a symlink
+would additionally break `docker run -v` source resolution — which the foundry depends on. A
+bind mount is invisible to all of them. The entries go in `/etc/fstab`, not just a live
+`mount --bind`: dormancy stops and starts a sandbox routinely, so a mount that lasts only
+until the next boot is a mount that silently vanishes and takes `/opt/datafye/agent` with it.
+
+⚠️ **8 GB root is mandated by the provisioner, not chosen.** accounts calls the
+`AwsProvisioner.launchServiceInstance` overload that takes **no** `rootVolumeSize`, and that
+path computes `bootVolumeSize = rumiVolumeSize > 0 ? 8 : 32`. The moment accounts asks for a
+data volume it also asks EC2 for an 8 GiB root — and EC2 **rejects a root smaller than the
+AMI's snapshot**. Bake root at anything above 8 and every provision dies at `RunInstances`.
+There is no larger-root escape either: the provisioner explicitly throws on an explicit
+`rootVolumeSize <= 8`. Rumi Support hit this from the other direction (accounts asking 8
+against a 64 GB-root bake) and had every provision rejected.
+
+⚠️ **The AMI id and `datafye.accounts.aws.rumi.volume.size` must move together.** They sit in
+the same `datafye-accounts` `config.xml`. The default is still `0` (root-only, 32 GB root);
+flipping it to `100` against a pre-DAT-178 AMI breaks every provision, and leaving it at `0`
+against a DAT-178 AMI silently disables the per-account `agentVolumeSize` floor and the data
+half of the cost model. Change both in one deploy.
+
+⚠️ **Existing sandboxes cannot be upgraded in place** — the layout is baked. They have to be
+re-provisioned, as was true for Support.
+
+`relocate_docker_data_root()` and the bind-mount helper are **idempotent, and that is
+load-bearing**: this installer re-runs on every auto-upgrade, on a live box, with a user's
+foundry running. The early return on an already-relocated daemon is what stops an upgrade
+from stopping Docker out from under running containers.
+
+`datafye-grow-data.service` grows the data filesystem on every boot. That is what turns
+accounts' `POST /sandbox/resize-disk` (`volume: "data"`, which does an EBS `ModifyVolume` and
+reboots) into usable bytes without anyone SSHing in. A raw fs on the device with no partition
+table, xfs or ext4, so it tries `xfs_growfs` on the mount point then `resize2fs` on both the
+nvme and the legacy device name.
+
+None of this runs without a data volume: every step is gated on `/home/rumi` being a
+mountpoint, so a laptop install or a standalone box keeps the old single-volume layout.
+
+**What this fixes, concretely.** A 128 GB data volume was provisioned onto a Datafye sandbox
+for a bulk minute-bar download and bought **exactly zero usable bytes**: it landed at
+`/home/rumi` owned by `rumi`, the `datafye` user could not write to it, and root — where
+Docker's data-root and therefore the entire store actually was — was untouched. The volume
+that grows has to be the volume the data is on.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |

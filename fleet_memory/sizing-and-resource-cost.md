@@ -105,6 +105,23 @@ is 24h, ~150 MB per coin-day for a major pair, trades only.
 Only xlarge is measured. Keep peak host usage at or below **70%** of RAM and leave **5 GB**
 disk free. When borderline, ask the user to resize up rather than assuming it fits.
 
+## Which disk
+
+Read the filesystem holding **Docker's data-root**, not `/`:
+
+```
+df -h $(docker info --format '{{.DockerRootDir}}')
+```
+
+Fetched history is written into the `rumi-sip-history-shared` Docker volume, so that is the
+filesystem a fetch fills. On a current sandbox it is a **separate data volume**, and `/` is a
+small OS disk whose free space says nothing about whether a fetch fits. Your own exports under
+the workspace land on the same filesystem, so one number covers both.
+
+Disk resizes independently of the instance: growing the **data** volume is what buys room for a
+fetch, and the resize reboots the box to pick it up. Ask for a data-volume resize, not a bigger
+instance, when the constraint is disk.
+
 ## Provenance
 
 Fetch and replay figures: measured on an xlarge across 47 isolated runs, high-volume

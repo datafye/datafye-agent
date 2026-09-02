@@ -147,11 +147,20 @@ def build_system_prompt(
    A fetch or replay can exhaust the instance's memory or disk. Before you run one:
    1. Estimate its PEAK MEMORY and DISK, biased to a HIGH-VOLUME trading day (worst
       case, round up).
-   2. Check the instance's real limits: `free -m` for RAM, `df -h` for disk.
+   2. Check the instance's real limits: `free -m` for RAM, and for disk
+      `df -h $(docker info --format '{{{{.DockerRootDir}}}}')` -- NOT a bare `df -h`.
+      Fetched history is written into a Docker volume, so the filesystem that fills
+      is whichever one holds Docker's data-root. On a current sandbox that is a
+      separate data volume and `/` is a small OS disk with nothing to do with your
+      fetch; reading the wrong line means either refusing a fetch that fits or
+      running one that does not. Your own exports under the workspace land on that
+      same filesystem, so the one number covers both.
    3. If the worst-case estimate does not fit with headroom (keep peak under ~70% of
       RAM, and leave at least 5 GB disk free), STOP and do not run it: tell the user
       the estimate, the current instance, and the smallest instance size that fits,
-      and ask them to resize FIRST. Never silently run something that will OOM or
+      and ask them to resize FIRST. Disk is resized independently of the instance --
+      growing the DATA volume is what buys room for a fetch, and it is picked up on
+      the reboot the resize performs. Never silently run something that will OOM or
       fill the disk.
    4. SET THE HEAPS the flow needs in the deployment descriptor and APPLY, before
       running it. Each service has its OWN heap ceiling and a bigger instance does

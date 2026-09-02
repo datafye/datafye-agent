@@ -1824,6 +1824,51 @@ The installer no longer takes an `--anthropic-key` flag, and `first-boot.sh` no 
 
 The agent source is open source — the value is in the Datafye platform, not the glue code. Power users can fork and customize the prompt, add tools, tweak behavior.
 
+### The disk that grew and bought nothing
+
+For most of its life the sandbox had one disk. A 32 GB root held the OS, the agent, the docs, the samples, the workspace, and — the part nobody thinks about until it matters — `/var/lib/docker`. That last one is not a detail. The foundry's history service writes every tick and every OHLC bar into a Docker *named volume*, and a Docker named volume lives inside Docker's data-root. So "the market data store" and "the operating system" were the same 32 GB.
+
+You can live with that for a long time. A few hundred symbols of minute bars is single-digit gigabytes. Then someone asks for a year of minute bars across the whole NYSE + NASDAQ universe — 8,502 symbols, about 178 GB — and the shape of the problem changes from "tight" to "impossible".
+
+So a 128 GB volume was provisioned for exactly that job. Here is what the box looked like afterwards:
+
+```
+/dev/nvme1n1    128G  1004M  127G   1% /home/rumi     <-- owned by 'rumi', mode 755
+/dev/nvme0n1p1   32G    25G  7.8G  76% /              <-- unchanged
+```
+
+Net usable gain: **zero bytes**. The new volume mounted at `/home/rumi`, owned by a user the agent isn't; the `datafye` user got `Permission denied` and there is no passwordless sudo. And root — where the store actually was — was never touched. A hundred and twenty-eight gigabytes of correctly-provisioned, correctly-attached, correctly-mounted, completely useless disk.
+
+This is a good lesson to keep, because nothing *failed*. Every component did its job. The resize API resized. EC2 attached. The base AMI mounted. The failure was that **the volume that grew was not the volume the data was on**, and no single component was in a position to notice.
+
+The fix has three parts, and the interesting thing about all three is how little new machinery they needed:
+
+1. **Declare `/dev/sdb` in the packer template.** That is all. The base Rumi Worker AMI already knows how to mount it at `/home/rumi` — Sutra and Rumi Support had both been through this and neither installer does a `mkfs`, an `/etc/fstab` edit, or a mount. Adding the device to the block-device mappings is what makes it appear.
+
+2. **Move Docker's data-root onto it.** One line of `daemon.json`. This is the whole ticket: it is where the tick data lives, so it is the thing that has to be on the disk that can grow.
+
+3. **Bind-mount `/opt/datafye` and `/home/datafye` onto it.** Not relocate, not symlink. Both paths are baked into the docs, the agent's own system prompt, systemd units, and the CLI's foundry provisioning — and a symlink would additionally break `docker run -v` source resolution, which the foundry depends on. A bind mount is a path that is simultaneously where it always was and somewhere else entirely, which is precisely what was wanted.
+
+Two details that look like polish and are not.
+
+**The mounts go in `/etc/fstab`, not just a live `mount --bind`.** Datafye sandboxes go dormant: the box is stopped and started routinely, invisibly, by the accounts service. A mount that only exists until the next boot is a mount that silently vanishes — and takes `/opt/datafye/agent`, the running agent's own install directory, with it.
+
+**Every step is idempotent, and that is load-bearing rather than tidy.** This installer re-runs on every auto-upgrade, on a live box, while a user's foundry is running. `relocate_docker_data_root()` returns early when `docker info` already reports the target. Without that early return, an ordinary version bump would stop Docker out from under a user's running containers. Rumi Support learned this one first; the code here is deliberately close to theirs.
+
+And then the sizing, which is where it stops being a design exercise. The root volume is **8 GB**, and that is not a number anyone picked. accounts calls the `AwsProvisioner.launchServiceInstance` overload that takes no `rootVolumeSize`, and that path computes:
+
+```java
+final int bootVolumeSize = rootVolumeSize > 8 ? rootVolumeSize : (rumiVolumeSize > 0 ? 8 : 32);
+```
+
+The moment accounts asks for a data volume, it also asks EC2 for an 8 GiB root. EC2 rejects a root smaller than the AMI's snapshot. So an AMI baked with a 16 GB root — which is what a reasonable person would choose for headroom — makes **every provision fail at `RunInstances`**, with an error that says nothing about AMIs. The provisioner also throws on an explicit `rootVolumeSize <= 8`, so there is no escape hatch upward either.
+
+Worth dwelling on *how* that was found. The javadoc on the overload accounts calls describes the behaviour; the constant in `SandboxCost` mirrors it; both say 8. But the number that EC2 actually receives is computed at line 5717 of `AwsProvisioner`, in a different overload, four call-hops away. Reading the layer that *describes* behaviour instead of the layer that *performs* it is a recurring way to be confidently wrong, and it is worth the extra two minutes every time.
+
+The same coupling runs the other way and is the deploy hazard: the AMI id and `datafye.accounts.aws.rumi.volume.size` live in the same `config.xml` and **must move together**. Flip the volume size to 100 against a pre-DAT-178 AMI and accounts asks for an 8 GB root against a 32 GB snapshot — every provision rejected. Leave it at 0 against a DAT-178 AMI and the AMI's own data volume still attaches, but the per-account `agentVolumeSize` floor and the data half of the cost model quietly stop working. Rumi Support hit the first version of this and had every provision rejected until the ordering was fixed.
+
+Finally, the agent had to be told. The prompt's resource guard used to say "check `df -h`". On a one-volume box that was unambiguous; on a two-volume box it shows both filesystems and the interesting one is not `/`. So the guard now says `df -h $(docker info --format '{{.DockerRootDir}}')` — ask Docker where its data is and measure *that*. Reading the wrong line costs you a refused fetch that would have fit, or a started fetch that cannot finish.
+
 ## Receive-Only Integration with `datafye-accounts`
 
 The agent is a **receive-only worker** in the Datafye sandbox plane. The shape of its role: it **receives** credentials and JWTs, it **does** work, it never **asks** accounts for anything. Accounts is the only writer in the relationship. This section captures how that integration is wired.
