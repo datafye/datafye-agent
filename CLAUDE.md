@@ -959,6 +959,21 @@ reboots) into usable bytes without anyone SSHing in. A raw fs on the device with
 table, xfs or ext4, so it tries `xfs_growfs` on the mount point then `resize2fs` on both the
 nvme and the legacy device name.
 
+⚠️ **Attaching a disk to this box will break it, until an upstream fix lands.** Rumi's
+`AwsProvisioner.attachNewVolumeToServiceInstance` — the operator path for adding a volume,
+and the one you would use to bring an ST1/SC1 history volume or a restored snapshot onto a
+sandbox — finishes by running `scripts/mount_disk.sh`, whose last act is
+`sudo chown -R rumi:rumi /home/rumi`. On a Sutra or Support box that is a no-op; everything
+there already belongs to `rumi`. Here it is not: the agent runs as `User=datafye`, and
+`/home/rumi/datafye-home` **is** `/home/datafye`, so one recursive chown hands the agent its
+own home, workspace, npm prefix and cache owned by a different user. `mount_disk.sh` also
+forces the mount point to be *relative to* `/home/rumi` (an absolute path is rejected), so
+there is no mounting around it either. The proper fix is upstream — chown the mount point it
+just created, not the whole tree. Until then `datafye-fix-data-ownership.service` repairs it
+on the next boot, which on a sandbox is soon: dormancy stops and starts the box routinely.
+The unit is guarded by a `stat`, not an unconditional walk, so the normal case costs two
+syscalls.
+
 None of this runs without a data volume: every step is gated on `/home/rumi` being a
 mountpoint, so a laptop install or a standalone box keeps the old single-volume layout.
 

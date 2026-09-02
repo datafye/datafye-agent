@@ -1088,6 +1088,48 @@ systemctl daemon-reload
 systemctl enable datafye-grow-data.service
 ok "Systemd service: datafye-grow-data.service (grows ${DATA_VOLUME_ROOT} on boot)"
 
+# ── Re-assert ownership of the bind-mounted trees (DAT-178) ──────
+# Defends against a specific, live hazard rather than a hypothetical one.
+# Rumi's own `attachNewVolumeToServiceInstance` -- the operator path for adding
+# a disk to an instance, and the one that would be used to bring an ST1/SC1
+# history volume or a restored snapshot onto this box -- finishes by running
+# scripts/mount_disk.sh, whose last act is:
+#
+#     sudo chown -R rumi:rumi /home/rumi
+#
+# On a Sutra or Rumi Support box that is a no-op: everything under /home/rumi
+# already belongs to `rumi`. Here it is not. The agent runs as `User=datafye`,
+# and /home/rumi/datafye-home IS /home/datafye -- so one recursive chown hands
+# the agent's own home, workspace, npm prefix and cache to a different user and
+# the agent can no longer write anything. Attaching a disk would break the box
+# it was attached to, which is the same shape of failure as the 128 GB volume
+# that mounted correctly and bought nothing.
+#
+# The proper fix is upstream: mount_disk.sh should chown the mount point it
+# just created, not the whole of /home/rumi. Until that lands, recover on the
+# next boot -- and a Datafye sandbox boots often, because dormancy stops and
+# starts it. Guarded by a stat rather than an unconditional walk, so the normal
+# case costs two syscalls and does not fight anything.
+cat > /etc/systemd/system/datafye-fix-data-ownership.service << EOF
+[Unit]
+Description=Re-assert ownership of the Datafye trees on the data volume
+After=local-fs.target datafye-grow-data.service
+Before=datafye-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'if [ -d /home/datafye ] && [ "\$(stat -c %%U /home/datafye)" != datafye ]; then echo "repairing /home/datafye ownership"; chown -R datafye:datafye /home/datafye; fi'
+ExecStart=/bin/sh -c 'if [ -d /opt/datafye ] && [ "\$(stat -c %%U /opt/datafye)" != root ]; then echo "repairing /opt/datafye ownership"; chown -R root:root /opt/datafye; fi'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable datafye-fix-data-ownership.service
+ok "Systemd service: datafye-fix-data-ownership.service (repairs a stray chown -R on ${DATA_VOLUME_ROOT})"
+
 # ── Write the foundry boot reconciler one-shot (DAT-199) ─────────
 # Installed in EVERY mode. Its predecessor (datafye-foundry-firstboot.service)
 # was hosted-only, which left a self-provisioned user -- who stops and starts
