@@ -257,6 +257,78 @@ for _bin_dir in _EXTRA_BIN_DIRS:
 os.environ["PATH"] = os.pathsep.join(p for p in _current_path if p)
 
 
+# Every tool that can run work outside this turn's governance (DAT-272).
+#
+# ⚠️ This is the ENFORCEMENT. Leaving a tool out of `allowed_tools` is not a
+# denial: `allowed_tools` becomes the CLI's `--allowedTools`, a PERMISSION
+# allowlist, and `permission_mode="bypassPermissions"` makes permission checks
+# moot. The comment on INTERNAL_TOOLS was right about WHY Task should be absent
+# and wrong that absence achieved it. Sutra ran the identical arrangement:
+# SUT-36 removed Task on 2026-08-04, and on 2026-08-31 that agent launched six
+# subagents. This agent's clean runs have been down to its PROMPT, which does
+# tell the model there is no Task tool, not to its allowlist.
+#
+# `Task` is only the alias; `Agent` is the tool's real name. `Workflow`
+# orchestrates subagents by another route -- verified against claude 2.1.259,
+# where `--disallowedTools Task` leaves it available. `RemoteTrigger` is the
+# worst and least obvious: it creates and RUNS claude.ai routines, separate
+# Claude Code sessions in the cloud under the user's own OAuth, inheriting
+# nothing from prompt.py and not running on this box at all.
+#
+# `CronCreate` is deliberately NOT here: it enqueues a prompt into THIS session,
+# so the scheduled turn re-enters this agent's own loop and does inherit the
+# prompt. Banning it would imply a threat that is not there.
+DELEGATION_TOOLS = ["Task", "Agent", "Workflow", "RunWorkflow", "RemoteTrigger"]
+
+# What goes to --disallowedTools, which is NOT the same list. The CLI warns
+# "Permission deny rule X matches no known tool" once per turn for a name it
+# does not know, and a warning that is always wrong is how people learn to
+# ignore warnings. RunWorkflow is an alias the CLI does not accept as a deny
+# target, so it is hooked -- free, and defends a future rename -- but not named.
+#
+# ⚠️ Sharper here than on Sutra: this installer runs `claude.ai/install.sh`
+# UNPINNED, so a box has whatever was current when it baked. The tool surface
+# therefore differs per box, and a name valid on one may warn on another. The
+# HOOK is version-independent and is what actually enforces; the deny list is
+# belt and braces. This is also why the deny list cannot be the durable answer
+# -- see SUT-62 for the inversion that makes the allowlist enforceable.
+DISALLOWED_DELEGATION_TOOLS = ["Task", "Agent", "Workflow", "RemoteTrigger"]
+
+
+async def deny_delegation(
+    input_data: dict[str, Any], tool_use_id: str | None, context: Any
+) -> dict[str, Any]:
+    """Refuse a tool that would run work outside this turn (DAT-272).
+
+    A subagent does not inherit prompt.py, so nothing this agent is told about
+    audience, plain language or voice governs delegated work, and its output
+    lands unfiltered in a user-facing surface. It also spends its own
+    containment benefit: a subagent exists so its exploration stays OUT of the
+    main context, and a large report lands there anyway.
+
+    ⚠️ FAIL-CLOSED, and deliberately the opposite of guard_oversized_read below.
+    This one exists to stop something, so an input shape it does not recognise
+    is refused rather than allowed.
+    """
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Delegating or orchestrating work outside this turn is not available "
+                "here, and the refusal is deliberate rather than a limit to work "
+                "around.\n\n"
+                "A subagent does not inherit your instructions, so what it writes is "
+                "not governed by anything you have been told about how to talk to this "
+                "user -- and its report lands in your context anyway, which is the one "
+                "thing delegating was supposed to avoid.\n\n"
+                "Do the work in this turn. If it is genuinely too large for one turn, "
+                "say so plainly and let the user send you back in."
+            ),
+        }
+    }
+
+
 async def guard_oversized_read(
     input_data: dict[str, Any], tool_use_id: str | None, context: Any
 ) -> dict[str, Any]:
@@ -351,6 +423,36 @@ INTERNAL_TOOLS = [
     # Discovery
     "Skill", "ToolSearch",
 ]
+
+
+def pre_tool_use_hooks() -> dict:
+    """The PreToolUse wiring, as ONE definition (DAT-272).
+
+    The real options construction and tests/test_tool_guards.py both call this,
+    so the test cannot assert a shape that nothing ships. A copy in the test
+    with a comment warning about drift is not a guard -- it is the drift, with
+    a note attached.
+    """
+    return {"PreToolUse": [
+        *[HookMatcher(matcher=t, hooks=[deny_delegation]) for t in DELEGATION_TOOLS],
+        HookMatcher(matcher="Read", hooks=[guard_oversized_read]),
+    ]}
+
+
+def build_agent_options_for_test() -> ClaudeAgentOptions:
+    """The guard-relevant options exactly as a turn builds them.
+
+    Exists so the guard tests inspect the OBJECT rather than grep the source:
+    a formatter wrapping a HookMatcher call would turn a source grep red while
+    the hook was correctly registered, and deleting the wiring while leaving a
+    comment that quotes it would keep it green with nothing registered.
+    """
+    return ClaudeAgentOptions(
+        disallowed_tools=list(DISALLOWED_DELEGATION_TOOLS),
+        hooks=pre_tool_use_hooks(),
+        max_buffer_size=MAX_BUFFER_SIZE,
+    )
+
 
 # -- Session storage -----------------------------------------------
 # Single session per user -- maps conversation_id -> agent session_id
@@ -1741,7 +1843,8 @@ async def stream_agent_response(
         # because the model read back a chart it had drawn. See MAX_BUFFER_SIZE.
         max_buffer_size=MAX_BUFFER_SIZE,
         # Refuse a read that could not survive the framer, before it is issued.
-        hooks={"PreToolUse": [HookMatcher(matcher="Read", hooks=[guard_oversized_read])]},
+        disallowed_tools=list(DISALLOWED_DELEGATION_TOOLS),
+        hooks=pre_tool_use_hooks(),
     )
 
     # Persist the user's turn and resume the project's SDK session.
