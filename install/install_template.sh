@@ -701,6 +701,42 @@ else
 fi
 
 # ── Step: Install / validate Datafye CLI ─────────────────────────
+prune_old_cli_versions() {
+    local versions_dir="${CLI_BASE}/versions"
+    [ -d "${versions_dir}" ] || return 0
+
+    # Resolve `current` to a bundle name. If it is missing or dangling we cannot
+    # tell which version is live, so reclaim nothing -- deleting the wrong tree
+    # here would take the box's only CLI with it.
+    local keep_current=""
+    keep_current="$(basename "$(readlink -f "${CLI_BASE}/current" 2>/dev/null)" 2>/dev/null)" || true
+    if [ -z "${keep_current}" ] || [ ! -d "${versions_dir}/${keep_current}" ]; then
+        return 0
+    fi
+
+    # Newest bundle that is not the current one, by mtime.
+    local keep_previous=""
+    keep_previous="$(ls -1dt "${versions_dir}"/*/ 2>/dev/null \
+                     | sed 's|/$||; s|.*/||' \
+                     | grep -vFx "${keep_current}" \
+                     | head -1)" || true
+
+    local removed=0
+    local d b
+    for d in "${versions_dir}"/*/; do
+        [ -d "${d}" ] || continue
+        b="$(basename "${d}")"
+        [ "${b}" = "${keep_current}" ] && continue
+        [ -n "${keep_previous}" ] && [ "${b}" = "${keep_previous}" ] && continue
+        rm -rf "${d}"
+        removed=$((removed + 1))
+    done
+
+    if [ "${removed}" -gt 0 ]; then
+        ok "Reclaimed ${removed} superseded CLI version(s); kept ${keep_current}${keep_previous:+ and ${keep_previous}}"
+    fi
+}
+
 next_step
 if is_snapshot "$VERSION"; then
     # SNAPSHOT mode does NOT install or upgrade the Datafye CLI -- it uses
@@ -758,6 +794,25 @@ else
         exit 1
     fi
     ok "Datafye CLI: ${CLI_PATH} -> $(readlink -f "${CLI_PATH}")"
+
+    # ── Reclaim superseded CLI versions (DAT-178) ────────────────
+    # The CLI installer drops each version at ${CLI_BASE}/versions/<bundle>/ and
+    # never removes an old one, and neither did we. That is unbounded growth on
+    # the ROOT volume, which the split-volume layout makes small on purpose --
+    # and the Datafye CLI distribution is ~560MB per version, so an 8GB root
+    # fills after five or six upgrades. (Sutra has the identical structure and
+    # gets away with it only because the Rumi CLI is ~84MB, roughly seven times
+    # smaller, so its boxes die of old age first.)
+    #
+    # Keep TWO: the one `current` points at, and the newest of the rest. The
+    # spare is a deliberate escape hatch rather than caution -- CLI_PATH follows
+    # `current`, so a bad CLI release would otherwise leave the box with no
+    # working CLI and no way to fetch one.
+    #
+    # Ordered AFTER the install and its -x check, so nothing is reclaimed until
+    # the replacement is on disk and executable. The transient peak is three
+    # versions (~1.7GB), which an 8GB root carries comfortably.
+    prune_old_cli_versions
 fi
 
 # ── Pin Java 17 for the Datafye CLI, globally (DAT-116) ───────────

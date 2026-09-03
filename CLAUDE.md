@@ -912,7 +912,8 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 ### Disk layout: two volumes, and the root size is not a free choice (DAT-178)
 
-The hosted AMI bakes **8 GB root (`/dev/xvda`) + 100 GB data (`/dev/sdb`)**. The base Rumi
+The hosted AMI bakes **8 GB root (`/dev/xvda`) + 64 GB data (`/dev/sdb`)**, and accounts sets
+`datafye.accounts.aws.rumi.volume.size = 64` to match, so a provisioned sandbox is **8/64**. The base Rumi
 Worker AMI mounts `/dev/sdb` at `/home/rumi`; the packer template simply declares the device
 in both `launch_block_device_mappings` and `ami_block_device_mappings`, and the mount comes
 free. Everything that grows lives on the data volume:
@@ -939,11 +940,20 @@ There is no larger-root escape either: the provisioner explicitly throws on an e
 `rootVolumeSize <= 8`. Rumi Support hit this from the other direction (accounts asking 8
 against a 64 GB-root bake) and had every provision rejected.
 
-⚠️ **The AMI id and `datafye.accounts.aws.rumi.volume.size` must move together.** They sit in
-the same `datafye-accounts` `config.xml`. The default is still `0` (root-only, 32 GB root);
-flipping it to `100` against a pre-DAT-178 AMI breaks every provision, and leaving it at `0`
-against a DAT-178 AMI silently disables the per-account `agentVolumeSize` floor and the data
-half of the cost model. Change both in one deploy.
+⚠️ **The AMI id and `datafye.accounts.aws.rumi.volume.size` must be DEPLOYED together.** They
+sit in the same `config.xml` and are both set in the repo, but the accounts deploy must not
+precede the AMI bake: `64` against a pre-DAT-178 AMI asks EC2 for an 8 GB root against a
+32 GB snapshot and **every provision is rejected**. Bake and bump the AMI id first, or in the
+same change.
+
+⚠️ **A 32 GB root cannot be combined with a data volume.** The instinct is to bake a roomier
+root for headroom and let accounts' request shrink it — EC2 does not work that way: a launch
+cannot ask for a root smaller than the AMI's snapshot, and accounts asks for exactly 8 the
+moment a data volume is present. Baking 32 does not give a 32 GB root, it gives a box that
+will not launch. The only way to a 32 GB root alongside a data volume is to change accounts
+to call an `AwsProvisioner` overload that takes `rootVolumeSize` — and even then the
+provisioner throws on any value `<= 8`, so 8 and "more than 8" are the only two shapes that
+exist.
 
 ⚠️ **Existing sandboxes cannot be upgraded in place** — the layout is baked. They have to be
 re-provisioned, as was true for Support.

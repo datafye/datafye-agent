@@ -67,8 +67,8 @@ variable "volume_size_gb" {
 
 variable "data_volume_size_gb" {
   type        = number
-  default     = 100
-  description = "The /home/rumi data volume (/dev/sdb) size (GB), bake + AMI. Holds Docker's data-root -- and therefore the foundry's rumi-sip-history-shared volume, i.e. every tick and OHLC log the history service writes -- plus /opt/datafye and /home/datafye via bind mounts. Sized well above Sutra's 40GB and Support's 64GB because tick data is the product: a year of minute bars for the full 8,502-symbol NYSE+NASDAQ universe is ~178GB, and a few hundred symbols is single-digit GB, so 100GB covers the realistic case with room and leaves the pathological one to a resize. The base Rumi Worker AMI ships /dev/sdb at only 1GB; this resizes it. accounts must launch the datafye persona with a data volume >= this -- see the sequencing hazard on DAT-178. (DAT-178)"
+  default     = 64
+  description = "The /home/rumi data volume (/dev/sdb) size (GB), bake + AMI. Holds Docker's data-root -- and therefore the foundry's rumi-<ds>-history-shared volume, i.e. every tick and OHLC log the history service writes -- plus /opt/datafye and /home/datafye via bind mounts. Matches Rumi Support's bake. Sized for the realistic case (a few hundred symbols of history is single-digit GB) rather than the pathological one: a year of minute bars for the full 8,502-symbol NYSE+NASDAQ universe is ~178GB, which is a resize, not a default. The base Rumi Worker AMI ships /dev/sdb at only 1GB; this resizes it. ⚠️ datafye.accounts.aws.rumi.volume.size must be >= this -- EC2 rejects a volume smaller than the AMI's snapshot. (DAT-178)"
 }
 
 variable "source_ami" {
