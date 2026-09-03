@@ -339,10 +339,16 @@ INTERNAL_TOOLS = [
     # surface its question. Without the tool, the model asks inline.)
     #
     # "Task" (delegate to a subagent) is deliberately ABSENT -- but ⚠️ ABSENCE
-    # HERE IS NOT WHAT STOPS IT. This list becomes the CLI's --allowedTools, a
+    # HERE DOES NOT ENFORCE IT. This list becomes the CLI's --allowedTools, a
     # PERMISSION allowlist, and permission_mode is bypassPermissions, so a tool
-    # left out of it is still callable. DELEGATION_TOOLS and the deny_delegation
-    # hook are the enforcement (DAT-272); this line is documentation of intent.
+    # left out of it is still callable. Verified on Sutra, which had the same
+    # arrangement: it removed Task from its allowlist on 2026-08-04 and launched
+    # six subagents on 2026-08-31 regardless.
+    #
+    # What has actually kept THIS agent clean is prompt.py, which tells the model
+    # there is no Task tool. That is a soft mechanism and it has held. Hard
+    # enforcement is deliberately NOT added unless spawning is observed here --
+    # see DAT-273.
     # It was first dropped as harness-only; the stronger reason is that a
     # subagent does NOT inherit prompt.py, so nothing this agent says about
     # audience, plain language or voice governs delegated work, and its output
