@@ -2,6 +2,32 @@
 
 This file provides guidance to Claude Code when working with this repository.
 
+
+## ⚠️ `Task`'s absence from `INTERNAL_TOOLS` is intent, not enforcement
+
+The comment there is right about *why* delegation is unwanted and wrong that absence achieves
+it. `allowed_tools` becomes `--allowedTools`, a *permission* allowlist, and
+`permission_mode="bypassPermissions"` makes permission checks moot — a tool left out is still
+callable. Proven on Sutra, which had the identical arrangement and launched six subagents 27
+days after "fixing" it.
+
+**What has actually kept this agent clean is `prompt.py`**, which tells the model there is no
+Task tool. That soft mechanism has held, and hard enforcement was deliberately **not** added:
+it was built on 2026-09-02 and backed out on 2026-09-03 because there is no observed failure
+here to justify it. **DAT-273** carries it, gated on spawning being observed. **SUT-62**
+proposes the durable inversion.
+
+## ⚠️ `tests/sanity_e2e.py` cannot run on an Apple-silicon Mac with an x86_64 venv
+
+It will time out on the first chat turn, and the cause is not this agent. The venv Python is
+x86_64, so everything runs under Rosetta, which does not emulate AVX; the SDK's bundled Bun
+CLI warns `CPU lacks AVX support, strange crashes may occur` and then its hook plumbing
+crashes, the tool-permission stream closes, and the turn never returns. Production is Linux
+x86-64 with real AVX and is unaffected. Rebuild the venv with arm64 Python to run it locally.
+
+⚠️ The suite `rmtree`s its work dir in a `finally`, so **it deletes `agent.log` exactly when a
+run fails**. To diagnose anything, copy the script and suppress that line first.
+
 ## Project Overview
 
 Datafye Agent is a dedicated per-user AI backend for algorithmic trading project development. It wraps the Claude Agent SDK in a FastAPI service, giving each user an interactive agent session with access to Datafye documentation, the Datafye CLI, and file system tools for building Python-based algos.
