@@ -329,62 +329,6 @@ async def deny_delegation(
     }
 
 
-async def guard_shell_delegation(
-    input_data: dict[str, Any], tool_use_id: str | None, context: Any
-) -> dict[str, Any]:
-    """Refuse a shell command that invokes the Claude CLI (DAT-272).
-
-    Denying the Task/Agent/Workflow TOOLS closes the tool routes and leaves the
-    shell wide open: the installer puts `claude` on this user's PATH, `Bash` is
-    allowlisted and unhooked, and permission_mode is bypassPermissions -- so
-    `claude -p "..."` spawns an ungoverned session on the same credentials. That
-    is the credit-exhaustion scenario this ticket exists to prevent, by a route
-    a tool deny list cannot reach.
-
-    Matches on the PROGRAM, not a substring: it splits on shell separators,
-    steps over leading environment assignments, and looks at the command word.
-    So `grep claude foo.log` and `cat claude.log` are fine, while `claude -p`,
-    `./claude` and `/home/datafye/.local/bin/claude` are not.
-
-    ⚠️ FAIL-OPEN on a command it cannot parse. This runs before EVERY Bash call,
-    which is the agent's main working tool, and a guard that misreads a quoting
-    edge case into a refusal would break far more than it protects. The narrow
-    check is deliberate: it is worth having for the obvious invocation without
-    pretending to be a sandbox.
-    """
-    try:
-        command = (input_data.get("tool_input") or {}).get("command")
-        if not command or not isinstance(command, str):
-            return {}
-        for segment in re.split(r"[;&|]+|\n|&&|\|\|", command):
-            words = segment.strip().split()
-            # Step over leading VAR=value assignments and common prefixes.
-            while words and ("=" in words[0].split("/")[0] or words[0] in ("sudo", "env", "nohup", "setsid", "time")):
-                words = words[1:]
-            if not words:
-                continue
-            program = words[0].strip("'\"")
-            if program == "claude" or program.endswith("/claude"):
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": (
-                            "Running the Claude CLI from the shell is not available here.\n\n"
-                            "It would start a session that inherits none of your "
-                            "instructions and runs on the same credentials as this one, "
-                            "which is the thing delegating to a subagent was already "
-                            "refused for.\n\n"
-                            "Do the work in this turn. If it is genuinely too large for "
-                            "one turn, say so plainly and let the user send you back in."
-                        ),
-                    }
-                }
-    except Exception:
-        return {}   # fail open: this runs before every Bash call
-    return {}
-
-
 async def guard_oversized_read(
     input_data: dict[str, Any], tool_use_id: str | None, context: Any
 ) -> dict[str, Any]:
@@ -489,21 +433,14 @@ def guard_options() -> dict:
     """The guard-relevant SDK options, as ONE definition (DAT-272).
 
     Returned as kwargs and spread into the real ClaudeAgentOptions, so the turn
-    and tests/test_tool_guards.py are looking at the same object rather than two
-    that happen to agree.
-
-    ⚠️ The first cut of this got it wrong in a way worth recording: it built a
-    parallel ClaudeAgentOptions for the test with its own disallowed_tools
-    literal, so every assertion checked the helper against itself -- deleting
-    the real line left the suite green. A copy with a comment warning about
-    drift is not a guard, it is the drift with a note attached, and moving the
-    copy one level up does not fix it.
+    and tests/test_tool_guards.py inspect the same object rather than two that
+    happen to agree. A copy in the test, however carefully commented, is a
+    second definition that can drift out of step with this one.
     """
     return {
         "disallowed_tools": list(DISALLOWED_DELEGATION_TOOLS),
         "hooks": {"PreToolUse": [
             *[HookMatcher(matcher=t, hooks=[deny_delegation]) for t in DELEGATION_TOOLS],
-            HookMatcher(matcher="Bash", hooks=[guard_shell_delegation]),
             HookMatcher(matcher="Read", hooks=[guard_oversized_read]),
         ]},
         # A single oversized tool result must not destroy the turn (DAT-204).

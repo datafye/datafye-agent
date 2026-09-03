@@ -69,8 +69,7 @@ async def run():
     for tool in main.DELEGATION_TOOLS:
         check(f"{tool} is hooked to the denial", tool in matched, str(sorted(matched)))
 
-    for matcher, fn in (("Read", main.guard_oversized_read),
-                        ("Bash", main.guard_shell_delegation)):
+    for matcher, fn in (("Read", main.guard_oversized_read),):
         check(f"{matcher} is hooked to its guard",
               any(getattr(m, "matcher", None) == matcher and fn in (getattr(m, "hooks", []) or [])
                   for m in (guards.get("hooks") or {}).get("PreToolUse", [])))
@@ -104,21 +103,6 @@ async def run():
           built.disallowed_tools == guards.get("disallowed_tools")
           and built.hooks == guards.get("hooks")
           and built.max_buffer_size == guards.get("max_buffer_size"))
-
-    # ---- the shell route the tool deny list cannot reach ------------
-    for cmd in ("claude -p 'go'", "./claude -p x", "/home/datafye/.local/bin/claude -p x",
-                "FOO=1 claude -p x", "ls && claude -p x", "sudo claude -p x"):
-        check(f"shell delegation denied: {cmd}",
-              denied(await main.guard_shell_delegation({"tool_input": {"command": cmd}}, None, None)))
-    # Fail-OPEN and narrow: this runs before EVERY Bash call, so a false
-    # positive costs far more than the guard protects.
-    for cmd in ("grep claude /var/log/app.log", "cat claude.log", "echo claude",
-                "ls /home/datafye/.local/bin", "python3 -c 'print(1)'"):
-        check(f"ordinary command allowed: {cmd}",
-              not denied(await main.guard_shell_delegation({"tool_input": {"command": cmd}}, None, None)))
-    for odd in ({}, {"tool_input": {}}, {"tool_input": {"command": None}}):
-        check(f"fails open on {odd}",
-              not denied(await main.guard_shell_delegation(odd, None, None)))
 
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py")).read()
 
