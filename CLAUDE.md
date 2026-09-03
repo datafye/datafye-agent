@@ -912,8 +912,12 @@ sudo ./install.sh --mode hosted --ami-cleanup
 
 ### Disk layout: two volumes, and the root size is not a free choice (DAT-178)
 
-The hosted AMI bakes **8 GB root (`/dev/xvda`) + 64 GB data (`/dev/sdb`)**, and accounts sets
-`datafye.accounts.aws.rumi.volume.size = 64` to match, so a provisioned sandbox is **8/64**. The base Rumi
+The hosted AMI bakes **8 GB root (`/dev/xvda`) + 32 GB data (`/dev/sdb`)**, and accounts sets
+`datafye.accounts.aws.rumi.volume.size = 32` to match, so a provisioned sandbox is **8/32**.
+That is a default, not a ceiling: `Account.agentVolumeSize` raises the data volume at provision
+(it is applied as a floor over the config value), and `POST /sandbox/resize-disk` grows either
+volume in place on a live box. Both were already built; DAT-178 is what makes the data half of
+them act on something. The base Rumi
 Worker AMI mounts `/dev/sdb` at `/home/rumi`; the packer template simply declares the device
 in both `launch_block_device_mappings` and `ami_block_device_mappings`, and the mount comes
 free. Everything that grows lives on the data volume:
@@ -942,7 +946,7 @@ against a 64 GB-root bake) and had every provision rejected.
 
 ⚠️ **The AMI id and `datafye.accounts.aws.rumi.volume.size` must be DEPLOYED together.** They
 sit in the same `config.xml` and are both set in the repo, but the accounts deploy must not
-precede the AMI bake: `64` against a pre-DAT-178 AMI asks EC2 for an 8 GB root against a
+precede the AMI bake: `32` against a pre-DAT-178 AMI asks EC2 for an 8 GB root against a
 32 GB snapshot and **every provision is rejected**. Bake and bump the AMI id first, or in the
 same change.
 

@@ -67,8 +67,8 @@ variable "volume_size_gb" {
 
 variable "data_volume_size_gb" {
   type        = number
-  default     = 64
-  description = "The /home/rumi data volume (/dev/sdb) size (GB), bake + AMI. Holds Docker's data-root -- and therefore the foundry's rumi-<ds>-history-shared volume, i.e. every tick and OHLC log the history service writes -- plus /opt/datafye and /home/datafye via bind mounts. Matches Rumi Support's bake. Sized for the realistic case (a few hundred symbols of history is single-digit GB) rather than the pathological one: a year of minute bars for the full 8,502-symbol NYSE+NASDAQ universe is ~178GB, which is a resize, not a default. The base Rumi Worker AMI ships /dev/sdb at only 1GB; this resizes it. ⚠️ datafye.accounts.aws.rumi.volume.size must be >= this -- EC2 rejects a volume smaller than the AMI's snapshot. (DAT-178)"
+  default     = 32
+  description = "The /home/rumi data volume (/dev/sdb) size (GB), bake + AMI. Holds Docker's data-root -- and therefore the foundry's rumi-<ds>-history-shared volume, i.e. every tick and OHLC log the history service writes -- plus /opt/datafye and /home/datafye via bind mounts. 32GB is the DEFAULT, not the ceiling: it covers a foundry's images plus a few hundred symbols of history, which is what a normal session does. A larger appetite is served per account (Account.agentVolumeSize acts as a floor at provision) or in place (POST /sandbox/resize-disk with volume=data), so the default does not have to carry the worst case -- a year of minute bars for the full 8,502-symbol universe is ~178GB and is a resize. The base Rumi Worker AMI ships /dev/sdb at only 1GB; this resizes it. ⚠️ datafye.accounts.aws.rumi.volume.size must be >= this -- EC2 rejects a volume smaller than the AMI's snapshot. (DAT-178)"
 }
 
 variable "source_ami" {
