@@ -63,8 +63,11 @@ instance. The only fixes are to make the fetch smaller:
 - use OHLC instead of ticks where the algo allows it
 
 Estimate against a high-volume day, not an average one, and check `free -m` and
-`df -h` before starting. The bundled foundry resource-cost cheat sheet has the
-per-symbol-day rates and worked examples.
+`df -h $(docker info --format '{{.DockerRootDir}}')` before starting -- fetched
+history lands in a Docker volume, so the filesystem that fills is the one holding
+Docker's data-root, which on a current sandbox is a separate data volume and not
+`/`. The bundled foundry resource-cost cheat sheet has the per-symbol-day rates
+and worked examples.
 
 ## Fetch semantics that surprise people
 

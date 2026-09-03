@@ -79,6 +79,7 @@ peak_host_MiB = foundry_baseline_host + (estimated_peak_mem_MiB - history_servic
 
 FITS (memory) IF:  peak_host_MiB <= 0.70 * instance_RAM_MiB          # keep 30% headroom
 FITS (disk)   IF:  estimated_disk_MB <= (free_disk_MB - 5000)        # leave >= 5 GB free
+                   # free_disk_MB = df on Docker's data-root, NOT on /
                    AND, if a replay will follow, data stays on disk during replay (already counted)
 
 IF not FITS -> tell the user the estimate, the current instance, and the smallest
@@ -202,6 +203,11 @@ state a hard minimum of **8 GB RAM / 20 GB disk** for any local foundry.
 - **Memory:** keep `peak_host_MiB <= 70% of instance RAM`. The check is
   `worst_case_estimate + headroom <= instance RAM` (worst case = high-volume day, rounded up).
 - **Disk:** leave `>= 5 GB` free. Never let `estimated_disk_MB` come within 5 GB of free space.
+  Measure free space on the filesystem holding Docker's data-root
+  (`df -h $(docker info --format '{{.DockerRootDir}}')`), not on `/`: history is written into a
+  Docker volume, and on a current sandbox that is a separate data volume while `/` is a small OS
+  disk. Disk resizes independently of the instance -- growing the **data** volume is the fix when
+  the constraint is disk.
 - **Heap OOM (separate from host RAM):** the history heap is 2 GiB **on every instance
   size** - a bigger box does NOT raise it. So a combined-ticks fetch whose one-day buffer
   exceeds ~1300 MB OOMs on a 2xlarge just as on a medium. The fix is always to split the

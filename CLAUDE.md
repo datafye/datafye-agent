@@ -910,6 +910,93 @@ sudo ./install.sh --mode hosted --ami-cleanup
 /home/datafye/workspace/ # User workspace
 ```
 
+### Disk layout: two volumes, and the root size is not a free choice (DAT-178)
+
+The hosted AMI bakes **8 GB root (`/dev/xvda`) + 32 GB data (`/dev/sdb`)**, and accounts sets
+`datafye.accounts.aws.rumi.volume.size = 32` to match, so a provisioned sandbox is **8/32**.
+That is a default, not a ceiling: `Account.agentVolumeSize` raises the data volume at provision
+(it is applied as a floor over the config value), and `POST /sandbox/resize-disk` grows either
+volume in place on a live box. Both were already built; DAT-178 is what makes the data half of
+them act on something. The base Rumi
+Worker AMI mounts `/dev/sdb` at `/home/rumi`; the packer template simply declares the device
+in both `launch_block_device_mappings` and `ami_block_device_mappings`, and the mount comes
+free. Everything that grows lives on the data volume:
+
+| On the data volume | Via | Why |
+|---|---|---|
+| Docker's `data-root` | `/etc/docker/daemon.json` | holds `rumi-<ds>-history-shared`, i.e. **every tick and OHLC log**. This is the whole point. |
+| `/opt/datafye` | bind mount → `/home/rumi/datafye-opt` | agent, venv, docs, samples |
+| `/home/datafye` | bind mount → `/home/rumi/datafye-home` | the user workspace and its exports |
+
+Bind mounts, not relocation and not symlinks. Both paths appear in the docs, in the agent's
+own system prompt, in systemd units and in the CLI's foundry provisioning, and a symlink
+would additionally break `docker run -v` source resolution — which the foundry depends on. A
+bind mount is invisible to all of them. The entries go in `/etc/fstab`, not just a live
+`mount --bind`: dormancy stops and starts a sandbox routinely, so a mount that lasts only
+until the next boot is a mount that silently vanishes and takes `/opt/datafye/agent` with it.
+
+⚠️ **8 GB root is mandated by the provisioner, not chosen.** accounts calls the
+`AwsProvisioner.launchServiceInstance` overload that takes **no** `rootVolumeSize`, and that
+path computes `bootVolumeSize = rumiVolumeSize > 0 ? 8 : 32`. The moment accounts asks for a
+data volume it also asks EC2 for an 8 GiB root — and EC2 **rejects a root smaller than the
+AMI's snapshot**. Bake root at anything above 8 and every provision dies at `RunInstances`.
+There is no larger-root escape either: the provisioner explicitly throws on an explicit
+`rootVolumeSize <= 8`. Rumi Support hit this from the other direction (accounts asking 8
+against a 64 GB-root bake) and had every provision rejected.
+
+⚠️ **The AMI id and `datafye.accounts.aws.rumi.volume.size` must be DEPLOYED together.** They
+sit in the same `config.xml` and are both set in the repo, but the accounts deploy must not
+precede the AMI bake: `32` against a pre-DAT-178 AMI asks EC2 for an 8 GB root against a
+32 GB snapshot and **every provision is rejected**. Bake and bump the AMI id first, or in the
+same change.
+
+⚠️ **A 32 GB root cannot be combined with a data volume.** The instinct is to bake a roomier
+root for headroom and let accounts' request shrink it — EC2 does not work that way: a launch
+cannot ask for a root smaller than the AMI's snapshot, and accounts asks for exactly 8 the
+moment a data volume is present. Baking 32 does not give a 32 GB root, it gives a box that
+will not launch. The only way to a 32 GB root alongside a data volume is to change accounts
+to call an `AwsProvisioner` overload that takes `rootVolumeSize` — and even then the
+provisioner throws on any value `<= 8`, so 8 and "more than 8" are the only two shapes that
+exist.
+
+⚠️ **Existing sandboxes cannot be upgraded in place** — the layout is baked. They have to be
+re-provisioned, as was true for Support.
+
+`relocate_docker_data_root()` and the bind-mount helper are **idempotent, and that is
+load-bearing**: this installer re-runs on every auto-upgrade, on a live box, with a user's
+foundry running. The early return on an already-relocated daemon is what stops an upgrade
+from stopping Docker out from under running containers.
+
+`datafye-grow-data.service` grows the data filesystem on every boot. That is what turns
+accounts' `POST /sandbox/resize-disk` (`volume: "data"`, which does an EBS `ModifyVolume` and
+reboots) into usable bytes without anyone SSHing in. A raw fs on the device with no partition
+table, xfs or ext4, so it tries `xfs_growfs` on the mount point then `resize2fs` on both the
+nvme and the legacy device name.
+
+⚠️ **Attaching a disk to this box will break it, until an upstream fix lands.** Rumi's
+`AwsProvisioner.attachNewVolumeToServiceInstance` — the operator path for adding a volume,
+and the one you would use to bring an ST1/SC1 history volume or a restored snapshot onto a
+sandbox — finishes by running `scripts/mount_disk.sh`, whose last act is
+`sudo chown -R rumi:rumi /home/rumi`. On a Sutra or Support box that is a no-op; everything
+there already belongs to `rumi`. Here it is not: the agent runs as `User=datafye`, and
+`/home/rumi/datafye-home` **is** `/home/datafye`, so one recursive chown hands the agent its
+own home, workspace, npm prefix and cache owned by a different user. `mount_disk.sh` also
+forces the mount point to be *relative to* `/home/rumi` (an absolute path is rejected), so
+there is no mounting around it either. The proper fix is upstream — chown the mount point it
+just created, not the whole tree. Until then `datafye-fix-data-ownership.service` repairs it
+on the next boot, which on a sandbox is soon: dormancy stops and starts the box routinely.
+The unit is guarded by a `stat`, not an unconditional walk, so the normal case costs two
+syscalls.
+
+None of this runs without a data volume: every step is gated on `/home/rumi` being a
+mountpoint, so a laptop install or a standalone box keeps the old single-volume layout.
+
+**What this fixes, concretely.** A 128 GB data volume was provisioned onto a Datafye sandbox
+for a bulk minute-bar download and bought **exactly zero usable bytes**: it landed at
+`/home/rumi` owned by `rumi`, the `datafye` user could not write to it, and root — where
+Docker's data-root and therefore the entire store actually was — was untouched. The volume
+that grows has to be the volume the data is on.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |

@@ -282,8 +282,8 @@ detect_platform() {
 }
 
 PLATFORM=$(detect_platform)
-TOTAL_STEPS=11
-[ "$MODE" = "standalone" ] && TOTAL_STEPS=13
+TOTAL_STEPS=12
+[ "$MODE" = "standalone" ] && TOTAL_STEPS=14
 STEP=0
 
 next_step() { STEP=$((STEP + 1)); }
@@ -379,6 +379,101 @@ ok "Java: $(java -version 2>&1 | head -1)"
 ok "Maven: $(mvn --version 2>/dev/null | head -1)"
 ok "Git: $(git --version)"
 
+# ── Step: Data volume layout (DAT-178) ───────────────────────────
+#
+# The Rumi Worker base AMI mounts a second EBS volume (/dev/sdb) at
+# /home/rumi. The hosted AMI bake declares that volume; a box without one --
+# a manual install, a laptop, standalone mode -- simply has no mountpoint
+# there, and every step below no-ops so the old single-volume layout keeps
+# working unchanged.
+#
+# Why anything moves at all. On the single-volume layout root held the OS AND
+# Docker's data-root -- and Docker's data-root is where the foundry's
+# rumi-sip-history-shared volume lives, which is every tick and OHLC log the
+# history service writes. A tick download filling the OS disk is not a disk
+# problem, it is an outage: the box stops being able to log, and the agent
+# stops being able to write its own workspace.
+#
+# It is also what makes accounts' `POST /sandbox/resize-disk` with
+# volume=data mean anything here. A 128GB data volume was provisioned onto a
+# Datafye sandbox for a bulk minute-bar download and bought exactly zero
+# usable bytes: it landed at /home/rumi owned by `rumi`, the `datafye` user
+# could not write to it, and root -- where the store actually was -- was
+# untouched. The volume that grows has to be the volume the data is on.
+#
+# /opt/datafye and /home/datafye keep their documented paths and are BIND
+# MOUNTED onto the data volume rather than relocated. Both paths appear in
+# the docs, in the agent's own system prompt, in systemd units and in the
+# CLI's foundry provisioning; a symlink would additionally break `docker run
+# -v` source resolution, which the foundry depends on. A bind mount is
+# invisible to all of them.
+DATA_VOLUME_ROOT="/home/rumi"
+
+bind_onto_data_volume() {
+    local path="$1"
+    local target="$2"
+
+    if mountpoint -q "${path}" 2>/dev/null; then
+        ok "  ${path} already on the data volume"
+        return
+    fi
+
+    # Refuse to move a path out from under a RUNNING agent. This is the same
+    # hazard as `cp`-ing onto a script that is still executing, one level up:
+    # on the auto-upgrade path this installer is invoked by upgrade-check.sh,
+    # which lives in /opt/datafye/agent, and the agent's venv and source are
+    # under the same tree. Relocating it mid-run pulls the floor out.
+    #
+    # In practice the only box that reaches here with the service running is one
+    # where a data volume was attached to a PRE-DAT-178 AMI by hand -- exactly
+    # what happened when a 128GB volume was added to a live sandbox and bought
+    # nothing. Such a box cannot be converted in place; it has to be
+    # re-provisioned from a DAT-178 bake. Say so rather than half-doing it.
+    if [ -d "${path}" ] && [ -n "$(ls -A "${path}" 2>/dev/null)" ] \
+       && systemctl is-active --quiet datafye-agent.service 2>/dev/null; then
+        warn "  ${path} is in use by a running agent; leaving it on the root volume."
+        warn "  This box predates the split-volume AMI and cannot be converted in place."
+        warn "  Re-provision the sandbox to pick up the new layout."
+        return
+    fi
+
+    mkdir -p "${target}"
+    # Migrate whatever an earlier single-volume install left behind. This runs
+    # exactly once per path: once the bind mount is in place ${path} IS
+    # ${target}, so the mountpoint check above short-circuits every later
+    # upgrade before any copying can happen.
+    if [ -d "${path}" ] && [ -n "$(ls -A "${path}" 2>/dev/null)" ]; then
+        info "  migrating ${path} onto the data volume..."
+        if cp -a "${path}/." "${target}/"; then
+            rm -rf "${path:?}"/..?* "${path:?}"/.[!.]* "${path:?}"/* 2>/dev/null || true
+        else
+            warn "  could not migrate ${path}; leaving the single-volume layout in place"
+            return
+        fi
+    fi
+    mkdir -p "${path}"
+
+    # /etc/fstab, not just a live `mount --bind`. A sandbox is stopped and
+    # started routinely by dormancy, so a mount that lasts only until the next
+    # boot is a mount that silently vanishes -- and takes the agent's install
+    # dir with it.
+    if ! grep -qE "^[^#]*[[:space:]]${path}[[:space:]]" /etc/fstab 2>/dev/null; then
+        echo "${target} ${path} none bind 0 0" >> /etc/fstab
+    fi
+    mount --bind "${target}" "${path}"
+    ok "  ${path} -> ${target}"
+}
+
+next_step
+info "[${STEP}/${TOTAL_STEPS}] Data volume layout..."
+if mountpoint -q "${DATA_VOLUME_ROOT}" 2>/dev/null; then
+    bind_onto_data_volume /opt/datafye  "${DATA_VOLUME_ROOT}/datafye-opt"
+    bind_onto_data_volume /home/datafye "${DATA_VOLUME_ROOT}/datafye-home"
+    ok "Data volume: $(df -h "${DATA_VOLUME_ROOT}" | tail -1 | awk '{print $2" total, "$4" free"}')"
+else
+    warn "No separate data volume at ${DATA_VOLUME_ROOT}; using the single-volume layout"
+fi
+
 # ── Step: Install Docker (for Datafye environment containers) ────
 install_docker() {
     if command -v docker &> /dev/null; then
@@ -434,9 +529,58 @@ install_docker_compose() {
     ok "Docker Compose: $(docker compose version | head -1)"
 }
 
+# Docker's data-root carries the whole foundry: the Rumi and Solace images, the
+# containers, and -- the part that actually grows without bound -- the
+# rumi-sip-history-shared named volume holding every tick and OHLC log. On the
+# root volume that is a few GB of images plus an unbounded store sharing a disk
+# with the OS. Move it to the data volume.
+#
+# Idempotent by design, and that matters more than it looks: this installer
+# re-runs on every auto-upgrade, on a live box, with a user's foundry running.
+# The early return on an already-relocated daemon is what stops an upgrade from
+# stopping Docker out from under running containers.
+relocate_docker_data_root() {
+    local target="${DATA_VOLUME_ROOT}/docker"
+    if ! mountpoint -q "${DATA_VOLUME_ROOT}" 2>/dev/null; then
+        return
+    fi
+    if docker info 2>/dev/null | grep -q "Docker Root Dir: ${target}"; then
+        ok "Docker data-root already on ${target}"
+        return
+    fi
+    # Same "cannot convert in place" rule as the bind mounts above, and the
+    # order matters: the already-relocated check ran FIRST, so a normal upgrade
+    # of a DAT-178 box returns before reaching this and is never blocked. What
+    # reaches here with the agent running is a pre-DAT-178 box that had a data
+    # volume attached by hand -- and relocating the data-root means stopping
+    # Docker under whatever foundry containers that user has running.
+    if systemctl is-active --quiet datafye-agent.service 2>/dev/null; then
+        warn "Docker data-root left on the root volume: the agent is running and"
+        warn "this box predates the split-volume AMI. Re-provision to pick up the"
+        warn "new layout; stopping Docker here would kill a running foundry."
+        return
+    fi
+
+    info "Relocating Docker data-root to ${target}..."
+    systemctl stop docker docker.socket 2>/dev/null || true
+    mkdir -p "${target}" /etc/docker
+    # Migrate anything already under /var/lib/docker so baked images aren't
+    # orphaned, then clear the old dir to reclaim root space. The base Rumi
+    # Worker AMI ships no custom daemon.json, so a minimal one setting only
+    # data-root is safe to write wholesale.
+    if [ -d /var/lib/docker ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+        info "  migrating existing /var/lib/docker..."
+        cp -a /var/lib/docker/. "${target}/" && rm -rf /var/lib/docker/*
+    fi
+    printf '{\n  "data-root": "%s"\n}\n' "${target}" > /etc/docker/daemon.json
+    systemctl start docker 2>/dev/null || systemctl restart docker 2>/dev/null || true
+    ok "Docker data-root: $(docker info 2>/dev/null | grep -i 'docker root dir' | awk '{print $NF}')"
+}
+
 next_step
 info "[${STEP}/${TOTAL_STEPS}] Docker (for Datafye environment containers)..."
 install_docker
+relocate_docker_data_root
 install_docker_compose
 
 # ── Step: Create directories and user ────────────────────────────
@@ -557,6 +701,42 @@ else
 fi
 
 # ── Step: Install / validate Datafye CLI ─────────────────────────
+prune_old_cli_versions() {
+    local versions_dir="${CLI_BASE}/versions"
+    [ -d "${versions_dir}" ] || return 0
+
+    # Resolve `current` to a bundle name. If it is missing or dangling we cannot
+    # tell which version is live, so reclaim nothing -- deleting the wrong tree
+    # here would take the box's only CLI with it.
+    local keep_current=""
+    keep_current="$(basename "$(readlink -f "${CLI_BASE}/current" 2>/dev/null)" 2>/dev/null)" || true
+    if [ -z "${keep_current}" ] || [ ! -d "${versions_dir}/${keep_current}" ]; then
+        return 0
+    fi
+
+    # Newest bundle that is not the current one, by mtime.
+    local keep_previous=""
+    keep_previous="$(ls -1dt "${versions_dir}"/*/ 2>/dev/null \
+                     | sed 's|/$||; s|.*/||' \
+                     | grep -vFx "${keep_current}" \
+                     | head -1)" || true
+
+    local removed=0
+    local d b
+    for d in "${versions_dir}"/*/; do
+        [ -d "${d}" ] || continue
+        b="$(basename "${d}")"
+        [ "${b}" = "${keep_current}" ] && continue
+        [ -n "${keep_previous}" ] && [ "${b}" = "${keep_previous}" ] && continue
+        rm -rf "${d}"
+        removed=$((removed + 1))
+    done
+
+    if [ "${removed}" -gt 0 ]; then
+        ok "Reclaimed ${removed} superseded CLI version(s); kept ${keep_current}${keep_previous:+ and ${keep_previous}}"
+    fi
+}
+
 next_step
 if is_snapshot "$VERSION"; then
     # SNAPSHOT mode does NOT install or upgrade the Datafye CLI -- it uses
@@ -614,6 +794,25 @@ else
         exit 1
     fi
     ok "Datafye CLI: ${CLI_PATH} -> $(readlink -f "${CLI_PATH}")"
+
+    # ── Reclaim superseded CLI versions (DAT-178) ────────────────
+    # The CLI installer drops each version at ${CLI_BASE}/versions/<bundle>/ and
+    # never removes an old one, and neither did we. That is unbounded growth on
+    # the ROOT volume, which the split-volume layout makes small on purpose --
+    # and the Datafye CLI distribution is ~560MB per version, so an 8GB root
+    # fills after five or six upgrades. (Sutra has the identical structure and
+    # gets away with it only because the Rumi CLI is ~84MB, roughly seven times
+    # smaller, so its boxes die of old age first.)
+    #
+    # Keep TWO: the one `current` points at, and the newest of the rest. The
+    # spare is a deliberate escape hatch rather than caution -- CLI_PATH follows
+    # `current`, so a bad CLI release would otherwise leave the box with no
+    # working CLI and no way to fetch one.
+    #
+    # Ordered AFTER the install and its -x check, so nothing is reclaimed until
+    # the replacement is on disk and executable. The transient peak is three
+    # versions (~1.7GB), which an 8GB root carries comfortably.
+    prune_old_cli_versions
 fi
 
 # ── Pin Java 17 for the Datafye CLI, globally (DAT-116) ───────────
@@ -913,6 +1112,78 @@ EOF
 systemctl daemon-reload
 systemctl enable datafye-agent.service
 ok "Systemd service: datafye-agent.service"
+
+# ── Grow the data volume filesystem on every boot (DAT-178) ──────
+# Enlarging an EBS volume grows the DEVICE; the filesystem on it stays the old
+# size until something calls the grow. accounts' POST /sandbox/resize-disk
+# resizes the volume and reboots, so doing it here is what turns that API into
+# usable bytes without anyone SSHing in. Idempotent -- a no-op once the fs
+# already fills the device. The data volume is a raw filesystem directly on the
+# device (no partition table) and may be xfs or ext4, so try the mount-point
+# xfs grow first, then the device resize2fs under both the nvme and the legacy
+# name. Ordered before the agent and the foundry reconciler, both of which want
+# the space.
+cat > /etc/systemd/system/datafye-grow-data.service << EOF
+[Unit]
+Description=Grow the ${DATA_VOLUME_ROOT} filesystem to fill its data volume
+DefaultDependencies=no
+After=local-fs.target
+Before=datafye-agent.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'xfs_growfs ${DATA_VOLUME_ROOT} 2>/dev/null || resize2fs /dev/nvme1n1 2>/dev/null || resize2fs /dev/sdb 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable datafye-grow-data.service
+ok "Systemd service: datafye-grow-data.service (grows ${DATA_VOLUME_ROOT} on boot)"
+
+# ── Re-assert ownership of the bind-mounted trees (DAT-178) ──────
+# Defends against a specific, live hazard rather than a hypothetical one.
+# Rumi's own `attachNewVolumeToServiceInstance` -- the operator path for adding
+# a disk to an instance, and the one that would be used to bring an ST1/SC1
+# history volume or a restored snapshot onto this box -- finishes by running
+# scripts/mount_disk.sh, whose last act is:
+#
+#     sudo chown -R rumi:rumi /home/rumi
+#
+# On a Sutra or Rumi Support box that is a no-op: everything under /home/rumi
+# already belongs to `rumi`. Here it is not. The agent runs as `User=datafye`,
+# and /home/rumi/datafye-home IS /home/datafye -- so one recursive chown hands
+# the agent's own home, workspace, npm prefix and cache to a different user and
+# the agent can no longer write anything. Attaching a disk would break the box
+# it was attached to, which is the same shape of failure as the 128 GB volume
+# that mounted correctly and bought nothing.
+#
+# The proper fix is upstream: mount_disk.sh should chown the mount point it
+# just created, not the whole of /home/rumi. Until that lands, recover on the
+# next boot -- and a Datafye sandbox boots often, because dormancy stops and
+# starts it. Guarded by a stat rather than an unconditional walk, so the normal
+# case costs two syscalls and does not fight anything.
+cat > /etc/systemd/system/datafye-fix-data-ownership.service << EOF
+[Unit]
+Description=Re-assert ownership of the Datafye trees on the data volume
+After=local-fs.target datafye-grow-data.service
+Before=datafye-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'if [ -d /home/datafye ] && [ "\$(stat -c %%U /home/datafye)" != datafye ]; then echo "repairing /home/datafye ownership"; chown -R datafye:datafye /home/datafye; fi'
+ExecStart=/bin/sh -c 'if [ -d /opt/datafye ] && [ "\$(stat -c %%U /opt/datafye)" != root ]; then echo "repairing /opt/datafye ownership"; chown -R root:root /opt/datafye; fi'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable datafye-fix-data-ownership.service
+ok "Systemd service: datafye-fix-data-ownership.service (repairs a stray chown -R on ${DATA_VOLUME_ROOT})"
 
 # ── Write the foundry boot reconciler one-shot (DAT-199) ─────────
 # Installed in EVERY mode. Its predecessor (datafye-foundry-firstboot.service)
