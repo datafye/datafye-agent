@@ -60,27 +60,28 @@ async def run():
               denied(await main.deny_delegation(odd, None, None)))
 
     # ---- the wiring, against the real object -------------------------
-    opts = main.build_agent_options_for_test()
+    guards = main.guard_options()
 
     matched = set()
-    for m in (opts.hooks or {}).get("PreToolUse", []):
+    for m in (guards.get("hooks") or {}).get("PreToolUse", []):
         if main.deny_delegation in (getattr(m, "hooks", []) or []):
             matched.add(getattr(m, "matcher", None))
     for tool in main.DELEGATION_TOOLS:
         check(f"{tool} is hooked to the denial", tool in matched, str(sorted(matched)))
 
-    check("Read is still hooked to the size guard",
-          any(getattr(m, "matcher", None) == "Read"
-              and main.guard_oversized_read in (getattr(m, "hooks", []) or [])
-              for m in (opts.hooks or {}).get("PreToolUse", [])))
+    for matcher, fn in (("Read", main.guard_oversized_read),
+                        ("Bash", main.guard_shell_delegation)):
+        check(f"{matcher} is hooked to its guard",
+              any(getattr(m, "matcher", None) == matcher and fn in (getattr(m, "hooks", []) or [])
+                  for m in (guards.get("hooks") or {}).get("PreToolUse", [])))
 
     for tool in main.DISALLOWED_DELEGATION_TOOLS:
-        check(f"{tool} is also in disallowed_tools", tool in (opts.disallowed_tools or []))
+        check(f"{tool} is also in disallowed_tools", tool in (guards.get("disallowed_tools") or []))
 
     # The deny list is deliberately narrower than the hook list: the CLI warns
     # once per turn for a rule naming a tool it does not know.
     check("the deny list carries no name the CLI would warn about",
-          "RunWorkflow" not in (opts.disallowed_tools or []))
+          "RunWorkflow" not in (guards.get("disallowed_tools") or []))
     check("but RunWorkflow is still hooked, which defends a rename",
           "RunWorkflow" in main.DELEGATION_TOOLS)
 
@@ -93,13 +94,44 @@ async def run():
     # THIS session, so the scheduled turn inherits the prompt.
     check("CronCreate is deliberately NOT banned", "CronCreate" not in main.DELEGATION_TOOLS)
 
-    # The real turn and this test must share ONE definition, not two that
-    # happen to agree today.
-    src_all = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py")).read()
-    check("the real construction uses the same hook definition the test does",
-          src_all.count("hooks=pre_tool_use_hooks()") >= 2)
+    # The turn spreads guard_options() into ClaudeAgentOptions, so constructing
+    # one here with the same spread proves the SDK accepts the shape the turn
+    # ships -- rather than grepping for a string, which is what this file exists
+    # to avoid and which the previous version of this check did anyway.
+    from claude_agent_sdk import ClaudeAgentOptions
+    built = ClaudeAgentOptions(model="x", **main.guard_options())
+    check("the SDK accepts the guard options the turn ships",
+          built.disallowed_tools == guards.get("disallowed_tools")
+          and built.hooks == guards.get("hooks")
+          and built.max_buffer_size == guards.get("max_buffer_size"))
 
-    src = src_all
+    # ---- the shell route the tool deny list cannot reach ------------
+    for cmd in ("claude -p 'go'", "./claude -p x", "/home/datafye/.local/bin/claude -p x",
+                "FOO=1 claude -p x", "ls && claude -p x", "sudo claude -p x"):
+        check(f"shell delegation denied: {cmd}",
+              denied(await main.guard_shell_delegation({"tool_input": {"command": cmd}}, None, None)))
+    # Fail-OPEN and narrow: this runs before EVERY Bash call, so a false
+    # positive costs far more than the guard protects.
+    for cmd in ("grep claude /var/log/app.log", "cat claude.log", "echo claude",
+                "ls /home/datafye/.local/bin", "python3 -c 'print(1)'"):
+        check(f"ordinary command allowed: {cmd}",
+              not denied(await main.guard_shell_delegation({"tool_input": {"command": cmd}}, None, None)))
+    for odd in ({}, {"tool_input": {}}, {"tool_input": {"command": None}}):
+        check(f"fails open on {odd}",
+              not denied(await main.guard_shell_delegation(odd, None, None)))
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py")).read()
+
+    # The one check here that IS a source check, and why. Everything above
+    # inspects objects; this asserts the turn actually spreads guard_options()
+    # into its ClaudeAgentOptions, which cannot be inspected without standing up
+    # a whole turn. It is meaningful now only because the string appears in
+    # exactly ONE place -- the real construction. The earlier version counted
+    # two occurrences including a copy in this file, so a comment quoting the
+    # string satisfied it while the turn went unwired.
+    check("the turn spreads the shared guard options",
+          src.count("**guard_options()") == 1)
+
     allowlist = src.split("INTERNAL_TOOLS = [")[1].split("\n]")[0]
     entries = "".join(ln.split("#")[0] for ln in allowlist.split("\n"))
     check("Task is still absent from the allowlist itself", '"Task"' not in entries)
