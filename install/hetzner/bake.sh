@@ -31,6 +31,12 @@ if [ "${OS_UPGRADE:-false}" = "true" ]; then
     dnf upgrade -y
 fi
 
+# The installer creates datafye as UID 1000, but on the service image that UID is already the rumi user, so
+# `useradd -u 1000` fails. Nothing depends on the number, and the installer skips useradd for an existing user.
+if ! id -u datafye &>/dev/null; then
+    useradd -m -d /home/datafye -s /bin/bash datafye
+fi
+
 echo "Downloading the published installer for v${AGENT_VERSION}..."
 curl -fsSL "https://downloads.n5corp.com/datafye/agent/${AGENT_VERSION}/install.sh" -o /var/tmp/install.sh
 chmod +x /var/tmp/install.sh
@@ -38,5 +44,16 @@ chmod +x /var/tmp/install.sh
 echo "Running the installer (--mode hosted --ami-cleanup)..."
 /var/tmp/install.sh --mode hosted --ami-cleanup --version "${AGENT_VERSION}"
 rm -f /var/tmp/install.sh
+
+# The provisioner snapshots the live disk, so quiesce what writes to it. Docker's containerd keeps an
+# open bolt database; a snapshot taken mid-write yields a sandbox where containers will not start.
+echo "Stopping container runtimes before the snapshot..."
+systemctl stop docker.socket docker containerd 2>/dev/null || true
+sync; sync
+
+# Every sibling Hetzner bake ends here: without it the snapshot carries this box's instance id and
+# semaphores, and firstboot.sh never runs again on the boxes launched from it.
+echo "Resetting cloud-init so instances launched from this image re-run their first boot..."
+cloud-init clean --logs || true
 
 echo "Datafye agent v${AGENT_VERSION} baked."
