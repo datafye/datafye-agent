@@ -20,9 +20,12 @@ if [ -z "${AGENT_VERSION:-}" ]; then
     echo "AGENT_VERSION must be set to a published Datafye agent release (e.g. AGENT_VERSION=2.0.52)" >&2
     exit 1
 fi
-case "$AGENT_VERSION" in
-    *SNAPSHOT*) echo "A SNAPSHOT needs the private repos; bake a published release instead" >&2; exit 1 ;;
-esac
+# 'latest' is a real published path, so it would fail ten minutes into the bake rather than here -- and
+# whatever string is passed is also what the snapshot is labelled with, which imageMinVersion then compares.
+if ! [[ "$AGENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "AGENT_VERSION must be an exact published release (X.Y.Z), not '$AGENT_VERSION'" >&2
+    exit 1
+fi
 
 cloud-init status --wait || true
 
@@ -45,11 +48,33 @@ echo "Running the installer (--mode hosted --ami-cleanup)..."
 /var/tmp/install.sh --mode hosted --ami-cleanup --version "${AGENT_VERSION}"
 rm -f /var/tmp/install.sh
 
-# The provisioner snapshots the live disk, so quiesce what writes to it. Docker's containerd keeps an
-# open bolt database; a snapshot taken mid-write yields a sandbox where containers will not start.
-echo "Stopping container runtimes before the snapshot..."
+# The provisioner snapshots the live disk, so quiesce everything that writes to it.
+#
+# crond first: the installer leaves an every-minute auto-upgrade job behind, and baking anything other than
+# the current `latest` (a re-bake, or a deliberately older pin) means its first tick decides the box is out
+# of date and runs the NEWEST installer over the disk being snapshotted -- restarting docker and rewriting
+# the tree underneath us. The cron FILE stays; boxes launched from this image need it.
+echo "Stopping cron and the container runtimes before the snapshot..."
+systemctl stop crond 2>/dev/null || true
+# Docker's containerd keeps an open bolt database; a snapshot taken mid-write yields a sandbox whose
+# containers will not start. A runtime that refuses to stop is exactly the case this guards against, so it
+# fails the bake rather than snapshotting it silently.
 systemctl stop docker.socket docker containerd 2>/dev/null || true
+for unit in docker containerd; do
+    if systemctl is-active --quiet "$unit"; then
+        echo "$unit is still running; refusing to snapshot a live container runtime" >&2
+        exit 1
+    fi
+done
 sync; sync
+
+# These bake boxes have a history of files that were valid at bake time coming back empty on the snapshot,
+# so assert what matters rather than ship a silently-broken image.
+echo "Verifying the installed agent..."
+if ! systemctl is-enabled --quiet datafye-agent.service; then
+    echo "datafye-agent.service is not enabled; the image would boot without an agent" >&2
+    exit 1
+fi
 
 # Every sibling Hetzner bake ends here: without it the snapshot carries this box's instance id and
 # semaphores, and firstboot.sh never runs again on the boxes launched from it.
