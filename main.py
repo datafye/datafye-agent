@@ -483,13 +483,39 @@ def _credential_env_seed() -> dict:
     }
 
 
+# The LLM metering gateway (DAT-295). A hosted box is told the gateway's URL in its
+# accounts-signed bootstrap token (claim `llm_gateway_url`) and its "Anthropic key"
+# is then a per-user gateway token. The URL is taken ONLY from that signed claim,
+# never from the unauthenticated /v1/credentials/update push: whoever sets it
+# receives every conversation. The SDK subprocess and the direct sidecar calls
+# below all follow ANTHROPIC_BASE_URL, so setting it moves every model call.
+_DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
+# Whatever the process started with (a local-dev override, usually nothing), so a
+# bootstrap WITHOUT the claim puts the box back on it rather than on a stale gateway.
+_BASE_URL_AT_START = os.environ.get("ANTHROPIC_BASE_URL")
+
+
+def _anthropic_base() -> str:
+    return (os.environ.get("ANTHROPIC_BASE_URL") or _DEFAULT_ANTHROPIC_BASE).rstrip("/")
+
+
+def _apply_gateway_url(url: Optional[str]) -> None:
+    if url:
+        os.environ["ANTHROPIC_BASE_URL"] = url.rstrip("/")
+        logger.info("Model calls go through the metering gateway at %s", os.environ["ANTHROPIC_BASE_URL"])
+    elif _BASE_URL_AT_START:
+        os.environ["ANTHROPIC_BASE_URL"] = _BASE_URL_AT_START
+    else:
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+
+
 def _validate_anthropic_key(key: str) -> str:
     """Quick liveness check of an Anthropic API key against the Anthropic
     API. Returns "ok", "invalid", or "unvalidated" (the network couldn't
     confirm — the caller treats that as a soft pass)."""
     try:
         resp = httpx.get(
-            "https://api.anthropic.com/v1/models",
+            f"{_anthropic_base()}/v1/models",
             headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
             timeout=5.0,
         )
@@ -667,7 +693,7 @@ async def generate_title(first_message: str, usage_sink: Optional[list] = None) 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                f"{_anthropic_base()}/v1/messages",
                 headers={
                     "x-api-key": key,
                     "anthropic-version": "2023-06-01",
@@ -737,7 +763,7 @@ async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str
                  f"Assistant: {(assistant_text or '')[:1500]}")
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                f"{_anthropic_base()}/v1/messages",
                 headers={
                     "x-api-key": key,
                     "anthropic-version": "2023-06-01",
@@ -846,7 +872,7 @@ async def classify_environment_intent(transcript: str,
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                f"{_anthropic_base()}/v1/messages",
                 headers={
                     "x-api-key": key,
                     "anthropic-version": "2023-06-01",
@@ -924,7 +950,7 @@ async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = Non
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                f"{_anthropic_base()}/v1/messages",
                 headers={
                     "x-api-key": key,
                     "anthropic-version": "2023-06-01",
@@ -2587,6 +2613,8 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
         logger.error("Bootstrap failed opening credentials store: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Could not open credentials store: {e}")
     broker.configure(credentials)
+    # Before the key: validating it must go to wherever it will be used.
+    _apply_gateway_url(claims.get("llm_gateway_url"))
     _apply_anthropic_key()
     _apply_credentials_env()
     _bootstrapped = True
