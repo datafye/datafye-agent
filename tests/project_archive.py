@@ -383,6 +383,76 @@ check("and the NEXT export carries it, so a second hop cannot lose it",
       any(n.endswith("CLAUDE.imported.md") for n in zipfile.ZipFile(_roundtrip).namelist()),
       zipfile.ZipFile(_roundtrip).namelist())
 
+print("== an UNREADABLE live file must not blow up the import ==")
+# ⚠️ Round 5 made _has_real_content return True for an unreadable file (right: when in doubt the
+# file is precious) and the very next line called read_bytes() on it, which threw straight out of
+# the import - a 500, staging destroyed, files already moved left live. A partial restore that
+# failed identically on every retry, which is WORSE than the overwrite the branch was preventing.
+shutil.rmtree(memory.USER_DIR, ignore_errors=True)
+Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
+memory.ensure_user_memory()
+Path(memory.USER_DIR, "MEMORY.md").write_text("# User Memory\n- [d](d.md) - donor\n")
+Path(memory.USER_DIR, "d.md").write_text("d\n")
+Path(memory.USER_CLAUDE_MD).write_text("DONOR\n")
+_unread_arch = _TMP / "unreadable.zip"
+pa.export_user_memory(_unread_arch)
+
+shutil.rmtree(memory.USER_DIR, ignore_errors=True)
+memory.ensure_user_memory()
+_live = Path(memory.USER_CLAUDE_MD)
+_live.write_text("PRECIOUS LOCAL NOTES\n")
+os.chmod(_live, 0o000)
+try:
+    pa.import_user_memory(_unread_arch.read_bytes())
+    check("an unreadable live CLAUDE.md does not raise", True)
+except Exception as e:
+    check("an unreadable live CLAUDE.md does not raise", False, f"{type(e).__name__}: {e}")
+finally:
+    os.chmod(_live, 0o644)
+check("and the precious local file is untouched",
+      _live.read_text() == "PRECIOUS LOCAL NOTES\n", _live.read_text())
+check("while the archive's copy is kept to reconcile",
+      any(Path(memory.USER_DIR).glob("CLAUDE.imported*")),
+      list(Path(memory.USER_DIR).iterdir()))
+
+print("== two unreconciled conflict copies must not overwrite each other ==")
+# The conflict copy now lives in memory/, so it is EXPORTED - a restore carries box A's
+# unreconciled notes into box B, where box B's own must not be discarded to make room.
+Path(memory.USER_DIR, "CLAUDE.imported.md").write_text("BOX B unreconciled\n")
+_a = _TMP / "boxa.zip"
+_prev = Path(memory.USER_DIR, "CLAUDE.imported.md").read_text()
+with zipfile.ZipFile(_a, "w") as z:
+    z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1, "kind": "datafye-user-memory"}))
+    z.writestr(pa._MEMORY_PREFIX + "memory/CLAUDE.imported.md", "BOX A unreconciled\n")
+pa.import_user_memory(_a.read_bytes())
+_kept = {p.read_text().strip() for p in Path(memory.USER_DIR).glob("CLAUDE.imported*")}
+check("box B's copy survives", "BOX B unreconciled" in _kept, _kept)
+check("and box A's arrives beside it", "BOX A unreconciled" in _kept, _kept)
+
+print("== a second import does not file under a section the user added ==")
+shutil.rmtree(memory.USER_DIR, ignore_errors=True)
+memory.ensure_user_memory()
+_idx = Path(memory.USER_DIR, "MEMORY.md")
+_idx.write_text("# User Memory\n- [live](live.md) - mine\n")
+
+
+def _donor(name, path):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1, "kind": "datafye-user-memory"}))
+        z.writestr(pa._MEMORY_PREFIX + "memory/MEMORY.md",
+                   f"# User Memory\n- [{name}]({name}.md) - imported\n")
+        z.writestr(pa._MEMORY_PREFIX + f"memory/{name}.md", "x\n")
+    return path
+
+
+pa.import_user_memory(_donor("first", _TMP / "d1.zip").read_bytes())
+_idx.write_text(_idx.read_text() + "\n## Trading\n- [t](t.md) - my trading notes\n")
+pa.import_user_memory(_donor("second", _TMP / "d2.zip").read_bytes())
+_body = _idx.read_text()
+_after_trading = _body.split("## Trading", 1)[1].split("## Imported")[0]
+check("the second import is not filed under the user's own section",
+      "second.md" not in _after_trading, _body)
+
 print("== a memory import that restored nothing is not a success ==")
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, "w") as z:

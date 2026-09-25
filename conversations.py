@@ -306,9 +306,11 @@ _orphan_warned: dict = {}
 
 def list_conversations() -> list:
     """All projects, metadata only, most-recently-updated first."""
+    # ⚠️ BEFORE the early return. A box with no projects yet is precisely the restore TARGET, and
+    # it is the one where an orphaned .import-memory-* dir is most likely and was never reported.
+    note_orphan_staging_dirs()
     if not _BASE_DIR.exists():
         return []
-    note_orphan_staging_dirs()      # cheap, and this is the one call that already walks the tree
     out = []
     for child in _BASE_DIR.iterdir():
         if not child.is_dir():

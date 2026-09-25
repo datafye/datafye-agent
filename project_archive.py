@@ -100,21 +100,33 @@ def _add_member(z: zipfile.ZipFile, absolute: Path, arcname: str, partial: list)
     finding was about; pretending a stream can be un-committed is not available.
     """
     try:
-        info = zipfile.ZipInfo.from_file(absolute, arcname)
+        # strict_timestamps=False clamps BOTH ends of what a zip can represent. Clamping only the
+        # pre-1980 side left a post-2107 mtime to reach the header writer as a struct.error, which
+        # is not an OSError and killed the entire export.
+        info = zipfile.ZipInfo.from_file(absolute, arcname, strict_timestamps=False)
     except OSError as e:
         logger.warning("Skipping %s during export: %s", absolute, e)
         return False
-    if info.date_time[0] < 1980:
-        # A zip cannot represent a pre-1980 mtime, and the writer raises rather than rounding.
-        info.date_time = (1980, 1, 1, 0, 0, 0)
     # A ZipInfo carries its OWN compress_type, defaulting to STORED and overriding the one the
     # ZipFile was opened with, so this line is what keeps the archive compressed at all.
     info.compress_type = zipfile.ZIP_DEFLATED
     try:
-        with absolute.open("rb") as src, z.open(info, "w") as dst:
+        src = absolute.open("rb")
+    except OSError as e:
+        # Never opened, so no member began: this is a clean SKIP, not a partial. Reporting it as
+        # partial named a member the archive does not contain, while `note` called it skipped in
+        # the same manifest.
+        logger.warning("Skipping %s during export: %s", absolute, e)
+        return False
+    try:
+        with src, z.open(info, "w") as dst:
             shutil.copyfileobj(src, dst, 1024 * 1024)
         return True
-    except (OSError, ValueError) as e:
+    except Exception as e:
+        # Anything from here on has already begun the member and it is committed on close, so the
+        # archive holds a short one and must say so. Deliberately broad: a post-2107 timestamp
+        # raises struct.error and a member crossing the ZIP64 limit raises RuntimeError, and
+        # neither is an OSError - both used to escape and kill the whole export.
         logger.warning("Could not finish archiving %s: %s", absolute, e)
         partial.append(arcname)
         return False
@@ -355,6 +367,33 @@ def _index_key(line: str) -> str:
     return line[start + 2:end].strip() if end > start else line.strip()
 
 
+def _last_section(body: str) -> str:
+    """The final `##` heading in a markdown body, or "" when there is none."""
+    last = ""
+    for line in body.splitlines():
+        if line.startswith("## "):
+            last = line.strip()
+    return last
+
+
+def _keep_beside(source: Path, preferred: Path) -> Path:
+    """Move `source` to `preferred`, or to the next free numbered name if that is taken.
+
+    Every caller is holding something UNRECONCILED - a copy the user still has to look at - so
+    overwriting one with another is the loss these paths exist to prevent, merely postponed.
+    """
+    preferred.parent.mkdir(parents=True, exist_ok=True)
+    target = preferred
+    n = 2
+    while target.exists():
+        target = preferred.with_name(f"{preferred.stem}.{n}{preferred.suffix}")
+        n += 1
+        if n > 100:                       # absurd; stop rather than spin
+            break
+    shutil.move(str(source), str(target))
+    return target
+
+
 def _merge_index(live: Path, incoming: Path) -> bool:
     """Union the pointer lines of two MEMORY.md indexes, keeping the live file's own order.
 
@@ -383,7 +422,11 @@ def _merge_index(live: Path, incoming: Path) -> bool:
         # standing false statement rather than untidiness. Carrying the archive's own headings
         # across would mean merging two section structures; saying where these came from is
         # honest, and the user can file them properly.
-        if "## Imported" not in body:
+        # ⚠️ Whether the tail is already that section, not whether the file mentions it anywhere.
+        # Checking the whole body suppressed the heading on every import after the first while
+        # still appending at EOF, so once the user added a section below it the entries filed under
+        # THAT - the exact misfiling this is here to stop, returning on the second import.
+        if _last_section(body) != "## Imported":
             body += "\n## Imported\n"
         live.write_text(body + "\n".join(added) + "\n")
     return True
@@ -587,22 +630,36 @@ def import_user_memory(archive_bytes: bytes) -> dict:
                 else:
                     # Could not read the live index, so nothing was merged. Keep the archive's copy
                     # rather than dropping it and reporting a restore that did not happen.
-                    shutil.move(str(absolute), str(final.with_name("MEMORY.imported.md")))
+                    _keep_beside(absolute, Path(memory.USER_DIR) / "MEMORY.imported.md")
             elif final == Path(memory.USER_CLAUDE_MD) and final.is_file() and had_claude:
                 # Prose, so there is no safe line-wise merge. The live file wins and the archive's
-                # copy lands beside it for the user to reconcile, because "merge, not replace" has
-                # to be true of the file the prompt reads on every single turn.
-                if final.read_bytes() != absolute.read_bytes():
-                    # ⚠️ Inside the memory dir, NOT beside it at the state root. export_user_memory
-                    # archives <state>/memory/** plus <state>/CLAUDE.md and nothing else, so a
-                    # conflict copy written to the state root is invisible to the next export and
-                    # the notes are lost on the following hop - which is precisely the harm this
-                    # branch exists to stop. In memory/ it travels with everything else.
-                    kept = Path(memory.USER_DIR) / "CLAUDE.imported.md"
-                    kept.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(absolute), str(kept))
-                else:
+                # copy is kept for the user to reconcile, because "merge, not replace" has to be
+                # true of the file the prompt reads on every single turn.
+                #
+                # ⚠️ The comparison must not RAISE. had_claude is deliberately true for a live file
+                # we could not read, and read_bytes() on that file then threw straight out of the
+                # import: a 500, staging destroyed, and the files already moved this pass left
+                # live - a partial restore that failed identically on every retry, which is worse
+                # than the overwrite this branch was added to prevent. Unreadable means we cannot
+                # compare, so it is treated as a conflict and both copies survive.
+                same = False
+                try:
+                    same = final.read_bytes() == absolute.read_bytes()
+                except OSError as e:
+                    logger.warning("Could not compare %s with the archive's copy: %s", final, e)
+                if same:
                     absolute.unlink(missing_ok=True)
+                else:
+                    # Inside memory/, NOT beside it at the state root: export_user_memory archives
+                    # memory/** plus the user CLAUDE.md and nothing else, so a conflict copy at the
+                    # root is invisible to the next export and the notes die on the following hop.
+                    _keep_beside(absolute, Path(memory.USER_DIR) / "CLAUDE.imported.md")
+            elif ".imported" in final.name and final.is_file():
+                # ⚠️ Now that the conflict copy lives in memory/, it is EXPORTED - so a restore
+                # carries box A's unreconciled notes into box B and the generic move below would
+                # overwrite box B's own, which is the same loss one level removed. Neither is
+                # reconciled yet, so neither may be discarded.
+                _keep_beside(absolute, final)
             else:
                 shutil.move(str(absolute), str(final))
             merged += 1
