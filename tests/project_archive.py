@@ -372,8 +372,16 @@ check("and the archive's own line is there too", "old.md" in index, index)
 check("the live user CLAUDE.md is not overwritten",
       Path(memory.USER_CLAUDE_MD).read_text() == "LIVE user CLAUDE\n",
       Path(memory.USER_CLAUDE_MD).read_text())
-check("the archive's CLAUDE.md is kept beside it to reconcile",
-      Path(mem_dir.parent, "CLAUDE.imported.md").exists())
+# ⚠️ Inside memory/, not beside it at the state root. export_user_memory archives memory/** plus
+# the user CLAUDE.md and nothing else, so a conflict copy at the root is invisible to the NEXT
+# export and the notes vanish on the following hop - the exact harm this branch exists to prevent.
+kept = Path(mem_dir, "CLAUDE.imported.md")
+check("the archive's CLAUDE.md is kept to reconcile", kept.exists(), list(mem_dir.iterdir()))
+_roundtrip = _TMP / "again.zip"
+pa.export_user_memory(_roundtrip)
+check("and the NEXT export carries it, so a second hop cannot lose it",
+      any(n.endswith("CLAUDE.imported.md") for n in zipfile.ZipFile(_roundtrip).namelist()),
+      zipfile.ZipFile(_roundtrip).namelist())
 
 print("== a memory import that restored nothing is not a success ==")
 buf = io.BytesIO()

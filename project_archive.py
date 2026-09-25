@@ -80,43 +80,44 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _add_member(z: zipfile.ZipFile, absolute: Path, arcname: str) -> bool:
-    """Add one file to the archive, or skip it cleanly. True when the member really landed.
+def _add_member(z: zipfile.ZipFile, absolute: Path, arcname: str, partial: list) -> bool:
+    """Add one file to the archive. True when a COMPLETE member landed.
 
-    ⚠️ `ZipFile.write` is NOT all-or-nothing. If the read fails part way it has already begun the
-    member, and the entry is COMMITTED when the writing handle closes during unwind - so catching
-    OSError around `write` left a truncated member in the archive while the counter stayed behind,
-    and the manifest then under-reported what the file actually contains. Measured: a member
-    present at 16384 bytes with the manifest claiming zero.
+    ⚠️ `ZipFile.write` is not all-or-nothing: a read failure part way has already begun the member,
+    and it is committed when the writing handle closes, so catching OSError around it left a
+    truncated member in the archive while the counter stayed behind and the manifest under-reported
+    what the file holds.
 
-    Reading the bytes ourselves means a failure happens BEFORE anything is opened in the archive,
-    which is the only point at which skipping is really a skip.
+    Round 4 "fixed" that by reading each file whole and calling writestr, which introduced two
+    regressions of its own, both measured: a bare ZipInfo carries no `external_attr`, so every
+    member came out 0600 and an exported executable unzipped non-executable; and a single large
+    file was buffered entirely in the agent process where it used to stream in chunks, which is an
+    OOM on these boxes for one file under the total ceiling.
+
+    So: metadata from `ZipInfo.from_file` (mode and mtime preserved), content STREAMED, and a
+    member that fails mid-write is named in the manifest's `partial_files` rather than quietly
+    miscounted. The archive declares what it could not finish, which is the property the original
+    finding was about; pretending a stream can be un-committed is not available.
     """
     try:
-        data = absolute.read_bytes()
+        info = zipfile.ZipInfo.from_file(absolute, arcname)
     except OSError as e:
         logger.warning("Skipping %s during export: %s", absolute, e)
         return False
+    if info.date_time[0] < 1980:
+        # A zip cannot represent a pre-1980 mtime, and the writer raises rather than rounding.
+        info.date_time = (1980, 1, 1, 0, 0, 0)
+    # A ZipInfo carries its OWN compress_type, defaulting to STORED and overriding the one the
+    # ZipFile was opened with, so this line is what keeps the archive compressed at all.
+    info.compress_type = zipfile.ZIP_DEFLATED
     try:
-        info = zipfile.ZipInfo(arcname, date_time=_zip_time(absolute))
-        # ⚠️ A ZipInfo carries its OWN compress_type, defaulting to STORED, and it overrides the
-        # one the ZipFile was opened with. Without this line the switch from write() to writestr()
-        # would quietly stop compressing every archive the agent produces.
-        info.compress_type = zipfile.ZIP_DEFLATED
-        z.writestr(info, data)
+        with absolute.open("rb") as src, z.open(info, "w") as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
         return True
     except (OSError, ValueError) as e:
-        logger.warning("Could not archive %s: %s", absolute, e)
+        logger.warning("Could not finish archiving %s: %s", absolute, e)
+        partial.append(arcname)
         return False
-
-
-def _zip_time(path: Path):
-    """The member's timestamp, falling back to a fixed epoch when the file cannot be stat'd."""
-    import time as _time
-    try:
-        return _time.localtime(path.stat().st_mtime)[:6]
-    except OSError:
-        return (1980, 1, 1, 0, 0, 0)
 
 
 def _require_safe_project_id(conversation_id: str) -> str:
@@ -187,11 +188,14 @@ def _write_zip(out_path: Path, root: Path, prefix: str, manifest: dict) -> dict:
     manifest = dict(manifest)
     manifest["raw_bytes"] = raw_bytes
     written = 0
+    partial = []
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for absolute, relative in entries:
-            if _add_member(z, absolute, prefix + relative.as_posix()):
+            if _add_member(z, absolute, prefix + relative.as_posix(), partial):
                 written += 1
         manifest["files"] = written
+        if partial:
+            manifest["partial_files"] = partial
         if written != len(entries):
             manifest["note"] = "some files could not be read and were skipped; see the agent log"
         # ⚠️ Written LAST, and that is the whole point. Writing it first meant the count inside the
@@ -275,11 +279,15 @@ def export_user_memory(out_path: Path) -> dict:
             f"{MAX_EXPORT_BYTES // (1024 * 1024)} MB an export may carry")
 
     written = 0
+    partial = []
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for absolute in entries:
-            if _add_member(z, absolute, _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix()):
+            if _add_member(z, absolute,
+                           _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix(), partial):
                 written += 1
         manifest["files"] = written
+        if partial:
+            manifest["partial_files"] = partial
         if written != len(entries):
             manifest["note"] = "some files could not be read and were skipped; see the agent log"
         z.writestr(_MANIFEST_NAME, json.dumps(manifest, indent=2))
@@ -300,11 +308,19 @@ def _iter_staged(root: Path):
 
 
 def _has_real_content(path: Path, template: str) -> bool:
-    """Whether `path` holds anything beyond the scaffold the agent writes on startup."""
+    """Whether `path` holds anything beyond the scaffold the agent writes on startup.
+
+    ⚠️ An UNREADABLE file counts as real content. Returning False there would fold "I could not
+    look" into "there is nothing worth keeping", and the caller acts on that by overwriting - so a
+    live CLAUDE.md that merely failed to decode would be replaced outright, with no copy kept
+    beside it. When in doubt the file is precious, because the cost of being wrong is asymmetric.
+    """
+    if not path.is_file():
+        return False
     try:
         body = path.read_text()
     except (OSError, UnicodeDecodeError):
-        return False
+        return True
     return bool(body.strip()) and body.strip() != template.strip()
 
 
@@ -314,10 +330,16 @@ def _index_has_entries(index: Path) -> bool:
     The agent already treats a header-only index as empty when it builds the prompt block, so this
     is the same reading rather than a new one.
     """
+    if not index.is_file():
+        return False
     try:
         return any(line.lstrip().startswith("- ") for line in index.read_text().splitlines())
     except (OSError, UnicodeDecodeError):
-        return False
+        # Unreadable, so treat it as having entries: that routes the restore through _merge_index,
+        # which itself refuses to touch an index it cannot read and keeps the archive's copy as
+        # MEMORY.imported.md. Returning False here would bypass the guard this round added and
+        # overwrite the live index wholesale, stranding every topic file it pointed at.
+        return True
 
 
 def _index_key(line: str) -> str:
@@ -355,6 +377,14 @@ def _merge_index(live: Path, incoming: Path) -> bool:
     if added:
         if body and not body.endswith("\n"):
             body += "\n"
+        # ⚠️ Under a heading of their own. Appending bare pointer lines files them under whatever
+        # `##` section the live file happens to end with, so an archive's Trading entries arrive
+        # under Local - and this block is injected into every prompt, so a wrong heading is a
+        # standing false statement rather than untidiness. Carrying the archive's own headings
+        # across would mean merging two section structures; saying where these came from is
+        # honest, and the user can file them properly.
+        if "## Imported" not in body:
+            body += "\n## Imported\n"
         live.write_text(body + "\n".join(added) + "\n")
     return True
 
@@ -563,7 +593,14 @@ def import_user_memory(archive_bytes: bytes) -> dict:
                 # copy lands beside it for the user to reconcile, because "merge, not replace" has
                 # to be true of the file the prompt reads on every single turn.
                 if final.read_bytes() != absolute.read_bytes():
-                    shutil.move(str(absolute), str(final.with_name("CLAUDE.imported.md")))
+                    # ⚠️ Inside the memory dir, NOT beside it at the state root. export_user_memory
+                    # archives <state>/memory/** plus <state>/CLAUDE.md and nothing else, so a
+                    # conflict copy written to the state root is invisible to the next export and
+                    # the notes are lost on the following hop - which is precisely the harm this
+                    # branch exists to stop. In memory/ it travels with everything else.
+                    kept = Path(memory.USER_DIR) / "CLAUDE.imported.md"
+                    kept.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(absolute), str(kept))
                 else:
                     absolute.unlink(missing_ok=True)
             else:

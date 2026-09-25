@@ -251,6 +251,31 @@ def meta(record: dict) -> dict:
     }
 
 
+def note_orphan_staging_dirs() -> None:
+    """Sweep BOTH places an import stages into, and prune the warned map.
+
+    ⚠️ The project listing scans <state>/projects, so hooking the warning there covered
+    `.import-<id>.tmp` and missed `.import-memory-*` entirely - import_user_memory stages into
+    <state>, one level up, which the listing never walks. A warning that silently covers half the
+    cases is the shape of gap this whole round keeps turning up.
+    """
+    from paths import STATE_DIR                      # local: avoids a module-level import cycle
+    seen = set()
+    for base in (_BASE_DIR, Path(STATE_DIR)):
+        try:
+            children = list(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_dir() and child.name.startswith(".import"):
+                seen.add(child.name)
+                _note_orphan_staging(child)
+    # Entries whose directory has gone would otherwise accumulate for the life of the process, and
+    # a reused name would find its first warning already suppressed.
+    for name in [n for n in _orphan_warned if n not in seen]:
+        _orphan_warned.pop(name, None)
+
+
 def _note_orphan_staging(child) -> None:
     """Log a staging directory that outlived its import, once per hour per directory.
 
@@ -260,7 +285,7 @@ def _note_orphan_staging(child) -> None:
     same id ever clears it. Deleting one here would be wrong (an import may be in flight this
     instant), so this makes it findable instead.
     """
-    if not child.name.startswith(".import-"):
+    if not child.name.startswith(".import"):
         return
     try:
         age = time.time() - child.stat().st_mtime
@@ -283,6 +308,7 @@ def list_conversations() -> list:
     """All projects, metadata only, most-recently-updated first."""
     if not _BASE_DIR.exists():
         return []
+    note_orphan_staging_dirs()      # cheap, and this is the one call that already walks the tree
     out = []
     for child in _BASE_DIR.iterdir():
         if not child.is_dir():
@@ -293,8 +319,7 @@ def list_conversations() -> list:
         # project: the project listed twice during the swap window, and a crash mid-import left a
         # phantom the user could not delete, because delete resolves by folder name.
         if child.name.startswith("."):
-            _note_orphan_staging(child)
-            continue
+            continue                                 # never a project; swept by note_orphan_staging_dirs
         mp = child / "meta.json"
         if not mp.exists():
             continue
