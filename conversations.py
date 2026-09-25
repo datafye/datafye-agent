@@ -251,6 +251,34 @@ def meta(record: dict) -> dict:
     }
 
 
+def _note_orphan_staging(child) -> None:
+    """Log a staging directory that outlived its import, once per hour per directory.
+
+    ⚠️ Skipping dot-prefixed directories in the listing is right - a staging dir is not a project -
+    but it also removed the ONLY place an abandoned one was visible, and nothing sweeps them. A
+    crashed import can leave up to MAX_EXPANDED_BYTES on disk, and only a re-import of the very
+    same id ever clears it. Deleting one here would be wrong (an import may be in flight this
+    instant), so this makes it findable instead.
+    """
+    if not child.name.startswith(".import-"):
+        return
+    try:
+        age = time.time() - child.stat().st_mtime
+    except OSError:
+        return
+    if age < 3600:
+        return                                   # young enough to be an import in progress
+    last = _orphan_warned.get(child.name, 0)
+    if time.time() - last < 3600:
+        return
+    _orphan_warned[child.name] = time.time()
+    logger.warning("Abandoned import staging directory %s is %d minutes old; it holds disk and "
+                   "nothing will remove it automatically", child, int(age // 60))
+
+
+_orphan_warned: dict = {}
+
+
 def list_conversations() -> list:
     """All projects, metadata only, most-recently-updated first."""
     if not _BASE_DIR.exists():
@@ -265,6 +293,7 @@ def list_conversations() -> list:
         # project: the project listed twice during the swap window, and a crash mid-import left a
         # phantom the user could not delete, because delete resolves by folder name.
         if child.name.startswith("."):
+            _note_orphan_staging(child)
             continue
         mp = child / "meta.json"
         if not mp.exists():

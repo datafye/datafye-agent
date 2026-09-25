@@ -310,6 +310,45 @@ finally:
     pa.MAX_EXPORT_BYTES = _saved_export
 
 shutil.rmtree(_TMP, ignore_errors=True)
+print("== a restore onto a SCAFFOLDED box (what every running agent presents) ==")
+# ⚠️ THE TEST THAT WAS MISSING, and its absence is why the previous fix shipped broken. main.py's
+# lifespan calls ensure_user_memory() at STARTUP, so by the time an import arrives both files
+# already exist as templates. The old check asked "did it exist?", which was therefore always yes,
+# so the user's real notes were diverted to CLAUDE.imported.md - a file nothing reads and
+# export_user_memory does not archive, losing them on the next migration hop. The old test passed
+# only because it unlinked the file first, a state no running agent ever presents.
+shutil.rmtree(memory.USER_DIR, ignore_errors=True)
+Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
+memory.ensure_user_memory()
+Path(memory.USER_CLAUDE_MD).write_text("MY REAL NOTES: prefers pandas\n")
+Path(memory.USER_DIR, "MEMORY.md").write_text("# User Memory\n- [style](style.md) - terse\n")
+Path(memory.USER_DIR, "style.md").write_text("terse\n")
+donor = _TMP / "donor.zip"
+pa.export_user_memory(donor)
+
+# a FRESH box: wiped, then scaffolded exactly as startup does, then the archive arrives
+shutil.rmtree(memory.USER_DIR, ignore_errors=True)
+Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
+memory.ensure_user_memory()                       # <-- this is what main.py does at boot
+pa.import_user_memory(donor.read_bytes())
+check("the user's notes land in the LIVE CLAUDE.md, not beside it",
+      "MY REAL NOTES" in Path(memory.USER_CLAUDE_MD).read_text(),
+      Path(memory.USER_CLAUDE_MD).read_text()[:80])
+check("no stray CLAUDE.imported.md is left on a scaffolded box",
+      not Path(memory.USER_DIR).parent.joinpath("CLAUDE.imported.md").exists())
+restored_index = Path(memory.USER_DIR, "MEMORY.md").read_text()
+check("the index carries the archive's entry", "style.md" in restored_index, restored_index)
+check("and not the scaffold's placeholder above it",
+      "Empty for now" not in restored_index, restored_index)
+
+print("== an index entry whose description changed is not duplicated ==")
+Path(memory.USER_DIR, "MEMORY.md").write_text(
+    "# User Memory\n- [style](style.md) - terse, and updated since the export\n")
+pa.import_user_memory(donor.read_bytes())
+idx = Path(memory.USER_DIR, "MEMORY.md").read_text()
+check("the topic is pointed at exactly once", idx.count("style.md") == 1, idx)
+check("and it is the LIVE description that survives", "updated since the export" in idx, idx)
+
 print("== the memory index is MERGED, not overwritten ==")
 # A plain move is an overwriting rename, so a restore of an older archive dropped every index line
 # added since the export - and a dropped line makes its topic file INVISIBLE, because bodies are

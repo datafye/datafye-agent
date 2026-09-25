@@ -80,6 +80,45 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _add_member(z: zipfile.ZipFile, absolute: Path, arcname: str) -> bool:
+    """Add one file to the archive, or skip it cleanly. True when the member really landed.
+
+    ⚠️ `ZipFile.write` is NOT all-or-nothing. If the read fails part way it has already begun the
+    member, and the entry is COMMITTED when the writing handle closes during unwind - so catching
+    OSError around `write` left a truncated member in the archive while the counter stayed behind,
+    and the manifest then under-reported what the file actually contains. Measured: a member
+    present at 16384 bytes with the manifest claiming zero.
+
+    Reading the bytes ourselves means a failure happens BEFORE anything is opened in the archive,
+    which is the only point at which skipping is really a skip.
+    """
+    try:
+        data = absolute.read_bytes()
+    except OSError as e:
+        logger.warning("Skipping %s during export: %s", absolute, e)
+        return False
+    try:
+        info = zipfile.ZipInfo(arcname, date_time=_zip_time(absolute))
+        # ⚠️ A ZipInfo carries its OWN compress_type, defaulting to STORED, and it overrides the
+        # one the ZipFile was opened with. Without this line the switch from write() to writestr()
+        # would quietly stop compressing every archive the agent produces.
+        info.compress_type = zipfile.ZIP_DEFLATED
+        z.writestr(info, data)
+        return True
+    except (OSError, ValueError) as e:
+        logger.warning("Could not archive %s: %s", absolute, e)
+        return False
+
+
+def _zip_time(path: Path):
+    """The member's timestamp, falling back to a fixed epoch when the file cannot be stat'd."""
+    import time as _time
+    try:
+        return _time.localtime(path.stat().st_mtime)[:6]
+    except OSError:
+        return (1980, 1, 1, 0, 0, 0)
+
+
 def _require_safe_project_id(conversation_id: str) -> str:
     """Refuse anything that is not a plain project id. Returns the id.
 
@@ -150,11 +189,8 @@ def _write_zip(out_path: Path, root: Path, prefix: str, manifest: dict) -> dict:
     written = 0
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for absolute, relative in entries:
-            try:
-                z.write(absolute, prefix + relative.as_posix())
+            if _add_member(z, absolute, prefix + relative.as_posix()):
                 written += 1
-            except OSError as e:          # unreadable file: skip it, do not fail the whole export
-                logger.warning("Skipping %s during export: %s", absolute, e)
         manifest["files"] = written
         if written != len(entries):
             manifest["note"] = "some files could not be read and were skipped; see the agent log"
@@ -241,11 +277,8 @@ def export_user_memory(out_path: Path) -> dict:
     written = 0
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for absolute in entries:
-            try:
-                z.write(absolute, _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix())
+            if _add_member(z, absolute, _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix()):
                 written += 1
-            except OSError as e:      # one unreadable file must not fail the whole export
-                logger.warning("Skipping %s during memory export: %s", absolute, e)
         manifest["files"] = written
         if written != len(entries):
             manifest["note"] = "some files could not be read and were skipped; see the agent log"
@@ -266,7 +299,41 @@ def _iter_staged(root: Path):
             yield absolute, absolute.relative_to(root)
 
 
-def _merge_index(live: Path, incoming: Path) -> None:
+def _has_real_content(path: Path, template: str) -> bool:
+    """Whether `path` holds anything beyond the scaffold the agent writes on startup."""
+    try:
+        body = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(body.strip()) and body.strip() != template.strip()
+
+
+def _index_has_entries(index: Path) -> bool:
+    """Whether a MEMORY.md index carries any POINTER LINE, as opposed to just its header.
+
+    The agent already treats a header-only index as empty when it builds the prompt block, so this
+    is the same reading rather than a new one.
+    """
+    try:
+        return any(line.lstrip().startswith("- ") for line in index.read_text().splitlines())
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _index_key(line: str) -> str:
+    """The identity of a pointer line: the file it points at, not the prose describing it.
+
+    Deduping on the whole line re-adds an entry whose description was edited after the export, so
+    the index grows a second, stale pointer to the same topic file on every single restore.
+    """
+    start = line.find("](")
+    if start < 0:
+        return line.strip()
+    end = line.find(")", start + 2)
+    return line[start + 2:end].strip() if end > start else line.strip()
+
+
+def _merge_index(live: Path, incoming: Path) -> bool:
     """Union the pointer lines of two MEMORY.md indexes, keeping the live file's own order.
 
     The index is the always-on block injected into every prompt, and it is a list of pointers to
@@ -276,18 +343,20 @@ def _merge_index(live: Path, incoming: Path) -> None:
     file has, plus anything the archive carries that it does not.
     """
     try:
-        live_lines = live.read_text().splitlines()
+        body = live.read_text()
         new_lines = incoming.read_text().splitlines()
     except (OSError, UnicodeDecodeError):
-        return                                  # unreadable: leave the live index alone
-    seen = {line.strip() for line in live_lines if line.strip()}
-    added = [line for line in new_lines if line.strip() and line.strip() not in seen]
-    if not added:
-        return
-    body = live.read_text()
-    if body and not body.endswith("\n"):
-        body += "\n"
-    live.write_text(body + "\n".join(added) + "\n")
+        # The caller must know this did not happen: it used to discard the staged copy anyway and
+        # count it as restored, so the archive's index vanished while the import reported success.
+        return False
+    seen = {_index_key(line) for line in body.splitlines() if line.strip()}
+    added = [line for line in new_lines
+             if line.lstrip().startswith("- ") and _index_key(line) not in seen]
+    if added:
+        if body and not body.endswith("\n"):
+            body += "\n"
+        live.write_text(body + "\n".join(added) + "\n")
+    return True
 
 
 def _safe_target(base: Path, name: str) -> Optional[Path]:
@@ -427,14 +496,18 @@ def import_user_memory(archive_bytes: bytes) -> dict:
     """
     if len(archive_bytes) > MAX_IMPORT_BYTES:
         raise ArchiveError(f"archive is larger than {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-    # ⚠️ Captured BEFORE ensure_user_memory, which SCAFFOLDS both of these. Without that, the
-    # preserve-the-live-file rule below sees the scaffold this call just created, decides the box
-    # has content worth protecting, and diverts the archive's copy to CLAUDE.imported.md - so a
-    # restore onto a fresh box would never actually restore. "Already there" has to mean "there
-    # before we touched it".
-    had_claude = Path(memory.USER_CLAUDE_MD).is_file()
-    had_index = Path(memory.USER_DIR, "MEMORY.md").is_file()
+    # ⚠️ The question is whether the live file holds REAL CONTENT, not whether it exists.
+    #
+    # Capturing existence before ensure_user_memory() was the previous attempt and it was wrong on
+    # every running agent: main.py's lifespan already scaffolds both files at STARTUP, long before
+    # an import arrives, so the file always existed, the preserve-the-live-file rule always fired,
+    # and the user's real notes were always diverted to CLAUDE.imported.md - which nothing reads
+    # and export_user_memory does not archive, so a second migration hop lost them outright. The
+    # unit test passed only because it unlinked the file first, which is a state no running agent
+    # ever presents. Verified by replaying the real sequence: scaffold, then import.
     memory.ensure_user_memory()
+    had_claude = _has_real_content(Path(memory.USER_CLAUDE_MD), memory._USER_CLAUDE_TEMPLATE)
+    had_index = _index_has_entries(Path(memory.USER_DIR, "MEMORY.md"))
     state_root = Path(memory.USER_DIR).parent
     memory_rel = Path(memory.USER_DIR).name                      # "memory"
     claude_rel = Path(memory.USER_CLAUDE_MD).name                # "CLAUDE.md"
@@ -479,8 +552,12 @@ def import_user_memory(archive_bytes: bytes) -> dict:
             final = state_root / relative
             final.parent.mkdir(parents=True, exist_ok=True)
             if final.name == "MEMORY.md" and final.is_file() and had_index:
-                _merge_index(final, absolute)
-                absolute.unlink(missing_ok=True)
+                if _merge_index(final, absolute):
+                    absolute.unlink(missing_ok=True)
+                else:
+                    # Could not read the live index, so nothing was merged. Keep the archive's copy
+                    # rather than dropping it and reporting a restore that did not happen.
+                    shutil.move(str(absolute), str(final.with_name("MEMORY.imported.md")))
             elif final == Path(memory.USER_CLAUDE_MD) and final.is_file() and had_claude:
                 # Prose, so there is no safe line-wise merge. The live file wins and the archive's
                 # copy lands beside it for the user to reconcile, because "merge, not replace" has
