@@ -28,8 +28,13 @@ SSE streaming responses with structured events for the agent frontend,
 including custom events for environment status, scorecard, and chart data.
 """
 
+import io
 import json
 import os
+import zipfile
+import tempfile
+import pathlib
+import shutil
 import re
 import logging
 import socket
@@ -43,9 +48,10 @@ from urllib.parse import urlparse
 
 import httpx
 import yaml
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Header, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from claude_agent_sdk import (
@@ -58,6 +64,7 @@ from prompt import build_system_prompt
 import auth
 import broker
 import conversations
+import project_archive
 import credentials as credentials_module
 import memory
 import foundry
@@ -3161,6 +3168,108 @@ async def delete_conversation_file(conversation_id: str, filename: str):
     if not conversations.delete_file(conversation_id, filename):
         raise HTTPException(status_code=404, detail="No such file")
     return Response(status_code=204)
+
+
+async def _read_capped_body(request: Request) -> bytes:
+    """Read a request body, refusing one past the ceiling WITHOUT buffering it first.
+
+    `await request.body()` reads the whole upload into memory before anything can check its size, so
+    a ceiling applied afterwards never fires - a multi-GB chunked POST would OOM the agent while the
+    limit sat there looking protective. Streaming lets the check happen while the bytes arrive."""
+    buf = io.BytesIO()
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > project_archive.MAX_IMPORT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"archive is larger than {project_archive.MAX_IMPORT_BYTES // (1024 * 1024)} MB")
+        buf.write(chunk)
+    # ⚠️ Accumulated into ONE buffer rather than a list of chunks joined at the end. The join holds
+    # the chunk list and the joined result at the same time, so a body at the 512 MB ceiling peaked
+    # near 1 GB of RSS: the ceiling bounded the upload and not the memory it cost, which is the same
+    # class of miss as applying the cap after request.body() had already read everything.
+    return buf.getvalue()
+
+
+@app.get("/v1/conversations/{conversation_id}/export",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def export_conversation(conversation_id: str):
+    """Download the agent half of one project as a versioned zip: the app's code, the chat history,
+    the project's memory, its uploads and its outputs. Accounts calls this and bundles the result
+    with its own record, so a project travels as one file (DAT-293).
+
+    Regenerable trees (node_modules, target, ...) are left out and named in the archive's manifest.
+    404 when the project has no folder on this box, which is a real state: accounts can hold a
+    record for a project the user created but never chatted to."""
+    workdir = tempfile.mkdtemp(prefix="datafye-export-")
+    out = pathlib.Path(workdir) / f"{conversation_id}.zip"
+    try:
+        project_archive.export_project(conversation_id, out)
+    except project_archive.ArchiveError as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        logger.exception("Export of project %s failed", conversation_id)
+        raise HTTPException(status_code=500, detail=f"export failed: {e}")
+    # Delete the staging copy once the response has been sent, not before: FileResponse streams
+    # from the path, so removing it earlier would truncate the download.
+    return FileResponse(out, filename=out.name, media_type="application/zip",
+                        background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True))
+
+
+@app.post("/v1/conversations/{conversation_id}/import",
+          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def import_conversation(conversation_id: str, request: Request, overwrite: bool = False):
+    """Write the agent half of a project into `conversation_id` from a zip posted as the raw body.
+
+    The id is the caller's: accounts mints it, so importing into another account just means a
+    different id, and the record inside the archive is retargeted to match. Refuses an existing
+    project unless `?overwrite=true`, so a restore cannot quietly destroy live work (DAT-300)."""
+    body = await _read_capped_body(request)
+    try:
+        return project_archive.import_project(conversation_id, body, overwrite=overwrite)
+    except project_archive.ArchiveError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except zipfile.BadZipFile as e:
+        # a truncated or non-zip body is the CALLER's mistake, not a server fault
+        raise HTTPException(status_code=400, detail=f"not a readable zip archive: {e}")
+
+
+@app.get("/v1/memory/export",
+         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def export_user_memory():
+    """Download the user-level memory that spans projects (the memory dir plus the user CLAUDE.md).
+
+    Per-project memory rides inside each project's own archive; this is the cross-project half,
+    which is what would otherwise be lost when a user's projects move to another box (DAT-300)."""
+    workdir = tempfile.mkdtemp(prefix="datafye-memory-export-")
+    out = pathlib.Path(workdir) / "user-memory.zip"
+    try:
+        project_archive.export_user_memory(out)
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        logger.exception("Export of user memory failed")
+        raise HTTPException(status_code=500, detail=f"export failed: {e}")
+    return FileResponse(out, filename=out.name, media_type="application/zip",
+                        background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True))
+
+
+@app.post("/v1/memory/import",
+          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
+async def import_user_memory(request: Request):
+    """Merge cross-project memory from a zip posted as the raw body.
+
+    Merge rather than replace: the target box may already hold memory for this user, and a restore
+    that silently dropped it would lose work the box learned since the export."""
+    body = await _read_capped_body(request)
+    try:
+        return project_archive.import_user_memory(body)
+    except project_archive.ArchiveError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except zipfile.BadZipFile as e:
+        raise HTTPException(status_code=400, detail=f"not a readable zip archive: {e}")
 
 
 @app.get("/v1/conversations/{conversation_id}/outputs",

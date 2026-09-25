@@ -259,6 +259,13 @@ def list_conversations() -> list:
     for child in _BASE_DIR.iterdir():
         if not child.is_dir():
             continue
+        # ⚠️ A dot-prefixed directory is never a project. An import stages into
+        # `.import-<id>.tmp` in this same directory (same filesystem, so the swap is an atomic
+        # rename), and once its meta.json has been retargeted that staging dir is a VALID-looking
+        # project: the project listed twice during the swap window, and a crash mid-import left a
+        # phantom the user could not delete, because delete resolves by folder name.
+        if child.name.startswith("."):
+            continue
         mp = child / "meta.json"
         if not mp.exists():
             continue
