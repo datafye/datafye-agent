@@ -164,6 +164,24 @@ try:
                    headers={"Authorization": "Bearer " + _token(sub="someone-else")})
     check("another user's token refused on import", r.status_code in (401, 403), r.status_code)
 
+    print("== the ROUTE does not accept a traversal path at all ==")
+    # ⚠️ READ THIS BEFORE TRUSTING IT. These all 404, and they 404 *with or without* the id guard in
+    # project_archive: the path is normalised before routing, so `%2e%2e` never reaches the handler
+    # and the route simply does not match. Measured, after review claimed the opposite - so the
+    # unguarded export was NOT reachable through this endpoint as shipped.
+    #
+    # It is still worth pinning. The guard is what makes export_project safe for any caller, and it
+    # is covered by the unit suite (which calls the function directly and, without the guard,
+    # produces a zip of credentials.bin). What THIS asserts is the layer in front: if a future
+    # framework version stopped normalising, the guard would become the only thing standing there,
+    # and this test would tell us the shape of the request changed.
+    for raw in ("%2e%2e", "%2E%2E", "%2e", "..%2f..", "%2e%2e%2f%2e%2e"):
+        r = httpx.get(f"{base}/v1/conversations/{raw}/export", headers=hdr, timeout=30)
+        body = r.text[:120]
+        check(f"refused {raw}", r.status_code >= 400, f"{r.status_code} {body}")
+        check(f"{raw} returned no zip",
+              "zip" not in r.headers.get("content-type", ""), r.headers.get("content-type"))
+
     print("== export a project that does not exist ==")
     r = httpx.get(f"{base}/v1/conversations/nope/export", headers=hdr, timeout=20)
     check("404 for a project with no folder", r.status_code == 404, r.status_code)

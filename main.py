@@ -28,6 +28,7 @@ SSE streaming responses with structured events for the agent frontend,
 including custom events for environment status, scorecard, and chart data.
 """
 
+import io
 import json
 import os
 import zipfile
@@ -3175,7 +3176,7 @@ async def _read_capped_body(request: Request) -> bytes:
     `await request.body()` reads the whole upload into memory before anything can check its size, so
     a ceiling applied afterwards never fires - a multi-GB chunked POST would OOM the agent while the
     limit sat there looking protective. Streaming lets the check happen while the bytes arrive."""
-    chunks = []
+    buf = io.BytesIO()
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
@@ -3183,8 +3184,12 @@ async def _read_capped_body(request: Request) -> bytes:
             raise HTTPException(
                 status_code=413,
                 detail=f"archive is larger than {project_archive.MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-        chunks.append(chunk)
-    return b"".join(chunks)
+        buf.write(chunk)
+    # ⚠️ Accumulated into ONE buffer rather than a list of chunks joined at the end. The join holds
+    # the chunk list and the joined result at the same time, so a body at the 512 MB ceiling peaked
+    # near 1 GB of RSS: the ceiling bounded the upload and not the memory it cost, which is the same
+    # class of miss as applying the cap after request.body() had already read everything.
+    return buf.getvalue()
 
 
 @app.get("/v1/conversations/{conversation_id}/export",

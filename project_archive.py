@@ -80,6 +80,32 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _require_safe_project_id(conversation_id: str) -> str:
+    """Refuse anything that is not a plain project id. Returns the id.
+
+    The id is used to build a filesystem path. Called with `".."` this function archived the agent
+    STATE ROOT: `credentials.bin`, `broker_user.json`, the user's memory, `plugins/user/skills` and
+    every other project - reproduced at 7 entries before this guard existed. Import guarded its id
+    from the start and export did not, which is why both now share one guard rather than each
+    carrying its own idea of what is safe.
+
+    ⚠️ On the REACHABILITY, because it was initially overstated: the HTTP route does NOT let this
+    through. `/v1/conversations/%2e%2e/export` is normalised before routing and 404s with or without
+    this guard (measured both ways). So this is defence in depth for any caller of the function, not
+    a patch for a live exploit. It matters because the only thing that made the export safe was a
+    property of the web framework that nothing here states or tests.
+
+    The allow-list matches the accounts-side `isSafeProjectId`, deliberately: two components that
+    disagree about which ids are legal is a gap that only shows up under attack.
+    """
+    if not conversation_id or len(conversation_id) > 128:
+        raise ArchiveError(f"invalid project id '{conversation_id}'")
+    for ch in conversation_id:
+        if not (ch.isascii() and (ch.isalnum() or ch in "-_")):
+            raise ArchiveError(f"invalid project id '{conversation_id}'")
+    return conversation_id
+
+
 def _iter_files(root: Path):
     """Every file under `root` worth archiving, as (absolute path, path relative to root).
 
@@ -120,21 +146,24 @@ def _write_zip(out_path: Path, root: Path, prefix: str, manifest: dict) -> dict:
             f"{MAX_EXPORT_BYTES // (1024 * 1024)} MB an export may carry")
 
     manifest = dict(manifest)
-    manifest["files"] = len(entries)
     manifest["raw_bytes"] = raw_bytes
     written = 0
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        z.writestr(_MANIFEST_NAME, json.dumps(manifest, indent=2))
         for absolute, relative in entries:
             try:
                 z.write(absolute, prefix + relative.as_posix())
                 written += 1
             except OSError as e:          # unreadable file: skip it, do not fail the whole export
                 logger.warning("Skipping %s during export: %s", absolute, e)
-    if written != manifest["files"]:
-        # the manifest must not claim files the archive does not hold
         manifest["files"] = written
-        manifest["note"] = "some files could not be read and were skipped; see the agent log"
+        if written != len(entries):
+            manifest["note"] = "some files could not be read and were skipped; see the agent log"
+        # ⚠️ Written LAST, and that is the whole point. Writing it first meant the count inside the
+        # ARCHIVE was the count we intended rather than the count we achieved: a skipped unreadable
+        # file corrected only the dict returned to the caller, so anyone restoring from the file saw
+        # a manifest claiming members it does not hold. The correction has to land where the reader
+        # will look for it.
+        z.writestr(_MANIFEST_NAME, json.dumps(manifest, indent=2))
     return manifest
 
 
@@ -144,6 +173,7 @@ def export_project(conversation_id: str, out_path: Path) -> dict:
     Raises ArchiveError when the project does not exist on this box — which is a real state, not a
     fault: accounts can hold a project record for a project the user never chatted to.
     """
+    _require_safe_project_id(conversation_id)
     root = conversations.project_dir(conversation_id)
     if not root.is_dir():
         raise ArchiveError(f"no project '{conversation_id}' on this agent")
@@ -199,14 +229,65 @@ def export_user_memory(out_path: Path) -> dict:
             raw_bytes += absolute.stat().st_size
         except OSError:
             pass
-    manifest["files"] = len(entries)
     manifest["raw_bytes"] = raw_bytes
+    # The same ceiling the project export enforces. This measured raw_bytes and then never looked at
+    # it, so a memory tree past the limit was archived anyway; on the accounts side that surfaces as
+    # a bare `user_memory: unavailable` with nothing saying why.
+    if raw_bytes > MAX_EXPORT_BYTES:
+        raise ArchiveError(
+            f"this user's memory holds {raw_bytes // (1024 * 1024)} MB, more than the "
+            f"{MAX_EXPORT_BYTES // (1024 * 1024)} MB an export may carry")
 
+    written = 0
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        z.writestr(_MANIFEST_NAME, json.dumps(manifest, indent=2))
         for absolute in entries:
-            z.write(absolute, _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix())
+            try:
+                z.write(absolute, _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix())
+                written += 1
+            except OSError as e:      # one unreadable file must not fail the whole export
+                logger.warning("Skipping %s during memory export: %s", absolute, e)
+        manifest["files"] = written
+        if written != len(entries):
+            manifest["note"] = "some files could not be read and were skipped; see the agent log"
+        z.writestr(_MANIFEST_NAME, json.dumps(manifest, indent=2))
     return manifest
+
+
+def _iter_staged(root: Path):
+    """Every file under `root`, with NO exclusions.
+
+    Distinct from `_iter_files`, which prunes regenerable directories on the way OUT. On the way in,
+    pruning would silently drop a staged file that has already been counted as restored.
+    """
+    for dirpath, _dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        for name in filenames:
+            absolute = base / name
+            yield absolute, absolute.relative_to(root)
+
+
+def _merge_index(live: Path, incoming: Path) -> None:
+    """Union the pointer lines of two MEMORY.md indexes, keeping the live file's own order.
+
+    The index is the always-on block injected into every prompt, and it is a list of pointers to
+    topic files. A plain overwrite (which is what shutil.move does) drops every line added since the
+    export, and each dropped line makes its topic file INVISIBLE rather than merely unlisted - the
+    body is only ever read on demand, via the index. So the lines are unioned: everything the live
+    file has, plus anything the archive carries that it does not.
+    """
+    try:
+        live_lines = live.read_text().splitlines()
+        new_lines = incoming.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return                                  # unreadable: leave the live index alone
+    seen = {line.strip() for line in live_lines if line.strip()}
+    added = [line for line in new_lines if line.strip() and line.strip() not in seen]
+    if not added:
+        return
+    body = live.read_text()
+    if body and not body.endswith("\n"):
+        body += "\n"
+    live.write_text(body + "\n".join(added) + "\n")
 
 
 def _safe_target(base: Path, name: str) -> Optional[Path]:
@@ -221,6 +302,11 @@ def _safe_target(base: Path, name: str) -> Optional[Path]:
     if pure.is_absolute() or (len(name) > 1 and name[1] == ":"):
         return None
     if any(part in ("..", "") for part in pure.parts):
+        return None
+    # `Path(".").parts` is EMPTY, so the filter above does not see it and the containment check
+    # below is satisfied by base == base. `_extract` would then open a DIRECTORY for writing and
+    # raise IsADirectoryError, which is a 500 where the caller means to answer 400.
+    if not pure.parts:
         return None
     target = (base / pure).resolve()
     if target != base.resolve() and base.resolve() not in target.parents:
@@ -269,8 +355,7 @@ def import_project(conversation_id: str, archive_bytes: bytes, overwrite: bool =
     """
     if len(archive_bytes) > MAX_IMPORT_BYTES:
         raise ArchiveError(f"archive is larger than {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-    if not conversation_id or "/" in conversation_id or conversation_id in (".", ".."):
-        raise ArchiveError(f"invalid project id '{conversation_id}'")
+    _require_safe_project_id(conversation_id)
 
     dest = conversations.project_dir(conversation_id)
     if dest.exists() and not overwrite:
@@ -342,6 +427,13 @@ def import_user_memory(archive_bytes: bytes) -> dict:
     """
     if len(archive_bytes) > MAX_IMPORT_BYTES:
         raise ArchiveError(f"archive is larger than {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
+    # ⚠️ Captured BEFORE ensure_user_memory, which SCAFFOLDS both of these. Without that, the
+    # preserve-the-live-file rule below sees the scaffold this call just created, decides the box
+    # has content worth protecting, and diverts the archive's copy to CLAUDE.imported.md - so a
+    # restore onto a fresh box would never actually restore. "Already there" has to mean "there
+    # before we touched it".
+    had_claude = Path(memory.USER_CLAUDE_MD).is_file()
+    had_index = Path(memory.USER_DIR, "MEMORY.md").is_file()
     memory.ensure_user_memory()
     state_root = Path(memory.USER_DIR).parent
     memory_rel = Path(memory.USER_DIR).name                      # "memory"
@@ -373,11 +465,34 @@ def import_user_memory(archive_bytes: bytes) -> dict:
                 with z.open(info) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
                 written += 1
+        if written == 0:
+            # import_project refuses the analogous case. Without this, posting a PROJECT archive to
+            # /v1/memory/import reads as a completed restore of nothing.
+            raise ArchiveError("archive holds no user-memory content")
         # Only now that the whole archive has been accepted, merge it into the live tree.
-        for absolute, relative in _iter_files(staging):
+        #
+        # ⚠️ _iter_files PRUNES excluded dirs and names, so iterating it here could drop a staged
+        # file that was already counted in `written` - reported as restored and then deleted with
+        # the staging dir. The merge walks everything that was staged.
+        merged = 0
+        for absolute, relative in _iter_staged(staging):
             final = state_root / relative
             final.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(absolute), str(final))
+            if final.name == "MEMORY.md" and final.is_file() and had_index:
+                _merge_index(final, absolute)
+                absolute.unlink(missing_ok=True)
+            elif final == Path(memory.USER_CLAUDE_MD) and final.is_file() and had_claude:
+                # Prose, so there is no safe line-wise merge. The live file wins and the archive's
+                # copy lands beside it for the user to reconcile, because "merge, not replace" has
+                # to be true of the file the prompt reads on every single turn.
+                if final.read_bytes() != absolute.read_bytes():
+                    shutil.move(str(absolute), str(final.with_name("CLAUDE.imported.md")))
+                else:
+                    absolute.unlink(missing_ok=True)
+            else:
+                shutil.move(str(absolute), str(final))
+            merged += 1
+        written = merged
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return {"files": written}

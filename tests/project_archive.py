@@ -68,6 +68,31 @@ check("manifest names the exclusions", "node_modules" in manifest["excluded_dirs
 check("manifest counts the files", manifest["files"] == 4, manifest.get("files"))
 check("manifest is readable back", pa.read_manifest(out.read_bytes())["project_id"] == "p-src")
 
+print("== EXPORT refuses a project id that is a path (the hole import already guarded) ==")
+# ⚠️ This is the finding that mattered most in review. uvicorn percent-decodes the URL path before
+# Starlette routes it, so `GET /v1/conversations/%2e%2e/export` arrived here with id "..".
+# project_dir("..") is the agent STATE ROOT, is_dir() is true, and the export returned a zip of
+# credentials.bin, broker_user.json, the user's memory, plugins/user/skills and every other
+# project. Reproduced at 7 entries before the guard existed. Import was guarded from the start;
+# export was not, and every traversal test below this line was an IMPORT test.
+# Named as a decoy rather than `credentials.bin`: a later test asserts that the memory-import
+# allow-list never CREATES credentials.bin, and planting one here would satisfy that by accident.
+Path(_TMP, "state", "credstore-decoy.bin").write_bytes(b"ENCRYPTED-KEY-MATERIAL")
+(Path(_TMP, "state", "plugins", "user", "skills")).mkdir(parents=True, exist_ok=True)
+Path(_TMP, "state", "plugins", "user", "skills", "mine.md").write_text("executable by the agent\n")
+for bad in ("..", ".", "../..", "a/b", "p-ok/../..", "", "proj-../x", "%2e%2e"):
+    try:
+        pa.export_project(bad, _TMP / "leak.zip")
+        check(f"export refuses id {bad!r}", False, "IT EXPORTED - this is a credential leak")
+    except pa.ArchiveError as e:
+        check(f"export refuses id {bad!r}", "invalid project id" in str(e), str(e))
+check("no archive was produced by any of those", not (_TMP / "leak.zip").exists())
+
+print("== a legitimate id still exports (the guard must not be too tight) ==")
+_make_project("proj-abc123")
+check("a minted-shape id is accepted",
+      pa.export_project("proj-abc123", _TMP / "ok.zip")["project_id"] == "proj-abc123")
+
 print("== export of a project this agent does not have ==")
 try:
     pa.export_project("never-chatted", _TMP / "x.zip")
@@ -285,6 +310,53 @@ finally:
     pa.MAX_EXPORT_BYTES = _saved_export
 
 shutil.rmtree(_TMP, ignore_errors=True)
+print("== the memory index is MERGED, not overwritten ==")
+# A plain move is an overwriting rename, so a restore of an older archive dropped every index line
+# added since the export - and a dropped line makes its topic file INVISIBLE, because bodies are
+# only ever read via the index.
+memory.ensure_user_memory()
+mem_dir = Path(memory.USER_DIR)
+mem_dir.mkdir(parents=True, exist_ok=True)
+Path(mem_dir, "MEMORY.md").write_text("# index\n- [old](old.md) - from the archive\n")
+Path(mem_dir, "old.md").write_text("old body\n")
+arch = _TMP / "mem-old.zip"
+pa.export_user_memory(arch)
+# now the live box learns something new
+Path(mem_dir, "MEMORY.md").write_text(
+    "# index\n- [old](old.md) - from the archive\n- [fresh](fresh.md) - learned since\n")
+Path(mem_dir, "fresh.md").write_text("fresh body\n")
+Path(memory.USER_CLAUDE_MD).write_text("LIVE user CLAUDE\n")
+pa.import_user_memory(arch.read_bytes())
+index = Path(mem_dir, "MEMORY.md").read_text()
+check("the line learned since the export survives the restore", "fresh.md" in index, index)
+check("and the archive's own line is there too", "old.md" in index, index)
+check("the live user CLAUDE.md is not overwritten",
+      Path(memory.USER_CLAUDE_MD).read_text() == "LIVE user CLAUDE\n",
+      Path(memory.USER_CLAUDE_MD).read_text())
+check("the archive's CLAUDE.md is kept beside it to reconcile",
+      Path(mem_dir.parent, "CLAUDE.imported.md").exists())
+
+print("== a memory import that restored nothing is not a success ==")
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w") as z:
+    z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1}))
+    z.writestr("project/meta.json", "{}")        # a PROJECT archive posted to the memory endpoint
+try:
+    pa.import_user_memory(buf.getvalue())
+    check("refuses an archive with no memory content", False, "reported success")
+except pa.ArchiveError as e:
+    check("refuses an archive with no memory content", "no user-memory content" in str(e), str(e))
+
+print("== the manifest INSIDE the archive counts what the archive holds ==")
+_make_project("p-manifest")
+zp = _TMP / "manifest.zip"
+man = pa.export_project("p-manifest", zp)
+inner = json.loads(zipfile.ZipFile(zp).read(pa._MANIFEST_NAME))
+members = [n for n in zipfile.ZipFile(zp).namelist() if n != pa._MANIFEST_NAME]
+check("the archived manifest matches the real member count",
+      inner["files"] == len(members), (inner["files"], len(members)))
+check("and agrees with what the caller was told", inner["files"] == man["files"])
+
 print()
 if _failures:
     print(f"FAILED: {len(_failures)} -> {_failures}")
