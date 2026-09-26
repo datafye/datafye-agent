@@ -3248,6 +3248,14 @@ async def export_user_memory():
     out = pathlib.Path(workdir) / "user-memory.zip"
     try:
         project_archive.export_user_memory(out)
+    except project_archive.ArchiveError as e:
+        # A REFUSAL, not a fault: the memory tree is past the export ceiling, and the caller can act
+        # on that. Reported as 400 like the project-export route reports its own ArchiveError,
+        # because accounts renders any 5xx as a bare "user_memory: unavailable" with no reason -
+        # which is exactly the silence the ceiling was added to replace.
+        shutil.rmtree(workdir, ignore_errors=True)
+        logger.warning("Refusing the user-memory export: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         shutil.rmtree(workdir, ignore_errors=True)
         logger.exception("Export of user memory failed")

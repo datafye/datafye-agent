@@ -80,6 +80,58 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _add_member(z: zipfile.ZipFile, absolute: Path, arcname: str, partial: list) -> bool:
+    """Add one file to the archive. True when a COMPLETE member landed.
+
+    ⚠️ `ZipFile.write` is not all-or-nothing: a read failure part way has already begun the member,
+    and it is committed when the writing handle closes, so catching OSError around it left a
+    truncated member in the archive while the counter stayed behind and the manifest under-reported
+    what the file holds.
+
+    Round 4 "fixed" that by reading each file whole and calling writestr, which introduced two
+    regressions of its own, both measured: a bare ZipInfo carries no `external_attr`, so every
+    member came out 0600 and an exported executable unzipped non-executable; and a single large
+    file was buffered entirely in the agent process where it used to stream in chunks, which is an
+    OOM on these boxes for one file under the total ceiling.
+
+    So: metadata from `ZipInfo.from_file` (mode and mtime preserved), content STREAMED, and a
+    member that fails mid-write is named in the manifest's `partial_files` rather than quietly
+    miscounted. The archive declares what it could not finish, which is the property the original
+    finding was about; pretending a stream can be un-committed is not available.
+    """
+    try:
+        # strict_timestamps=False clamps BOTH ends of what a zip can represent. Clamping only the
+        # pre-1980 side left a post-2107 mtime to reach the header writer as a struct.error, which
+        # is not an OSError and killed the entire export.
+        info = zipfile.ZipInfo.from_file(absolute, arcname, strict_timestamps=False)
+    except OSError as e:
+        logger.warning("Skipping %s during export: %s", absolute, e)
+        return False
+    # A ZipInfo carries its OWN compress_type, defaulting to STORED and overriding the one the
+    # ZipFile was opened with, so this line is what keeps the archive compressed at all.
+    info.compress_type = zipfile.ZIP_DEFLATED
+    try:
+        src = absolute.open("rb")
+    except OSError as e:
+        # Never opened, so no member began: this is a clean SKIP, not a partial. Reporting it as
+        # partial named a member the archive does not contain, while `note` called it skipped in
+        # the same manifest.
+        logger.warning("Skipping %s during export: %s", absolute, e)
+        return False
+    try:
+        with src, z.open(info, "w") as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+        return True
+    except Exception as e:
+        # Anything from here on has already begun the member and it is committed on close, so the
+        # archive holds a short one and must say so. Deliberately broad: a post-2107 timestamp
+        # raises struct.error and a member crossing the ZIP64 limit raises RuntimeError, and
+        # neither is an OSError - both used to escape and kill the whole export.
+        logger.warning("Could not finish archiving %s: %s", absolute, e)
+        partial.append(arcname)
+        return False
+
+
 def _require_safe_project_id(conversation_id: str) -> str:
     """Refuse anything that is not a plain project id. Returns the id.
 
@@ -148,14 +200,14 @@ def _write_zip(out_path: Path, root: Path, prefix: str, manifest: dict) -> dict:
     manifest = dict(manifest)
     manifest["raw_bytes"] = raw_bytes
     written = 0
+    partial = []
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for absolute, relative in entries:
-            try:
-                z.write(absolute, prefix + relative.as_posix())
+            if _add_member(z, absolute, prefix + relative.as_posix(), partial):
                 written += 1
-            except OSError as e:          # unreadable file: skip it, do not fail the whole export
-                logger.warning("Skipping %s during export: %s", absolute, e)
         manifest["files"] = written
+        if partial:
+            manifest["partial_files"] = partial
         if written != len(entries):
             manifest["note"] = "some files could not be read and were skipped; see the agent log"
         # ⚠️ Written LAST, and that is the whole point. Writing it first meant the count inside the
@@ -239,14 +291,15 @@ def export_user_memory(out_path: Path) -> dict:
             f"{MAX_EXPORT_BYTES // (1024 * 1024)} MB an export may carry")
 
     written = 0
+    partial = []
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for absolute in entries:
-            try:
-                z.write(absolute, _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix())
+            if _add_member(z, absolute,
+                           _MEMORY_PREFIX + absolute.relative_to(state_root).as_posix(), partial):
                 written += 1
-            except OSError as e:      # one unreadable file must not fail the whole export
-                logger.warning("Skipping %s during memory export: %s", absolute, e)
         manifest["files"] = written
+        if partial:
+            manifest["partial_files"] = partial
         if written != len(entries):
             manifest["note"] = "some files could not be read and were skipped; see the agent log"
         z.writestr(_MANIFEST_NAME, json.dumps(manifest, indent=2))
@@ -266,7 +319,82 @@ def _iter_staged(root: Path):
             yield absolute, absolute.relative_to(root)
 
 
-def _merge_index(live: Path, incoming: Path) -> None:
+def _has_real_content(path: Path, template: str) -> bool:
+    """Whether `path` holds anything beyond the scaffold the agent writes on startup.
+
+    ⚠️ An UNREADABLE file counts as real content. Returning False there would fold "I could not
+    look" into "there is nothing worth keeping", and the caller acts on that by overwriting - so a
+    live CLAUDE.md that merely failed to decode would be replaced outright, with no copy kept
+    beside it. When in doubt the file is precious, because the cost of being wrong is asymmetric.
+    """
+    if not path.is_file():
+        return False
+    try:
+        body = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return True
+    return bool(body.strip()) and body.strip() != template.strip()
+
+
+def _index_has_entries(index: Path) -> bool:
+    """Whether a MEMORY.md index carries any POINTER LINE, as opposed to just its header.
+
+    The agent already treats a header-only index as empty when it builds the prompt block, so this
+    is the same reading rather than a new one.
+    """
+    if not index.is_file():
+        return False
+    try:
+        return any(line.lstrip().startswith("- ") for line in index.read_text().splitlines())
+    except (OSError, UnicodeDecodeError):
+        # Unreadable, so treat it as having entries: that routes the restore through _merge_index,
+        # which itself refuses to touch an index it cannot read and keeps the archive's copy as
+        # MEMORY.imported.md. Returning False here would bypass the guard this round added and
+        # overwrite the live index wholesale, stranding every topic file it pointed at.
+        return True
+
+
+def _index_key(line: str) -> str:
+    """The identity of a pointer line: the file it points at, not the prose describing it.
+
+    Deduping on the whole line re-adds an entry whose description was edited after the export, so
+    the index grows a second, stale pointer to the same topic file on every single restore.
+    """
+    start = line.find("](")
+    if start < 0:
+        return line.strip()
+    end = line.find(")", start + 2)
+    return line[start + 2:end].strip() if end > start else line.strip()
+
+
+def _last_section(body: str) -> str:
+    """The final `##` heading in a markdown body, or "" when there is none."""
+    last = ""
+    for line in body.splitlines():
+        if line.startswith("## "):
+            last = line.strip()
+    return last
+
+
+def _keep_beside(source: Path, preferred: Path) -> Path:
+    """Move `source` to `preferred`, or to the next free numbered name if that is taken.
+
+    Every caller is holding something UNRECONCILED - a copy the user still has to look at - so
+    overwriting one with another is the loss these paths exist to prevent, merely postponed.
+    """
+    preferred.parent.mkdir(parents=True, exist_ok=True)
+    target = preferred
+    n = 2
+    while target.exists():
+        target = preferred.with_name(f"{preferred.stem}.{n}{preferred.suffix}")
+        n += 1
+        if n > 100:                       # absurd; stop rather than spin
+            break
+    shutil.move(str(source), str(target))
+    return target
+
+
+def _merge_index(live: Path, incoming: Path) -> bool:
     """Union the pointer lines of two MEMORY.md indexes, keeping the live file's own order.
 
     The index is the always-on block injected into every prompt, and it is a list of pointers to
@@ -276,18 +404,32 @@ def _merge_index(live: Path, incoming: Path) -> None:
     file has, plus anything the archive carries that it does not.
     """
     try:
-        live_lines = live.read_text().splitlines()
+        body = live.read_text()
         new_lines = incoming.read_text().splitlines()
     except (OSError, UnicodeDecodeError):
-        return                                  # unreadable: leave the live index alone
-    seen = {line.strip() for line in live_lines if line.strip()}
-    added = [line for line in new_lines if line.strip() and line.strip() not in seen]
-    if not added:
-        return
-    body = live.read_text()
-    if body and not body.endswith("\n"):
-        body += "\n"
-    live.write_text(body + "\n".join(added) + "\n")
+        # The caller must know this did not happen: it used to discard the staged copy anyway and
+        # count it as restored, so the archive's index vanished while the import reported success.
+        return False
+    seen = {_index_key(line) for line in body.splitlines() if line.strip()}
+    added = [line for line in new_lines
+             if line.lstrip().startswith("- ") and _index_key(line) not in seen]
+    if added:
+        if body and not body.endswith("\n"):
+            body += "\n"
+        # ⚠️ Under a heading of their own. Appending bare pointer lines files them under whatever
+        # `##` section the live file happens to end with, so an archive's Trading entries arrive
+        # under Local - and this block is injected into every prompt, so a wrong heading is a
+        # standing false statement rather than untidiness. Carrying the archive's own headings
+        # across would mean merging two section structures; saying where these came from is
+        # honest, and the user can file them properly.
+        # ⚠️ Whether the tail is already that section, not whether the file mentions it anywhere.
+        # Checking the whole body suppressed the heading on every import after the first while
+        # still appending at EOF, so once the user added a section below it the entries filed under
+        # THAT - the exact misfiling this is here to stop, returning on the second import.
+        if _last_section(body) != "## Imported":
+            body += "\n## Imported\n"
+        live.write_text(body + "\n".join(added) + "\n")
+    return True
 
 
 def _safe_target(base: Path, name: str) -> Optional[Path]:
@@ -427,14 +569,18 @@ def import_user_memory(archive_bytes: bytes) -> dict:
     """
     if len(archive_bytes) > MAX_IMPORT_BYTES:
         raise ArchiveError(f"archive is larger than {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-    # ⚠️ Captured BEFORE ensure_user_memory, which SCAFFOLDS both of these. Without that, the
-    # preserve-the-live-file rule below sees the scaffold this call just created, decides the box
-    # has content worth protecting, and diverts the archive's copy to CLAUDE.imported.md - so a
-    # restore onto a fresh box would never actually restore. "Already there" has to mean "there
-    # before we touched it".
-    had_claude = Path(memory.USER_CLAUDE_MD).is_file()
-    had_index = Path(memory.USER_DIR, "MEMORY.md").is_file()
+    # ⚠️ The question is whether the live file holds REAL CONTENT, not whether it exists.
+    #
+    # Capturing existence before ensure_user_memory() was the previous attempt and it was wrong on
+    # every running agent: main.py's lifespan already scaffolds both files at STARTUP, long before
+    # an import arrives, so the file always existed, the preserve-the-live-file rule always fired,
+    # and the user's real notes were always diverted to CLAUDE.imported.md - which nothing reads
+    # and export_user_memory does not archive, so a second migration hop lost them outright. The
+    # unit test passed only because it unlinked the file first, which is a state no running agent
+    # ever presents. Verified by replaying the real sequence: scaffold, then import.
     memory.ensure_user_memory()
+    had_claude = _has_real_content(Path(memory.USER_CLAUDE_MD), memory._USER_CLAUDE_TEMPLATE)
+    had_index = _index_has_entries(Path(memory.USER_DIR, "MEMORY.md"))
     state_root = Path(memory.USER_DIR).parent
     memory_rel = Path(memory.USER_DIR).name                      # "memory"
     claude_rel = Path(memory.USER_CLAUDE_MD).name                # "CLAUDE.md"
@@ -479,16 +625,41 @@ def import_user_memory(archive_bytes: bytes) -> dict:
             final = state_root / relative
             final.parent.mkdir(parents=True, exist_ok=True)
             if final.name == "MEMORY.md" and final.is_file() and had_index:
-                _merge_index(final, absolute)
-                absolute.unlink(missing_ok=True)
+                if _merge_index(final, absolute):
+                    absolute.unlink(missing_ok=True)
+                else:
+                    # Could not read the live index, so nothing was merged. Keep the archive's copy
+                    # rather than dropping it and reporting a restore that did not happen.
+                    _keep_beside(absolute, Path(memory.USER_DIR) / "MEMORY.imported.md")
             elif final == Path(memory.USER_CLAUDE_MD) and final.is_file() and had_claude:
                 # Prose, so there is no safe line-wise merge. The live file wins and the archive's
-                # copy lands beside it for the user to reconcile, because "merge, not replace" has
-                # to be true of the file the prompt reads on every single turn.
-                if final.read_bytes() != absolute.read_bytes():
-                    shutil.move(str(absolute), str(final.with_name("CLAUDE.imported.md")))
-                else:
+                # copy is kept for the user to reconcile, because "merge, not replace" has to be
+                # true of the file the prompt reads on every single turn.
+                #
+                # ⚠️ The comparison must not RAISE. had_claude is deliberately true for a live file
+                # we could not read, and read_bytes() on that file then threw straight out of the
+                # import: a 500, staging destroyed, and the files already moved this pass left
+                # live - a partial restore that failed identically on every retry, which is worse
+                # than the overwrite this branch was added to prevent. Unreadable means we cannot
+                # compare, so it is treated as a conflict and both copies survive.
+                same = False
+                try:
+                    same = final.read_bytes() == absolute.read_bytes()
+                except OSError as e:
+                    logger.warning("Could not compare %s with the archive's copy: %s", final, e)
+                if same:
                     absolute.unlink(missing_ok=True)
+                else:
+                    # Inside memory/, NOT beside it at the state root: export_user_memory archives
+                    # memory/** plus the user CLAUDE.md and nothing else, so a conflict copy at the
+                    # root is invisible to the next export and the notes die on the following hop.
+                    _keep_beside(absolute, Path(memory.USER_DIR) / "CLAUDE.imported.md")
+            elif ".imported" in final.name and final.is_file():
+                # ⚠️ Now that the conflict copy lives in memory/, it is EXPORTED - so a restore
+                # carries box A's unreconciled notes into box B and the generic move below would
+                # overwrite box B's own, which is the same loss one level removed. Neither is
+                # reconciled yet, so neither may be discarded.
+                _keep_beside(absolute, final)
             else:
                 shutil.move(str(absolute), str(final))
             merged += 1
