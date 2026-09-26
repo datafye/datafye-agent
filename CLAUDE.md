@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code when working with this repository.
 
+> **Tracking:** Datafye open work lives in **Linear** (GTM project, team Datafye: https://linear.app/datafye). The `gtm/datafye/TODO.md` file is retired.
+
 
 ## ⚠️ `Task`'s absence from `INTERNAL_TOOLS` is intent, not enforcement
 
@@ -50,6 +52,7 @@ datafye-agent/
 ├── broker.py        # ConnectTrade broker integration
 ├── conversations.py # Per-user project store — one FOLDER per project (meta.json + CLAUDE.md + PROJECT.md + memory/ + .claude/skills/)
 ├── memory.py        # Cross-session memory: global store + the memory-protocol block injected into the prompt
+├── project_archive.py # DAT-293 export/import: one project, or the user's cross-project memory, as a versioned zip. Mostly REFUSALS — an archive is untrusted input
 ├── skills.py        # Skill plugin wiring (system + user-global plugins) and GET /v1/skills listing
 ├── warmth.py        # Warm signal: is real work in flight (feeds /health active_proxied_apps)
 ├── foundry.py       # Derived environment readiness (intent + observation + in-flight) behind /health's `foundry` block
@@ -58,6 +61,8 @@ datafye-agent/
 ├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
 ├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
 ├── tests/test_prompt_audit.py  # Dependency-free prompt audit; renders the REAL prompt and pins every claim that has been wrong
+├── tests/project_archive.py    # 84 unit checks over export/import — most of them the attacks the module must refuse
+├── tests/project_archive_api.py # The same four routes against a REAL agent process (auth, ceilings, round-trip)
 ├── requirements.txt # Python dependencies (incl. pyyaml for deployment-descriptor parsing)
 ├── Dockerfile       # Legacy (agent now runs natively, Docker used for Datafye env containers)
 ├── install/
@@ -1047,6 +1052,10 @@ that grows has to be the volume the data is on.
 | `/v1/conversations/{id}` | PATCH | Rename a conversation; 404 if absent |
 | `/v1/conversations/{id}` | DELETE | Permanently delete a project's agent-side folder via `conversations.delete()` (path-safety guard refuses anything outside the projects base); 204 on success, 404 if the agent never materialised it. Accounts deletes its own project record separately |
 | `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail; also returns the project's `intent` + `track` (+ `stage`/`maxStage`) so the frontend can rehydrate the right stepper. Each assistant message carries a per-turn `usage` (tokens+cost) tagged by `conversations.set_last_message_usage`, for the accounts Conversation view |
+| `/v1/conversations/{id}/export` | GET | Download the agent half of one project as a versioned zip (code, chat history, project memory, uploads, outputs; regenerable trees excluded and named in the manifest). Accounts bundles it with its own project record. 404 when the box never materialised the folder — a real state, since accounts can hold a record for a project nobody chatted to (DAT-293) |
+| `/v1/conversations/{id}/import` | POST | Write that zip back in, as the **caller's** id — accounts mints the id on the target box, and the record inside the archive is retargeted to match. Raw body, staged first; refuses an existing project unless `?overwrite=true` |
+| `/v1/memory/export` | GET | Download the user's cross-project memory: `<state>/memory/**` plus the user's own `<state>/CLAUDE.md`, both archived relative to the STATE ROOT so an import can put each back where it belongs. Fleet memory is deliberately not in it (read-only, replaced wholesale on upgrade). An over-ceiling tree is a **400**, not a 500 — accounts renders any 5xx as a bare `user_memory: unavailable` with no reason |
+| `/v1/memory/import` | POST | **Merge** that memory in, never replace: the target box may already carry memory this user's box learned after the export |
 | `/v1/conversations/{id}/outputs` | GET | List the project's downloadable deliverables — files the agent wrote to the project's `outputs/` folder (distinct from `uploads/`), as `{name, type, size, modified_at}`. JWT-protected |
 | `/v1/conversations/{id}/outputs/{filename}` | GET | Download one deliverable as a `FileResponse` from `outputs/`. Path-safety-guarded (refuses anything resolving outside `outputs/`); JWT-gated; 404 if absent |
 
@@ -1138,6 +1147,9 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_FOUNDRY_PING_TIMEOUT` | `40` | Bound on the per-dataset health ping. Deliberately ABOVE the deployment API's own 30s reply timeout: a dead service makes the API wait that long, and bounding below it would turn every partial environment into "not answering at all" |
 | `DATAFYE_AGENT_RUN_DIR` | `~/.datafye/run` | The CLI's run directory, where the DAT-196 lock and the DAT-183 in-progress markers live. Read (never written) to tell whether an environment operation is in flight. Not under the agent state root — it belongs to the environment, which outlives this process |
 | `DATAFYE_AGENT_FOUNDRY_STOP_TIMEOUT` | `240` | Upper bound (seconds) on the graceful environment stop. Deliberately BELOW accounts' own 300s read timeout so the agent is what expires and can answer with which outcome happened |
+| `DATAFYE_AGENT_MAX_IMPORT_MB` | `512` | Ceiling on an uploaded archive (DAT-293). Enforced by `main._read_capped_body` **while the bytes arrive**, and again in `project_archive` for a direct caller |
+| `DATAFYE_AGENT_MAX_EXPANDED_MB` | `2048` | Ceiling on what an archive expands to, checked entry by entry during extraction — the compressed size bounds nothing on its own (a zip bomb is small) |
+| `DATAFYE_AGENT_MAX_EXPORT_MB` | `1024` | Ceiling on what an export may carry. The memory export **measured this and then never looked at it**, so an oversized tree was archived anyway and failed further down the line as an unexplained `unavailable` |
 | `DATAFYE_AGENT_JWT_LEEWAY_SECONDS` | `60` | Clock-skew tolerance applied to time-based JWT claims (iat/nbf/exp) when verifying accounts-signed tokens — avoids "token not yet valid (iat)" failures from clock drift |
 | `DATAFYE_UPGRADE_INACTIVITY_WINDOW` | `120` | Auto-upgrade idle gate (seconds). `upgrade-check.sh` proceeds only when `now - last_chat_activity_at >= this` (plus `running_jobs==0` and `active_proxied_apps==[]`); otherwise it defers to the next tick. See *Auto-upgrade never restarts mid-turn* |
 | `DATAFYE_UPGRADE_JITTER_SECONDS` | `60` | Random pre-download sleep in `upgrade-check.sh` to spread fleet load on `downloads.n5corp.com` (single origin/no CDN) |
@@ -1425,6 +1437,89 @@ Three details are load-bearing:
 - **The endpoint is gated by a purpose-scoped `agent-lifecycle` token**, not by the user JWT and not left open like `/v1/credentials/update`. That endpoint only writes a cache value; an unauthenticated stop would let anyone who can reach the agent take a user's environment down. A *user* token would be wrong in the other direction — this is accounts acting as accounts, and borrowing a person's identity for a machine call would mint a user-equivalent credential on every dormancy tick. `auth.require_accounts_lifecycle_jwt` demands `purpose=agent-lifecycle` **and** `sub` matching this sandbox; a perfectly valid login token is refused. Both guards now share one `_decode_bearer`, so the signature/issuer/algorithm checks cannot drift between them.
 
 The engine half is in `datafye-deploy`: `stop` no longer aborts when one application fails to shut down, and falls back to the container inventory when the deployment API cannot say which systems are deployed — because the API *is* one of the applications, so the box that most needs stopping was the one where the stop did least.
+
+### Export and import a project, and the user's memory (DAT-293/300)
+
+A project can now leave the box and come back, or land on a different one: four routes in
+`main.py` over one new module, `project_archive.py`, all four behind `require_bootstrapped` +
+`auth.require_self_jwt`.
+
+```
+GET|POST /v1/conversations/{id}/export | /import
+GET|POST /v1/memory/export             | /import
+```
+
+Accounts calls them and bundles the zip with its own project record, so a project travels as one
+file. The bytes move over HTTP and **never touch the message bus** — this is a bulk transfer between
+two components on the same network, and putting megabytes through a channel sized for events is how
+you find out what its frame limits are.
+
+**An archive is untrusted input, so most of the module is what import refuses.** Zip-slip in its
+several dialects (traversal, a doubled separator, an absolute-looking name), a project id that is
+itself a path, the size and expansion ceilings, and — the one worth reading twice — a memory archive
+carrying anything but the memory dir and the user's `CLAUDE.md`. That last check is an
+**allow-list, not a containment check**, and the reason is where those entries are archived from:
+relative to the **STATE ROOT**, which also holds `credentials.bin`, every other project, and
+`plugins/user/skills`, where a planted file is **executable by the agent**. ⚠️ **Staying inside the
+base directory is not a sufficient check when the base is the state root** — the destination has to
+be named. Extraction stages into a temp dir first, so an archive refused halfway has not already
+written part of itself.
+
+- **`_require_safe_project_id` guards export AND import.** Import was guarded from the start;
+  export was not, and `export_project("..")` archived the state root — reproduced at 7 entries:
+  `credentials.bin`, `broker_user.json`, the user skills, other people's projects. ⚠️ **On
+  reachability, because this was initially overstated:** the HTTP route does *not* let it through.
+  `/v1/conversations/%2e%2e/export` is normalised before routing and 404s **with or without the
+  guard** — measured both ways. So the guard is defence in depth for callers of the *function*,
+  and the thing that actually made the export safe was an **untested property of the web
+  framework**, which is not a thing to build a security boundary on. The allow-list deliberately
+  matches the accounts-side `isSafeProjectId`: two components disagreeing about which ids are legal
+  is a gap that only shows itself under attack.
+- **`_add_member` writes members by hand, and the metadata is load-bearing.** It takes metadata from
+  `ZipInfo.from_file` (mode and mtime preserved; `strict_timestamps=False` clamps both ends of what
+  a zip can represent) and **streams** content through `z.open(info, "w")` + `copyfileobj`.
+  ⚠️ A bare `ZipInfo` carries no `external_attr`, so every member came out `0600` and every
+  executable was broken on restore; it also carries its **own** `compress_type`, defaulting to
+  STORED regardless of what the `ZipFile` was opened with, so `info.compress_type = ZIP_DEFLATED`
+  is not decoration. ⚠️ **`ZipFile.write` is not all-or-nothing** — a failure part way through
+  leaves a *committed, truncated* member — so a member that fails mid-write is named in the
+  manifest's `partial_files` rather than being silently miscounted. The manifest is written
+  **last**, so its count describes what the archive holds rather than what we set out to put in it.
+- **Memory import merges, and "merge" has to be true of the two always-on files.** `MEMORY.md` is
+  line-unioned keyed on the **link target**, not the whole line: deduping whole lines re-added an
+  entry whose description had since been edited, as a second stale pointer, on every single
+  restore. Appended entries go under an `## Imported` heading chosen by checking whether the **last**
+  section is already that — checking the whole body suppressed the heading on every import after
+  the first, filing entries under whatever section the user happened to have added last.
+  `CLAUDE.md` is prose, and prose has no safe line-wise merge: the live file wins and the archive's
+  copy is kept via `_keep_beside` under a numbered name, **inside `memory/`** so the next export
+  carries it rather than stranding it.
+- ⚠️ **"Already there" means "there before we touched it", and unreadable means precious.**
+  `main.py`'s lifespan calls `ensure_user_memory()` at **startup**, so an existence check was
+  always true on any running agent: the preserve-the-live-file rule always fired and a restored
+  user's real notes always went to `CLAUDE.imported.md` — a file nothing reads and export does not
+  archive, so a second migration hop lost them outright. `_has_real_content` / `_index_has_entries`
+  ask whether there is real content rather than the scaffold template, and treat an **unreadable**
+  file as having content: folding "cannot look" into "nothing worth keeping" means overwriting it.
+  The unit test had passed only because it unlinked the file first, which is a state no running
+  agent ever presents.
+- **`conversations.py` learned about staging dirs.** `list_conversations` skips dot-prefixed
+  directories — a retargeted `.import-<id>.tmp` looked like a valid project, got listed twice
+  during the swap, and a crash mid-import left an undeletable phantom in the list.
+  `note_orphan_staging_dirs()` sweeps **both** `<state>/projects` and `<state>` (memory imports
+  stage one level up, which the project listing never walks), logs anything older than an hour and
+  prunes its own warned map. ⚠️ A warning that silently covers half the cases is worse than none.
+- **`main._read_capped_body` streams against the ceiling into a `BytesIO`.** `await request.body()`
+  buffers the whole upload before any check can fire, so a limit applied afterwards protects
+  nothing. And the obvious streaming fix — collect chunks, `b"".join` at the end — holds both
+  copies at once: a body at the 512 MB cap peaked near 1 GB of RSS. The ceiling bounded the upload
+  and not the memory it cost, which is the same miss one layer down.
+
+⚠️ **On the API test suite** (`tests/project_archive_api.py`, which runs a real agent process): it
+asserts that a **subject** mismatch is refused, not an audience one — this agent runs
+`verify_aud=False`, being a single product. Its JWKS URL derives from `ACCOUNTS_URL` with no
+override, and `/health` needs a generous probe timeout locally because it resolves the deployment
+and MCP hosts.
 
 ## Key Design Decisions
 
