@@ -94,6 +94,8 @@ We deliberately leaned on the engine's native skill machinery instead of hand-ro
 
 The agent keeps durable facts as plain markdown it writes and reads itself — no database, no special tool. Two scopes: **global** (cross-project: the user's preferences and reusable lessons) and **per-project**. The mechanism is pure convention, driven by a protocol in the system prompt: only the one-line `MEMORY.md` *indexes* (and the small `CLAUDE.md` notes) are always in context; the detailed memory files are read on demand when an index line looks relevant. That keeps the per-turn cost flat (~450 tokens, mostly the fixed protocol) even as the store grows.
 
+Because it is plain markdown on disk, it is also **portable**: `/v1/memory/export` carries the cross-project half (the memory dir plus the user's own `CLAUDE.md`) to another box, and the import *merges* rather than replaces. Per-project memory needs no separate route — it rides inside the project's own archive. Fleet memory is deliberately in neither: it is read-only and replaced wholesale on upgrade, so a copy of it would silently diverge. See *A Project You Can Take With You (DAT-293/300)*.
+
 The interesting decision was *not* to use the CLI's own auto-memory. It sounds like leaving sophistication on the table — until you look: auto-memory is scoped per-git-repository with **no global tier** (so a "2% stop on everything" preference learned in one project is invisible in the next), it stores under `~/.claude`, and its "recall" is just the first 200 lines of a `MEMORY.md` prefix — the *same* index-plus-on-demand shape we built. So we run one explicit model we control (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) that fits our two-scope, folder-per-project layout. The honest limitation: *whether* to remember and *what* to fetch are both model judgments guided by the protocol, not a guaranteed retrieval engine — a future RAG layer over the same markdown files is the planned upgrade for scale.
 
 ### Commentary: A Live Activity Feed
@@ -1569,6 +1571,141 @@ and the version of this same fix shipped a year later would have been three rele
 feature flag. Which is the real argument for looking hard at the *shape* of your events
 before anything depends on them.
 
+### A Project You Can Take With You (DAT-293/300)
+
+Until this session, a Datafye project was something that happened to be on a particular
+box. Accounts held a record of it; the box held the thing itself — the code, the
+conversation, the project's memory, the uploads, the deliverables. If the box went away, or
+the user needed to move to a bigger one, the record survived and the work did not. DAT-293
+is the agent half of fixing that: four routes over one new module, `project_archive.py`,
+that turn a project — or the user's cross-project memory — into a versioned zip and back.
+
+```
+GET|POST /v1/conversations/{id}/export | /import
+GET|POST /v1/memory/export             | /import
+```
+
+Accounts calls them and bundles the resulting zip with its own project record, so a project
+travels as **one file**. Worth noting what these bytes do *not* do: they never go near the
+message bus. This is a bulk transfer between two components sitting on the same network,
+and the way you discover a message channel's frame limits is by sending a 400 MB project
+through one.
+
+**Then the interesting part, which is that almost none of this module is about writing
+zips.** Export is short. Import is long, and nearly all of its length is refusals, because
+an archive arriving over HTTP is **untrusted input that happens to describe a filesystem**.
+It refuses zip-slip in each of its dialects (a `..` segment, a doubled separator, a name
+that only looks relative), a project id that is itself a path, an upload past the size
+ceiling, an archive that expands past the expansion ceiling — a zip bomb is small, so the
+compressed size bounds nothing on its own — and, the one worth dwelling on, a memory
+archive carrying anything at all except the memory directory and the user's `CLAUDE.md`.
+
+That last check is an **allow-list rather than a containment check**, and the reason is a
+good lesson in how a perfectly reasonable security check can be aimed at the wrong thing.
+The natural instinct is "make sure every entry lands inside the base directory" — which is
+exactly what the project import does, correctly. But the user's memory is archived relative
+to the **state root**, because the two things it holds live in different places
+(`<state>/memory/**` and `<state>/CLAUDE.md`, one level apart), and the state root also
+holds `credentials.bin`, every other project on the box, and `plugins/user/skills` — where
+a planted file is not merely written, it is **executable by the agent on the next turn**.
+So: ⚠️ **staying inside the base directory is not a sufficient check when the base is the
+state root.** The destination has to be *named*, not merely bounded. Extraction stages into
+a temp directory first, so an archive that is refused halfway has not already written half
+of itself into the live tree.
+
+**The guard that was on the wrong door.** `_require_safe_project_id` is now shared by export
+and import. Import had it from the first commit; export did not, and `export_project("..")`
+cheerfully archived the state root — reproduced, at seven entries: `credentials.bin`,
+`broker_user.json`, the user's skills, other projects.
+
+⚠️ And then a correction, because the first version of this note overstated it. The HTTP
+route does **not** let that through. `/v1/conversations/%2e%2e/export` is normalised before
+it ever reaches routing and 404s — measured **with and without** the guard, identically. So
+the honest description is that the guard is defence in depth for callers of the *function*,
+and that the thing which had actually been keeping the export endpoint safe was **an
+untested property of the web framework's URL handling**. Nobody chose that. Nobody wrote it
+down. It would have held until a refactor, a proxy in front, or an internal caller reaching
+the function directly. A security boundary you did not know you had is a security boundary
+you cannot keep. (The allow-list also deliberately mirrors the accounts-side
+`isSafeProjectId`: two components disagreeing about which ids are legal is the kind of gap
+that only announces itself under attack.)
+
+**Three things about writing the zip that the standard library will let you get wrong
+quietly.** Members are added by hand in `_add_member`, from `ZipInfo.from_file` metadata
+(mode and mtime preserved, with `strict_timestamps=False` clamping both ends of what the
+zip format can actually represent), with content **streamed** through
+`z.open(info, "w")` + `copyfileobj` rather than read into memory.
+
+- ⚠️ A bare `ZipInfo` you construct yourself carries no `external_attr`, so every member
+  came out `0600` and every executable in the project was broken on restore. The permission
+  bits are not a nicety; for a project that includes scripts they are part of the thing
+  being backed up.
+- ⚠️ A `ZipInfo` also carries **its own** `compress_type`, which defaults to STORED no
+  matter what you opened the `ZipFile` with. So `info.compress_type = ZIP_DEFLATED` is
+  load-bearing, and the symptom of omitting it is nothing but an archive several times
+  larger than it should be — which nobody notices until it trips the size ceiling.
+- ⚠️ **`ZipFile.write` is not all-or-nothing.** A failure part way through leaves a
+  *committed, truncated* member in the archive. So a member that fails mid-write is named
+  in the manifest's `partial_files` rather than being quietly dropped from the count, and
+  the manifest is written **last** — so what it says is what the archive holds, not what we
+  intended to put in it. An inventory taken before the loading is finished is a wish list.
+
+**"Merge" has to be true of the files that are always on.** Memory import merges rather than
+replaces, because the target box may already hold memory this user's agent learned after the
+export. That is easy to say and has two awkward files in the way.
+
+`MEMORY.md`, the index, is line-unioned — but keyed on the **link target**, not on the whole
+line. Deduping whole lines looks right and is subtly wrong: an entry whose *description* had
+been edited since the export no longer matches textually, so every restore re-added it as a
+second, stale pointer to the same file. Appended entries go under an `## Imported` heading,
+and choosing when to add that heading has its own trap: checking whether the heading appears
+anywhere in the body suppressed it on every import after the first, which filed new entries
+under whatever section the user had most recently added. The check is on whether the **last**
+section is already `## Imported`.
+
+`CLAUDE.md` is prose, and prose has no safe line-wise merge — union two paragraphs and you
+get neither. So the live file wins, and the archive's copy is kept beside it via
+`_keep_beside` under a numbered name, **inside `memory/`** — which is the detail that makes
+it a real answer rather than a polite one, because that is the directory the next export
+carries. Put it anywhere else and the copy you preserved is lost at the next hop.
+
+⚠️ **"Already there" means "there before we touched it", and unreadable means precious.**
+This is the bug in this arc that best deserves remembering. The preserve-the-live-file rule
+was gated on whether the file existed — and `main.py`'s lifespan calls `ensure_user_memory()`
+at **startup**. So on any actually-running agent the file always existed, the rule always
+fired, and a restored user's real notes always went to `CLAUDE.imported.md`: a file nothing
+reads and `export_user_memory` does not archive, so the second migration hop lost them
+outright. The unit test passed the whole time, because it unlinked the file first — a state
+no running agent has ever presented. The fix is `_has_real_content` / `_index_has_entries`,
+which ask whether there is *real content* as opposed to the scaffold template, and which
+treat an **unreadable** file as having content. That last choice is the conservative one on
+purpose: folding "I cannot look at this" into "there is nothing here worth keeping" is how
+you overwrite the thing you were protecting.
+
+Two smaller repairs came out of the same work. `conversations.list_conversations` now skips
+dot-prefixed directories, because a retargeted `.import-<id>.tmp` looked like a perfectly
+good project: it appeared twice in the listing during the swap, and a crash mid-import left
+an undeletable phantom behind. And `note_orphan_staging_dirs()` sweeps **both**
+`<state>/projects` and `<state>` — the memory import stages one level up, which the project
+listing never walks, so hooking the warning into the listing covered half the cases and said
+nothing about the other half. ⚠️ A warning that silently covers half its cases is worse than
+no warning, because it is also a claim of coverage.
+
+Finally, the upload path, which is a small lesson about where a limit has to sit.
+`main._read_capped_body` streams the request against the ceiling. The version that does not
+work is the obvious one: `await request.body()` and then check the size — by which point the
+whole multi-gigabyte upload is in memory and the limit is decorative. The version that
+*almost* works is streaming into a list of chunks and `b"".join`-ing at the end, which holds
+both the chunk list and the joined result at once: a body at the 512 MB cap peaked near 1 GB
+of RSS. The ceiling bounded the upload and not what the upload cost, which is the same miss
+one layer down. It accumulates into a single `BytesIO`.
+
+⚠️ One note for whoever next runs `tests/project_archive_api.py`, which starts a **real**
+agent process: it asserts that a **subject** mismatch is refused, not an audience one — this
+agent runs `verify_aud=False`, being a single product. Its JWKS URL derives from
+`ACCOUNTS_URL` with no override, and `/health` wants a generous probe timeout locally,
+because answering it resolves the deployment and MCP hosts.
+
 ### Where This Stands, and What the Next Person Picks Up
 
 The section above (*A Note on Where All This Stands*) explains why "merged" and "true of a
@@ -1601,6 +1738,11 @@ DAT-225, DAT-226, DAT-203, and DAT-234. Three of those carry a wrinkle worth sta
   re-proved.
 - **DAT-203 must be tested with `python3 -c "import time; time.sleep(700)"`**, never with
   `sleep`, which the harness blocks outright before it ever reaches the shell (see DAT-218).
+- **DAT-293 (export/import) is merged with both suites green** — 84 unit checks in
+  `tests/project_archive.py` and `tests/project_archive_api.py` against a real agent
+  process — but green here proves the agent half only. The end-to-end claim is *a project
+  leaves one box and arrives on another*, and that runs through accounts, so it is not
+  proved until it has been done between two sandboxes with accounts bundling the zip.
 
 **Known and deliberately deferred**, all four being corners of the same upgrade path:
 
@@ -1909,7 +2051,8 @@ The agent doesn't have a Rumi store (it's Python/FastAPI, not a Rumi application
 - **`GET /health`** — reports `bootstrapped`, `anthropic_key_status`, `credentials_generation`, `last_chat_activity_at`, `running_jobs`, `active_proxied_apps`. `username` and `credentials_generation` are `null` until bootstrapped. Accounts polls this for idle detection and cache-loss recovery (if `credentials_generation` drifts from what accounts last pushed, accounts re-pushes everything — see the [datafye-accounts PROJECT.md](../datafye-accounts/PROJECT.md) idle-monitor section). `last_chat_activity_at` is **seeded to boot time, not 0**: the accounts idle-monitor treats `0` as "never active" and skips it, so a provisioned-but-never-chatted agent would otherwise live forever; seeding to boot makes its idle clock start ticking immediately.
 - **`POST /v1/credentials`** — removed; returns 410 Gone. The frontend no longer writes credentials directly to the agent; all writes go through accounts.
 - **`/v1/conversations*`** — the agent's chat-layer conversation store (history replay via `GET /v1/conversations/{id}/history`). The id-minting `POST`/list `GET` are legacy/unused now that accounts is the authoritative project registry; the agent materialises a local record for an accounts-minted id via `conversations.ensure()` on the first chat turn. `DELETE /v1/conversations/{id}` permanently removes the project's agent-side folder via `conversations.delete()` (204, or 404 if the agent never materialised it) — guarded by a path-safety check that refuses to `rmtree` anything resolving outside the projects base, so a malformed or hostile id like `..` can't escape. Accounts deletes its own project-registry record separately.
-- **JWT validation** on `/v1/chat`, `/v1/credentials/status`, and `/v1/broker/*`: verify the accounts-signed JWT against accounts' JWKS and check `sub == the agent's bootstrapped username`. Reject otherwise.
+- **`GET|POST /v1/conversations/{id}/export`|`/import`** and **`GET|POST /v1/memory/export`|`/import`** — the DAT-293 portability pair, all four behind `require_bootstrapped` + `require_self_jwt`. Export streams a versioned zip (`FileResponse` from a temp dir cleaned up in a `BackgroundTask` *after* the response, since removing it earlier truncates the download); import takes the zip as the raw body, stages it, and merges or installs it. The id is always the **caller's** — accounts mints it on the target box and the record inside the archive is retargeted — so importing into another account is just a different id. See *A Project You Can Take With You*.
+- **JWT validation** on `/v1/chat`, `/v1/credentials/status`, `/v1/broker/*`, and the export/import routes: verify the accounts-signed JWT against accounts' JWKS and check `sub == the agent's bootstrapped username`. Reject otherwise. ⚠️ Note the audience claim is **not** checked (`verify_aud=False`) — this is a single-product token, and `tests/project_archive_api.py`'s negative case is therefore a *subject* mismatch, not an audience one.
 
 **A startup route guard keeps a broken agent from looking healthy.** A module-level check at the bottom of `main.py` walks `app.routes` and asserts that the load-bearing trio — `GET /health`, `POST /bootstrap`, `POST /v1/chat` — are all registered, raising `RuntimeError` at import if any is missing. The failure mode it defends against is subtle: if a mis-applied edit clobbered a route's decorator, the agent would still boot and serve `/health` 200 while silently 404'ing `/bootstrap`, so accounts' idle-monitor would see "Running" and never realise the agent can't actually be bootstrapped. Crashing loudly at boot turns that invisible degradation into an obvious failure.
 
