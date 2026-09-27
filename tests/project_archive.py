@@ -1,4 +1,8 @@
-"""Export/import of a project and the cross-project memory (DAT-293/300).
+"""Export/import of ONE project (DAT-293/300).
+
+Export/import of a whole user - every project plus the cross-project memory - was removed in
+DAT-325, so there is nothing here about user-level memory. A project's own memory travels inside
+its archive and is covered by the round-trip tests.
 
 The interesting cases are not the happy path. An archive is untrusted input, so most of what is
 asserted here is what import REFUSES: an entry that escapes the project directory, an id that is a
@@ -218,63 +222,6 @@ try:
 except pa.ArchiveError as e:
     check("refuses an archive with no content", "no project content" in str(e))
 
-print("== user-level memory round trip ==")
-memory.ensure_user_memory()
-Path(memory.USER_DIR, "fact.md").write_text("the user prefers Java\n")
-Path(memory.USER_CLAUDE_MD).write_text("user-level CLAUDE\n")
-mem_zip = _TMP / "mem.zip"
-mem_manifest = pa.export_user_memory(mem_zip)
-mem_names = zipfile.ZipFile(mem_zip).namelist()
-check("memory archive carries the memory dir", "memory/memory/fact.md" in mem_names, mem_names)
-check("memory archive carries the user CLAUDE.md beside it",
-      "memory/CLAUDE.md" in mem_names, mem_names)
-check("memory manifest is versioned", mem_manifest["kind"] == "datafye-user-memory")
-
-shutil.rmtree(memory.USER_DIR, ignore_errors=True)
-Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
-pa.import_user_memory(mem_zip.read_bytes())
-check("memory dir restored", Path(memory.USER_DIR, "fact.md").read_text() == "the user prefers Java\n")
-check("user CLAUDE.md restored to the STATE dir, not inside memory/",
-      Path(memory.USER_CLAUDE_MD).read_text() == "user-level CLAUDE\n")
-
-print("== memory import merges rather than replaces ==")
-Path(memory.USER_DIR, "local-only.md").write_text("learned on this box\n")
-pa.import_user_memory(mem_zip.read_bytes())
-check("a fact already on the box survives an import",
-      Path(memory.USER_DIR, "local-only.md").exists())
-
-print("== a memory archive may only carry memory/ and CLAUDE.md ==")
-
-
-def _evil_memory(entry_name: str) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1, "kind": "datafye-user-memory"}))
-        z.writestr(entry_name, "pwned\n")
-    return buf.getvalue()
-
-
-# These stay INSIDE the state root, so the path-containment check accepts them. What stops them is
-# the allow-list: the state root holds the encrypted credential store, every other project, and
-# plugins/user/skills, where a planted file is EXECUTABLE by the agent.
-_state = Path(os.environ["DATAFYE_AGENT_STATE_DIR"])
-for evil_name, why in [
-        ("memory/plugins/user/skills/pwn/SKILL.md", "an executable user-global skill"),
-        ("memory/credentials.bin", "the encrypted credential store"),
-        ("memory/projects/p-dest/meta.json", "another project's record"),
-        ("memory/../CLAUDE.md", "an escape by traversal")]:
-    try:
-        pa.import_user_memory(_evil_memory(evil_name))
-        check(f"refuses {evil_name} ({why})", False, "import succeeded")
-    except pa.ArchiveError as e:
-        check(f"refuses {evil_name} ({why})", "refusing" in str(e), str(e))
-check("no skill was planted", not (_state / "plugins" / "user" / "skills" / "pwn").exists())
-check("the credential store was not written", not (_state / "credentials.bin").exists())
-check("another project's record is intact",
-      json.loads((conversations.project_dir("p-dest") / "meta.json").read_text())["id"] == "p-dest")
-check("a refused memory import leaves no staging dir",
-      not list(_state.glob(".import-memory-*")))
-
 print("== an import with no record is refused, and does not destroy what is there ==")
 _make_project("p-keep", name="precious")
 no_meta = io.BytesIO()
@@ -309,161 +256,6 @@ except pa.ArchiveError as e:
 finally:
     pa.MAX_EXPORT_BYTES = _saved_export
 
-shutil.rmtree(_TMP, ignore_errors=True)
-print("== a restore onto a SCAFFOLDED box (what every running agent presents) ==")
-# ⚠️ THE TEST THAT WAS MISSING, and its absence is why the previous fix shipped broken. main.py's
-# lifespan calls ensure_user_memory() at STARTUP, so by the time an import arrives both files
-# already exist as templates. The old check asked "did it exist?", which was therefore always yes,
-# so the user's real notes were diverted to CLAUDE.imported.md - a file nothing reads and
-# export_user_memory does not archive, losing them on the next migration hop. The old test passed
-# only because it unlinked the file first, a state no running agent ever presents.
-shutil.rmtree(memory.USER_DIR, ignore_errors=True)
-Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
-memory.ensure_user_memory()
-Path(memory.USER_CLAUDE_MD).write_text("MY REAL NOTES: prefers pandas\n")
-Path(memory.USER_DIR, "MEMORY.md").write_text("# User Memory\n- [style](style.md) - terse\n")
-Path(memory.USER_DIR, "style.md").write_text("terse\n")
-donor = _TMP / "donor.zip"
-pa.export_user_memory(donor)
-
-# a FRESH box: wiped, then scaffolded exactly as startup does, then the archive arrives
-shutil.rmtree(memory.USER_DIR, ignore_errors=True)
-Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
-memory.ensure_user_memory()                       # <-- this is what main.py does at boot
-pa.import_user_memory(donor.read_bytes())
-check("the user's notes land in the LIVE CLAUDE.md, not beside it",
-      "MY REAL NOTES" in Path(memory.USER_CLAUDE_MD).read_text(),
-      Path(memory.USER_CLAUDE_MD).read_text()[:80])
-check("no stray CLAUDE.imported.md is left on a scaffolded box",
-      not Path(memory.USER_DIR).parent.joinpath("CLAUDE.imported.md").exists())
-restored_index = Path(memory.USER_DIR, "MEMORY.md").read_text()
-check("the index carries the archive's entry", "style.md" in restored_index, restored_index)
-check("and not the scaffold's placeholder above it",
-      "Empty for now" not in restored_index, restored_index)
-
-print("== an index entry whose description changed is not duplicated ==")
-Path(memory.USER_DIR, "MEMORY.md").write_text(
-    "# User Memory\n- [style](style.md) - terse, and updated since the export\n")
-pa.import_user_memory(donor.read_bytes())
-idx = Path(memory.USER_DIR, "MEMORY.md").read_text()
-check("the topic is pointed at exactly once", idx.count("style.md") == 1, idx)
-check("and it is the LIVE description that survives", "updated since the export" in idx, idx)
-
-print("== the memory index is MERGED, not overwritten ==")
-# A plain move is an overwriting rename, so a restore of an older archive dropped every index line
-# added since the export - and a dropped line makes its topic file INVISIBLE, because bodies are
-# only ever read via the index.
-memory.ensure_user_memory()
-mem_dir = Path(memory.USER_DIR)
-mem_dir.mkdir(parents=True, exist_ok=True)
-Path(mem_dir, "MEMORY.md").write_text("# index\n- [old](old.md) - from the archive\n")
-Path(mem_dir, "old.md").write_text("old body\n")
-arch = _TMP / "mem-old.zip"
-pa.export_user_memory(arch)
-# now the live box learns something new
-Path(mem_dir, "MEMORY.md").write_text(
-    "# index\n- [old](old.md) - from the archive\n- [fresh](fresh.md) - learned since\n")
-Path(mem_dir, "fresh.md").write_text("fresh body\n")
-Path(memory.USER_CLAUDE_MD).write_text("LIVE user CLAUDE\n")
-pa.import_user_memory(arch.read_bytes())
-index = Path(mem_dir, "MEMORY.md").read_text()
-check("the line learned since the export survives the restore", "fresh.md" in index, index)
-check("and the archive's own line is there too", "old.md" in index, index)
-check("the live user CLAUDE.md is not overwritten",
-      Path(memory.USER_CLAUDE_MD).read_text() == "LIVE user CLAUDE\n",
-      Path(memory.USER_CLAUDE_MD).read_text())
-# ⚠️ Inside memory/, not beside it at the state root. export_user_memory archives memory/** plus
-# the user CLAUDE.md and nothing else, so a conflict copy at the root is invisible to the NEXT
-# export and the notes vanish on the following hop - the exact harm this branch exists to prevent.
-kept = Path(mem_dir, "CLAUDE.imported.md")
-check("the archive's CLAUDE.md is kept to reconcile", kept.exists(), list(mem_dir.iterdir()))
-_roundtrip = _TMP / "again.zip"
-pa.export_user_memory(_roundtrip)
-check("and the NEXT export carries it, so a second hop cannot lose it",
-      any(n.endswith("CLAUDE.imported.md") for n in zipfile.ZipFile(_roundtrip).namelist()),
-      zipfile.ZipFile(_roundtrip).namelist())
-
-print("== an UNREADABLE live file must not blow up the import ==")
-# ⚠️ Round 5 made _has_real_content return True for an unreadable file (right: when in doubt the
-# file is precious) and the very next line called read_bytes() on it, which threw straight out of
-# the import - a 500, staging destroyed, files already moved left live. A partial restore that
-# failed identically on every retry, which is WORSE than the overwrite the branch was preventing.
-shutil.rmtree(memory.USER_DIR, ignore_errors=True)
-Path(memory.USER_CLAUDE_MD).unlink(missing_ok=True)
-memory.ensure_user_memory()
-Path(memory.USER_DIR, "MEMORY.md").write_text("# User Memory\n- [d](d.md) - donor\n")
-Path(memory.USER_DIR, "d.md").write_text("d\n")
-Path(memory.USER_CLAUDE_MD).write_text("DONOR\n")
-_unread_arch = _TMP / "unreadable.zip"
-pa.export_user_memory(_unread_arch)
-
-shutil.rmtree(memory.USER_DIR, ignore_errors=True)
-memory.ensure_user_memory()
-_live = Path(memory.USER_CLAUDE_MD)
-_live.write_text("PRECIOUS LOCAL NOTES\n")
-os.chmod(_live, 0o000)
-try:
-    pa.import_user_memory(_unread_arch.read_bytes())
-    check("an unreadable live CLAUDE.md does not raise", True)
-except Exception as e:
-    check("an unreadable live CLAUDE.md does not raise", False, f"{type(e).__name__}: {e}")
-finally:
-    os.chmod(_live, 0o644)
-check("and the precious local file is untouched",
-      _live.read_text() == "PRECIOUS LOCAL NOTES\n", _live.read_text())
-check("while the archive's copy is kept to reconcile",
-      any(Path(memory.USER_DIR).glob("CLAUDE.imported*")),
-      list(Path(memory.USER_DIR).iterdir()))
-
-print("== two unreconciled conflict copies must not overwrite each other ==")
-# The conflict copy now lives in memory/, so it is EXPORTED - a restore carries box A's
-# unreconciled notes into box B, where box B's own must not be discarded to make room.
-Path(memory.USER_DIR, "CLAUDE.imported.md").write_text("BOX B unreconciled\n")
-_a = _TMP / "boxa.zip"
-_prev = Path(memory.USER_DIR, "CLAUDE.imported.md").read_text()
-with zipfile.ZipFile(_a, "w") as z:
-    z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1, "kind": "datafye-user-memory"}))
-    z.writestr(pa._MEMORY_PREFIX + "memory/CLAUDE.imported.md", "BOX A unreconciled\n")
-pa.import_user_memory(_a.read_bytes())
-_kept = {p.read_text().strip() for p in Path(memory.USER_DIR).glob("CLAUDE.imported*")}
-check("box B's copy survives", "BOX B unreconciled" in _kept, _kept)
-check("and box A's arrives beside it", "BOX A unreconciled" in _kept, _kept)
-
-print("== a second import does not file under a section the user added ==")
-shutil.rmtree(memory.USER_DIR, ignore_errors=True)
-memory.ensure_user_memory()
-_idx = Path(memory.USER_DIR, "MEMORY.md")
-_idx.write_text("# User Memory\n- [live](live.md) - mine\n")
-
-
-def _donor(name, path):
-    with zipfile.ZipFile(path, "w") as z:
-        z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1, "kind": "datafye-user-memory"}))
-        z.writestr(pa._MEMORY_PREFIX + "memory/MEMORY.md",
-                   f"# User Memory\n- [{name}]({name}.md) - imported\n")
-        z.writestr(pa._MEMORY_PREFIX + f"memory/{name}.md", "x\n")
-    return path
-
-
-pa.import_user_memory(_donor("first", _TMP / "d1.zip").read_bytes())
-_idx.write_text(_idx.read_text() + "\n## Trading\n- [t](t.md) - my trading notes\n")
-pa.import_user_memory(_donor("second", _TMP / "d2.zip").read_bytes())
-_body = _idx.read_text()
-_after_trading = _body.split("## Trading", 1)[1].split("## Imported")[0]
-check("the second import is not filed under the user's own section",
-      "second.md" not in _after_trading, _body)
-
-print("== a memory import that restored nothing is not a success ==")
-buf = io.BytesIO()
-with zipfile.ZipFile(buf, "w") as z:
-    z.writestr(pa._MANIFEST_NAME, json.dumps({"format_version": 1}))
-    z.writestr("project/meta.json", "{}")        # a PROJECT archive posted to the memory endpoint
-try:
-    pa.import_user_memory(buf.getvalue())
-    check("refuses an archive with no memory content", False, "reported success")
-except pa.ArchiveError as e:
-    check("refuses an archive with no memory content", "no user-memory content" in str(e), str(e))
-
 print("== the manifest INSIDE the archive counts what the archive holds ==")
 _make_project("p-manifest")
 zp = _TMP / "manifest.zip"
@@ -474,6 +266,7 @@ check("the archived manifest matches the real member count",
       inner["files"] == len(members), (inner["files"], len(members)))
 check("and agrees with what the caller was told", inner["files"] == man["files"])
 
+shutil.rmtree(_TMP, ignore_errors=True)
 print()
 if _failures:
     print(f"FAILED: {len(_failures)} -> {_failures}")

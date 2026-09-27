@@ -3237,49 +3237,6 @@ async def import_conversation(conversation_id: str, request: Request, overwrite:
         raise HTTPException(status_code=400, detail=f"not a readable zip archive: {e}")
 
 
-@app.get("/v1/memory/export",
-         dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
-async def export_user_memory():
-    """Download the user-level memory that spans projects (the memory dir plus the user CLAUDE.md).
-
-    Per-project memory rides inside each project's own archive; this is the cross-project half,
-    which is what would otherwise be lost when a user's projects move to another box (DAT-300)."""
-    workdir = tempfile.mkdtemp(prefix="datafye-memory-export-")
-    out = pathlib.Path(workdir) / "user-memory.zip"
-    try:
-        project_archive.export_user_memory(out)
-    except project_archive.ArchiveError as e:
-        # A REFUSAL, not a fault: the memory tree is past the export ceiling, and the caller can act
-        # on that. Reported as 400 like the project-export route reports its own ArchiveError,
-        # because accounts renders any 5xx as a bare "user_memory: unavailable" with no reason -
-        # which is exactly the silence the ceiling was added to replace.
-        shutil.rmtree(workdir, ignore_errors=True)
-        logger.warning("Refusing the user-memory export: %s", e)
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        shutil.rmtree(workdir, ignore_errors=True)
-        logger.exception("Export of user memory failed")
-        raise HTTPException(status_code=500, detail=f"export failed: {e}")
-    return FileResponse(out, filename=out.name, media_type="application/zip",
-                        background=BackgroundTask(shutil.rmtree, workdir, ignore_errors=True))
-
-
-@app.post("/v1/memory/import",
-          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
-async def import_user_memory(request: Request):
-    """Merge cross-project memory from a zip posted as the raw body.
-
-    Merge rather than replace: the target box may already hold memory for this user, and a restore
-    that silently dropped it would lose work the box learned since the export."""
-    body = await _read_capped_body(request)
-    try:
-        return project_archive.import_user_memory(body)
-    except project_archive.ArchiveError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except zipfile.BadZipFile as e:
-        raise HTTPException(status_code=400, detail=f"not a readable zip archive: {e}")
-
-
 @app.get("/v1/conversations/{conversation_id}/outputs",
          dependencies=[Depends(require_bootstrapped), Depends(auth.require_self_jwt)])
 async def list_conversation_outputs(conversation_id: str):
