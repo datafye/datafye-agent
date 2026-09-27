@@ -1054,8 +1054,8 @@ that grows has to be the volume the data is on.
 | `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail; also returns the project's `intent` + `track` (+ `stage`/`maxStage`) so the frontend can rehydrate the right stepper. Each assistant message carries a per-turn `usage` (tokens+cost) tagged by `conversations.set_last_message_usage`, for the accounts Conversation view |
 | `/v1/conversations/{id}/export` | GET | Download the agent half of one project as a versioned zip (code, chat history, project memory, uploads, outputs; regenerable trees excluded and named in the manifest). Accounts bundles it with its own project record. 404 when the box never materialised the folder — a real state, since accounts can hold a record for a project nobody chatted to (DAT-293) |
 | `/v1/conversations/{id}/import` | POST | Write that zip back in, as the **caller's** id — accounts mints the id on the target box, and the record inside the archive is retargeted to match. Raw body, staged first; refuses an existing project unless `?overwrite=true` |
-| `/v1/memory/export` | GET | Download the user's cross-project memory: `<state>/memory/**` plus the user's own `<state>/CLAUDE.md`, both archived relative to the STATE ROOT so an import can put each back where it belongs. Fleet memory is deliberately not in it (read-only, replaced wholesale on upgrade). An over-ceiling tree is a **400**, not a 500 — accounts renders any 5xx as a bare `user_memory: unavailable` with no reason |
-| `/v1/memory/import` | POST | **Merge** that memory in, never replace: the target box may already carry memory this user's box learned after the export |
+
+⚠️ **Export/import deals in ONE project and nothing else (DAT-325).** Export and import of a whole *user* — every project at once, plus the cross-project memory — was built under DAT-293/300 and then withdrawn: it carried most of the risk and none of the demand. Reviewing its memory merge alone produced nine findings, two of which lost a user's notes (conflict copies that doubled on every backup/restore cycle until the archive outgrew its own ceiling, and an index silently replaced depending on which bullet character the model happened to write). A project's own memory travels inside its archive and is unaffected. Do not reintroduce a user-level archive without a design for merging one user's memory into another box's.
 | `/v1/conversations/{id}/outputs` | GET | List the project's downloadable deliverables — files the agent wrote to the project's `outputs/` folder (distinct from `uploads/`), as `{name, type, size, modified_at}`. JWT-protected |
 | `/v1/conversations/{id}/outputs/{filename}` | GET | Download one deliverable as a `FileResponse` from `outputs/`. Path-safety-guarded (refuses anything resolving outside `outputs/`); JWT-gated; 404 if absent |
 
@@ -1446,7 +1446,6 @@ A project can now leave the box and come back, or land on a different one: four 
 
 ```
 GET|POST /v1/conversations/{id}/export | /import
-GET|POST /v1/memory/export             | /import
 ```
 
 Accounts calls them and bundles the zip with its own project record, so a project travels as one

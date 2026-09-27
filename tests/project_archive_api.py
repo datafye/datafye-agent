@@ -229,6 +229,16 @@ try:
                    content=blob, timeout=60)
     check("overwrite=true succeeds", r.status_code == 200, r.status_code)
 
+    print("== the withdrawn user-level routes are GONE, not broken (DAT-325) ==")
+    # Deleting a feature has to leave nothing behind that half-answers. A route that 500s, or that
+    # answers 403 because a dependency still guards it, reads to a caller as "temporarily broken"
+    # and invites a retry forever.
+    for method, path in (("GET", "/v1/memory/export"), ("POST", "/v1/memory/import")):
+        r = (httpx.get if method == "GET" else httpx.post)(
+            f"{base}{path}", headers=hdr, timeout=20,
+            **({} if method == "GET" else {"content": b"x"}))
+        check(f"{method} {path} is 404", r.status_code == 404, r.status_code)
+
     print("== a hostile archive is refused over HTTP too ==")
     evil = io.BytesIO()
     with zipfile.ZipFile(evil, "w") as z:
@@ -239,15 +249,6 @@ try:
     check("400 for an escaping entry", r.status_code == 400, r.status_code)
     check("the escape did not land", not (_state / "pwned.txt").exists()
           and not (_TMP / "pwned.txt").exists())
-
-    print("== user memory round trip over HTTP ==")
-    r = httpx.get(f"{base}/v1/memory/export", headers=hdr, timeout=60)
-    check("memory export returns 200", r.status_code == 200, r.status_code)
-    mem_blob = r.content
-    check("memory archive is a valid zip",
-          zipfile.ZipFile(io.BytesIO(mem_blob)).testzip() is None)
-    r = httpx.post(f"{base}/v1/memory/import", headers=hdr, content=mem_blob, timeout=60)
-    check("memory import returns 200", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
 
 finally:
     proc.terminate()
