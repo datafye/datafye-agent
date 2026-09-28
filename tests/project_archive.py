@@ -12,6 +12,7 @@ guards did not also break the ordinary case.
 Run: python3 tests/project_archive.py    (no pytest dependency, like the other suites here)
 """
 
+import ast
 import io
 import json
 import os
@@ -265,6 +266,100 @@ members = [n for n in zipfile.ZipFile(zp).namelist() if n != pa._MANIFEST_NAME]
 check("the archived manifest matches the real member count",
       inner["files"] == len(members), (inner["files"], len(members)))
 check("and agrees with what the caller was told", inner["files"] == man["files"])
+
+print("== every refusal carries a status somebody CHOSE ==")
+# The point of the taxonomy is that a refusal added later reports itself correctly without anyone
+# touching a route. That only holds while each raise site picks the class its condition deserves,
+# and picking wrong is silent: the base class is a perfectly valid 400. So this walks the module.
+_src = ast.parse(Path(pa.__file__).read_text())
+
+
+def _raise_sites():
+    for node in ast.walk(_src):
+        if not (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)):
+            continue
+        name = getattr(node.exc.func, "id", "")
+        if not name.startswith("Archive"):
+            continue
+        arg = node.exc.args[0] if node.exc.args else None
+        if isinstance(arg, ast.Constant):
+            text = str(arg.value)
+        elif isinstance(arg, ast.JoinedStr):
+            text = "".join(v.value for v in arg.values if isinstance(v, ast.Constant))
+        else:
+            text = ""
+        yield node.lineno, name, " ".join(text.split())
+
+
+sites = list(_raise_sites())
+check("the module still raises something", len(sites) >= 10, len(sites))
+
+# Statuses are a property of the class, so a route never decides one.
+for cls, want in ((pa.ArchiveError, 400), (pa.ArchiveNotFound, 404),
+                  (pa.ArchiveConflict, 409), (pa.ArchiveTooLarge, 413)):
+    check(f"{cls.__name__} is {want}", cls.status == want, cls.status)
+check("every subclass is catchable as ArchiveError",
+      all(issubclass(c, pa.ArchiveError)
+          for c in (pa.ArchiveNotFound, pa.ArchiveConflict, pa.ArchiveTooLarge)))
+
+# ⚠️ THE REGRESSION GUARD. A condition that is plainly a size, a collision or an absence must not
+# be raised as the bare base class - that is exactly how "too large" came to be reported as "does
+# not exist". Keyed on the wording of the message, because that is what a new raise site writes
+# first and it is the only signal available before anyone has thought about the status.
+RULES = (
+    (("larger than", "expands to more than", "more than the"), pa.ArchiveTooLarge, "a size ceiling"),
+    (("already exists",), pa.ArchiveConflict, "a collision"),
+    (("no project '",), pa.ArchiveNotFound, "an absence"),
+)
+for lineno, name, text in sites:
+    for needles, want, what in RULES:
+        if any(n in text for n in needles):
+            check(f"line {lineno} ({what}) is {want.__name__}", name == want.__name__,
+                  f"raised {name}: {text[:60]}")
+
+# And the other direction: a site NOT covered by a rule is the base class on purpose, not by
+# omission. If this fires, either the raise deserves a subclass or the inventory below needs the
+# new wording - both are decisions, which is the point.
+GENERIC = ("invalid project id", "refusing unsafe archive entry", "archive holds no project content",
+           "archive has no project/meta.json", "archive's meta.json is not readable")
+for lineno, name, text in sites:
+    if name == "ArchiveError":
+        check(f"line {lineno} is a deliberate 400", any(g in text for g in GENERIC),
+              f"unclassified refusal: {text[:60]}")
+
+print("== and the refusals report those statuses in practice ==")
+_make_project("p-status")
+try:
+    pa.export_project("p-nonexistent-xyz", _TMP / "s.zip")
+    check("a missing project raises ArchiveNotFound", False, "it did not raise")
+except pa.ArchiveNotFound as e:
+    check("a missing project raises ArchiveNotFound", e.status == 404, e.status)
+except pa.ArchiveError as e:
+    check("a missing project raises ArchiveNotFound", False, f"{type(e).__name__}: {e}")
+
+_saved = pa.MAX_EXPORT_BYTES
+pa.MAX_EXPORT_BYTES = 1
+try:
+    pa.export_project("p-status", _TMP / "s.zip")
+    check("an oversized project raises ArchiveTooLarge", False, "it did not raise")
+except pa.ArchiveTooLarge as e:
+    check("an oversized project raises ArchiveTooLarge", e.status == 413, e.status)
+except pa.ArchiveError as e:
+    check("an oversized project raises ArchiveTooLarge", False, f"{type(e).__name__}: {e}")
+finally:
+    pa.MAX_EXPORT_BYTES = _saved
+
+_zip = _TMP / "conflict.zip"
+pa.export_project("p-status", _zip)
+_blob = _zip.read_bytes()
+try:
+    pa.import_project("p-status", _blob)
+    check("importing onto a live project raises ArchiveConflict", False, "it did not raise")
+except pa.ArchiveConflict as e:
+    check("importing onto a live project raises ArchiveConflict", e.status == 409, e.status)
+except pa.ArchiveError as e:
+    check("importing onto a live project raises ArchiveConflict", False, f"{type(e).__name__}: {e}")
+check("and overwrite still works", pa.import_project("p-status", _blob, overwrite=True) is not None)
 
 shutil.rmtree(_TMP, ignore_errors=True)
 print()

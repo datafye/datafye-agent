@@ -96,6 +96,7 @@ _state = _TMP / "state"
 env = dict(os.environ)
 env.update({
     "DATAFYE_AGENT_STATE_DIR": str(_state),
+    "DATAFYE_AGENT_MAX_EXPORT_MB": "1",          # so an over-ceiling export is reachable below
     "DATAFYE_AGENT_PROJECTS_DIR": str(_state / "projects"),
     "DATAFYE_AGENT_PORT": str(_port),
     # ⚠️ This agent builds its JWKS URL from ACCOUNTS_URL (there is no JWKS override), so the stub
@@ -224,7 +225,9 @@ try:
 
     print("== import refuses to clobber, unless told to ==")
     r = httpx.post(f"{base}/v1/conversations/p-2/import", headers=hdr, content=blob, timeout=60)
-    check("400 on an existing project", r.status_code == 400, r.status_code)
+    check("409 on an existing project", r.status_code == 409,
+          f"{r.status_code} - a client resolves this by retrying with overwrite, so it must not\n"
+          f"         look like a corrupt archive")
     r = httpx.post(f"{base}/v1/conversations/p-2/import?overwrite=true", headers=hdr,
                    content=blob, timeout=60)
     check("overwrite=true succeeds", r.status_code == 200, r.status_code)
@@ -238,6 +241,22 @@ try:
             f"{base}{path}", headers=hdr, timeout=20,
             **({} if method == "GET" else {"content": b"x"}))
         check(f"{method} {path} is 404", r.status_code == 404, r.status_code)
+
+
+    print("== the agent's refusals are distinguishable over HTTP, not all one status ==")
+    # The whole point of the taxonomy: accounts (and any other caller) must be able to tell these
+    # apart from the status alone. Before this they were 404, 400 and 404 respectively.
+    r = httpx.get(f"{base}/v1/conversations/p-absent-xyz/export", headers=hdr, timeout=20)
+    check("a project this box does not have is 404", r.status_code == 404, r.status_code)
+
+    big = _state / "projects" / "p-big"
+    big.mkdir(parents=True)
+    (big / "meta.json").write_text(json.dumps({"id": "p-big", "name": "big", "messages": []}))
+    (big / "payload.bin").write_bytes(b"x" * (2 * 1024 * 1024))     # over the 1 MB ceiling above
+    r = httpx.get(f"{base}/v1/conversations/p-big/export", headers=hdr, timeout=60)
+    check("a project over the export ceiling is 413, not 404", r.status_code == 413,
+          f"{r.status_code} - 404 here would report 'too big' as 'does not exist'")
+    check("and it says which ceiling", "MB" in r.text, r.text[:160])
 
     print("== a hostile archive is refused over HTTP too ==")
     evil = io.BytesIO()

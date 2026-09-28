@@ -252,12 +252,12 @@ def meta(record: dict) -> dict:
 
 
 def note_orphan_staging_dirs() -> None:
-    """Sweep BOTH places an import stages into, and prune the warned map.
+    """Sweep the places an import stages into, and prune the warned map.
 
-    ⚠️ The project listing scans <state>/projects, so hooking the warning there covered
-    `.import-<id>.tmp` and missed `.import-memory-*` entirely - import_user_memory stages into
-    <state>, one level up, which the listing never walks. A warning that silently covers half the
-    cases is the shape of gap this whole round keeps turning up.
+    Two roots, not one. `import_project` stages `.import-<id>.tmp` inside the project base, which
+    the listing walks; the state root one level up is swept as well because nothing else ever looks
+    there, and an importer that stages outside the project base would otherwise leave disk nobody
+    can find. (It held `.import-memory-*` until the user-level export was withdrawn.)
     """
     from paths import STATE_DIR                      # local: avoids a module-level import cycle
     seen = set()
