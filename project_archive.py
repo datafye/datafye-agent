@@ -76,7 +76,41 @@ _PROJECT_PREFIX = "project/"
 
 
 class ArchiveError(Exception):
-    """A bad archive, or a target that cannot be written. Carries a message meant for an operator."""
+    """A refusal, carrying a message meant for an operator AND the status that describes it.
+
+    ⚠️ The status lives on the EXCEPTION, not in the route. Before this, each route flattened every
+    ArchiveError to one status - the export answered 404 for all of them - so a project too large to
+    archive was reported as a project that does not exist, and every refusal added later silently
+    inherited whatever status that route happened to use. A new refusal now reports itself correctly
+    by CHOOSING ITS CLASS, which is a decision made where the condition is known.
+
+    The default is 400: an ArchiveError means the caller asked for something this agent will not do,
+    and "bad request" is the honest answer when nothing more specific applies. Subclass rather than
+    pass a status at the raise site, so the set of outcomes stays enumerable - `tests/project_archive.py`
+    walks every raise site in this module and fails on one whose class nobody chose.
+    """
+
+    status = 400
+
+
+class ArchiveNotFound(ArchiveError):
+    """Nothing here by that name. The project has no folder on this box - a real state, not a fault:
+    accounts can hold a record for a project the user created but never chatted to."""
+
+    status = 404
+
+
+class ArchiveConflict(ArchiveError):
+    """Something is already there. The one refusal a caller RESOLVES by retrying with overwrite,
+    which is why it must not look like a corrupt archive."""
+
+    status = 409
+
+
+class ArchiveTooLarge(ArchiveError):
+    """Over a ceiling - the archive, what it expands to, or the project being exported."""
+
+    status = 413
 
 
 def _now_ms() -> int:
@@ -196,7 +230,7 @@ def _write_zip(out_path: Path, root: Path, prefix: str, manifest: dict) -> dict:
         except OSError:
             pass
     if raw_bytes > MAX_EXPORT_BYTES:
-        raise ArchiveError(
+        raise ArchiveTooLarge(
             f"this project holds {raw_bytes // (1024 * 1024)} MB, more than the "
             f"{MAX_EXPORT_BYTES // (1024 * 1024)} MB an export may carry")
 
@@ -231,7 +265,7 @@ def export_project(conversation_id: str, out_path: Path) -> dict:
     _require_safe_project_id(conversation_id)
     root = conversations.project_dir(conversation_id)
     if not root.is_dir():
-        raise ArchiveError(f"no project '{conversation_id}' on this agent")
+        raise ArchiveNotFound(f"no project '{conversation_id}' on this agent")
     record = conversations.get(conversation_id) or {}
     manifest = {
         "format_version": FORMAT_VERSION,
@@ -283,7 +317,7 @@ def _extract(archive_bytes: bytes, prefix: str, dest: Path) -> int:
                 raise ArchiveError(f"refusing unsafe archive entry '{info.filename}'")
             expanded += info.file_size
             if expanded > MAX_EXPANDED_BYTES:
-                raise ArchiveError(
+                raise ArchiveTooLarge(
                     f"archive expands to more than {MAX_EXPANDED_BYTES // (1024 * 1024)} MB")
             target.parent.mkdir(parents=True, exist_ok=True)
             with z.open(info) as src, open(target, "wb") as out:
@@ -309,12 +343,12 @@ def import_project(conversation_id: str, archive_bytes: bytes, overwrite: bool =
     `overwrite`, and writes to a staging directory first so a failure leaves nothing half-written.
     """
     if len(archive_bytes) > MAX_IMPORT_BYTES:
-        raise ArchiveError(f"archive is larger than {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
+        raise ArchiveTooLarge(f"archive is larger than {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
     _require_safe_project_id(conversation_id)
 
     dest = conversations.project_dir(conversation_id)
     if dest.exists() and not overwrite:
-        raise ArchiveError(f"project '{conversation_id}' already exists on this agent")
+        raise ArchiveConflict(f"project '{conversation_id}' already exists on this agent")
 
     manifest = read_manifest(archive_bytes)
     staging = dest.parent / f".import-{conversation_id}.tmp"

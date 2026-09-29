@@ -3200,15 +3200,20 @@ async def export_conversation(conversation_id: str):
     with its own record, so a project travels as one file (DAT-293).
 
     Regenerable trees (node_modules, target, ...) are left out and named in the archive's manifest.
-    404 when the project has no folder on this box, which is a real state: accounts can hold a
-    record for a project the user created but never chatted to."""
+
+    Refusals are distinguishable by status: 404 when the project has no folder on this box (a real
+    state, not a fault - accounts can hold a record for a project the user created but never chatted
+    to), 413 when the project is over the export ceiling, 400 for a malformed request."""
     workdir = tempfile.mkdtemp(prefix="datafye-export-")
     out = pathlib.Path(workdir) / f"{conversation_id}.zip"
     try:
         project_archive.export_project(conversation_id, out)
     except project_archive.ArchiveError as e:
         shutil.rmtree(workdir, ignore_errors=True)
-        raise HTTPException(status_code=404, detail=str(e))
+        # ⚠️ ONE handler, and the status comes from the exception. This used to be a hard-coded 404,
+        # so every refusal the export could make - including a project over the size ceiling -
+        # reported itself as a project that does not exist.
+        raise HTTPException(status_code=e.status, detail=str(e))
     except Exception as e:
         shutil.rmtree(workdir, ignore_errors=True)
         logger.exception("Export of project %s failed", conversation_id)
@@ -3231,7 +3236,11 @@ async def import_conversation(conversation_id: str, request: Request, overwrite:
     try:
         return project_archive.import_project(conversation_id, body, overwrite=overwrite)
     except project_archive.ArchiveError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Same rule as the export: the condition chose the status where the condition was known.
+        # "Already exists" is now 409 rather than 400, which matters because it is the one refusal
+        # a client resolves by itself - by retrying with ?overwrite=true - and it was previously
+        # indistinguishable from a corrupt archive.
+        raise HTTPException(status_code=e.status, detail=str(e))
     except zipfile.BadZipFile as e:
         # a truncated or non-zip body is the CALLER's mistake, not a server fault
         raise HTTPException(status_code=400, detail=f"not a readable zip archive: {e}")
