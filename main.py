@@ -2337,8 +2337,20 @@ async def stream_agent_response(
                         'stage': stage_now,
                         'model': _model_label(CLAUDE_MODEL),
                     })
-            except Exception as e:
-                logger.warning("Usage tracking failed for %s: %s", conversation_id, e)
+            except Exception:
+                # ⚠️ logger.exception, not warning. This catch exists so that usage tracking can
+                # never break a turn, which also means a bug inside it is INVISIBLE: the turn
+                # completes normally and the only symptom is a missing number. Without the
+                # traceback there is nothing to say WHICH line stopped, and the block does five
+                # separate things after the accounts report.
+                #
+                # Not hypothetical. The Sutra agent lost this exact path twice, both silent: a
+                # NameError (`_USAGE_FIELDS`, which lives in conversations, not main), and a
+                # TypeError when a revert dropped an argument at all three call sites but left the
+                # parameter in the signature. The second one also aborted the per-model loop, so a
+                # multi-model turn recorded only its first model and usage was UNDER-COUNTED rather
+                # than merely un-reported. (DAT-341, pairs with SUT-114.)
+                logger.exception("Usage tracking failed for %s", conversation_id)
 
         # Announce any deliverables the agent produced this turn so the download
         # UI can offer them. Best-effort; never breaks the turn.

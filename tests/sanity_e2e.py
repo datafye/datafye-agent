@@ -254,6 +254,31 @@ def main():
         check("memory: USER memory file written", wrote_nonindex(gmem))
         check("memory: PER-STRATEGY memory file written", wrote_nonindex(smem))
 
+        # --- usage attribution survived the turn (DAT-341, pairs with SUT-114) ------
+        # ⚠️ Usage attribution lives inside a `try` whose whole purpose is that it can never break a
+        # turn -- so a bug in it is INVISIBLE: every check above still passes, the turn answers
+        # normally, and the only symptom is a missing number. The Sutra agent lost this exact path
+        # TWICE that way (a NameError, then a TypeError from a revert that dropped an argument),
+        # and no unit test could see either, because none of them runs the turn path.
+        #
+        # ⚠️ Assert the TAIL of that block, not its start. Sutra's guard checked the persisted
+        # totals -- which `add_usage` writes on the line BEFORE the failing call -- and stayed green
+        # through both incidents. The per-turn roll-up tagged onto the reply is written AFTER the
+        # accounts report, so a throw anywhere in between fails this.
+        uh = httpx.get(f"{AGENT}/v1/conversations/{STRAT_A}/history",
+                       headers={"Authorization": f"Bearer {self_jwt}"}, timeout=30)
+        check("usage: /history is readable", uh.status_code == 200)
+        hist = uh.json() if uh.status_code == 200 else {}
+        usage = hist.get("usage") or {}
+        totals = usage.get("totals") or {}
+        check("usage: the turn's tokens were recorded",
+              sum(int(totals.get(k) or 0) for k in ("tokens_in", "tokens_out")) > 0)
+        check("usage: attributed to at least one model",
+              bool(usage.get("by_stage_model") or usage.get("by_model")))
+        replies = [m for m in (hist.get("messages") or []) if m.get("role") == "assistant"]
+        check("usage: the roll-up reached the reply (the block ran to the END)",
+              any(isinstance(m.get("usage"), dict) and m["usage"] for m in replies))
+
         # --- skills: author a user-global skill -------------------------
         _, atools = chat_turn(self_jwt, STRAT_A,
             "Use your author-skill skill to create a reusable skill for ALL my "

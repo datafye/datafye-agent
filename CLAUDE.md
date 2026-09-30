@@ -30,6 +30,42 @@ x86-64 with real AVX and is unaffected. Rebuild the venv with arm64 Python to ru
 ⚠️ The suite `rmtree`s its work dir in a `finally`, so **it deletes `agent.log` exactly when a
 run fails**. To diagnose anything, copy the script and suppress that line first.
 
+## ⚠️ A dead usage path is invisible — assert at the END of the block (DAT-341)
+
+Usage attribution sits inside a `try` whose purpose is that usage tracking can never break a
+turn — which also means a bug in it is **invisible**: the turn answers normally, every other
+check passes, and the only symptom is a missing number. Two changes make it findable.
+
+The catch in `main.py` is now **`logger.exception`, not `logger.warning`**. A warning says the
+block failed; it does not say *which line* stopped, and the block does five separate things
+after the accounts report.
+
+`tests/sanity_e2e.py` now asserts usage arrived after the first real turn — `/history` readable,
+the turn's tokens recorded, attributed to at least one model, and the **roll-up reached the
+REPLY**. ⚠️ That last one is the load-bearing check, and it deliberately targets the **TAIL** of
+the usage block: `set_last_message_usage` (`main.py:2320`) runs AFTER all three
+`_report_usage_to_accounts` calls, so a throw anywhere between them now fails it. Asserting the
+persisted totals instead proves only that the block was **ENTERED** — `add_usage` writes them on
+the line BEFORE the failing call, and that is exactly the guard that stayed green in the Sutra
+agent through **two** separate silent failures (a `NameError` on `_USAGE_FIELDS`, then a
+`TypeError` from a revert that dropped an argument at all three call sites and left the parameter
+in the signature; the latter also aborted the per-model loop, so usage was UNDER-counted rather
+than merely un-reported). Nothing in `tests/` runs this path but the real-turn suite.
+
+Checked rather than assumed, because the two agents have drifted: this fork keys usage by
+**`by_stage_model`** (`conversations.py:383`) and the predicate also accepts `by_model`, so it
+survives the **DAT-319** port; and `/history` returns the raw stored messages, so
+`messages[].usage` rides through.
+
+⚠️ **Datafye is NOT affected by Sutra's `TypeError` — do not "port the fix".** Verified by AST on
+`origin/main` and `origin/2.0`: the signature takes 6 parameters and all 3 call sites pass 6.
+This fork never had the incomplete revert because it never had the per-activity apportionment
+that revert was undoing. What travels between the agents here is the *defence*, not a code fix.
+
+⚠️ **Not executed end to end.** `sanity_e2e` spends real money on several Opus turns and was not
+run on `girish/dat-341-usage-failures-invisible` (PR #59, open, not merged). The three predicates
+were proven offline against a healthy history and against both failure shapes.
+
 ## Project Overview
 
 Datafye Agent is a dedicated per-user AI backend for algorithmic trading project development. It wraps the Claude Agent SDK in a FastAPI service, giving each user an interactive agent session with access to Datafye documentation, the Datafye CLI, and file system tools for building Python-based algos.
