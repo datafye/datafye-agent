@@ -1157,8 +1157,10 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 - ⚠️ **Two clocks, and a flush must respect both** (review of PR #60). The SDK hands over a call's
   content blocks as each finishes, but the gateway writes the call's record only when its upstream
   stream ENDS. So a call is held back while it may still be streaming (`_open`), and becomes
-  flushable on the stream's `message_stop` (`labeller.settle()` in `main.py`), on the next call's
-  first block, or at turn end. Flushing an open call classified it on half its evidence, pushed a
+  flushable on its stream's `message_stop` (`labeller.settle()` in `main.py`), on its thread's next
+  call, or at turn end. ⚠️ **Per THREAD** (`parent_tool_use_id`): subagents run in parallel on one
+  stream (rare here, since `Task` is discouraged, but not prevented), so one thread's new call or
+  `message_stop` says nothing about another's. Flushing an open call classified it on half its evidence, pushed a
   label the gateway could not match yet, and paid to classify its later blocks a second time.
 - **A ticker asks "is a batch due?" every few seconds**, not only when a model message arrives.
   During a long tool run (a backtest, a history fetch, a provision) no message arrives, and without
@@ -1166,6 +1168,9 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 - **`unmatched` and `in_flight` labels get exactly ONE retry.** A label can beat its own record to
   the gateway; an in-flight record becomes labellable again if its delivery fails. A label still
   unmatched after its retry is a real join failure and is logged, not retried forever.
+- **The end-of-turn settle-up passes until nothing is owed** (at most `MAX_FINAL_PASSES`), and a
+  retry waits `UNMATCHED_RETRY_SECONDS` however soon the turn ends after a mid-turn push. Anything
+  still owed is logged. Two fixed passes used to drop whatever the second one produced, silently.
 - ⚠️ **The agent classifies; it does NOT apportion usage.** `ResultMessage.model_usage` is per model
   per turn, so any per-activity split computed here would be an estimate competing with the
   gateway's measurement. Usage stays **per model per turn** (`by_model`), and accounts files it

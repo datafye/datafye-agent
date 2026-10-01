@@ -299,7 +299,7 @@ def test_the_module_is_not_shadowed_in_main():
     # expires to `unclassified` - review finding 2 again, by a different route.
     import inspect
     src = inspect.getsource(main.stream_agent_response)
-    check("'message_stop'" in src and "labeller.settle()" in src,
+    check("'message_stop'" in src and "labeller.settle(" in src,
           "the stream loop settles the labeller on message_stop")
 
 
@@ -353,6 +353,7 @@ class ReplyCollector(activity.Collector):
 
     async def _send_labels(self, body):
         self.sent.append([c["message_id"] for c in body["calls"]])
+        self.sent_at = getattr(self, "sent_at", []) + [asyncio.get_event_loop().time()]
         return 200, (self.replies.pop(0) if self.replies else {})
 
 
@@ -450,6 +451,64 @@ async def test_an_in_flight_label_is_retried():
     check(c.sent == [["msg_1"], ["msg_1"]], f"an in-flight label is pushed again ({c.sent})")
 
 
+async def test_parallel_subagents_do_not_close_each_others_calls():
+    """⚠️ Second review, finding 1. Subagents run IN PARALLEL on the same stream, so their calls
+    interleave. With one global set, subagent B's new call "proved" A's had ended, and B's
+    `message_stop` settled A, while A was still streaming."""
+    c = StubCollector(replies=[["Build"], ["Design"]], age_seconds=0.0)
+    c.observe("msg_A", thinking=["A is thinking."], thread="task_1")
+    c.observe("msg_B", tools=["Write"], thread="task_2")
+    check(c._is_open("msg_A"), "a call in ANOTHER thread does not close A")
+    c.settle("task_2")                                   # B's stream ended
+    check(c._is_open("msg_A") and not c._is_open("msg_B"), "B's message_stop settles B only")
+    await c._flush()
+    check(c.classify_calls == [["msg_B"]], f"only B is flushed ({c.classify_calls})")
+    c.observe("msg_A", tools=["Edit"], thread="task_1")  # A's tool block arrives later
+    c.settle("task_1")
+    await c.finish()
+    check(c.classify_calls == [["msg_B"], ["msg_A"]], f"A is classified once, when complete ({c.classify_calls})")
+    ev = c.evidence[-1]
+    check("tools: Edit" in ev and "A is thinking" in ev, f"on all its evidence ({ev!r})")
+
+
+async def test_a_retry_produced_by_the_last_pass_is_not_dropped():
+    """⚠️ Second review, finding 2. The end of turn made exactly two passes. Classifying makes one
+    more metered call (a sidecar to label) and the SECOND pass pushes it; if that came back
+    `unmatched`, the retry it earned was queued and nothing ever ran it, with no log line."""
+    class Classifies(ReplyCollector):
+        async def _classify(self, batch):
+            self.observe_sidecar("msg_classifier")        # what the real classify call does
+            return ["Build"] * len(batch), False
+    c = Classifies(replies=[{}, {"unmatched": ["msg_classifier"]}, {}])
+    saved = activity.UNMATCHED_RETRY_SECONDS
+    activity.UNMATCHED_RETRY_SECONDS = 0.0
+    try:
+        c.observe("msg_1", tools=["Write"])
+        await c.finish()
+    finally:
+        activity.UNMATCHED_RETRY_SECONDS = saved
+    check(c.sent == [["msg_1"], ["msg_classifier"], ["msg_classifier"]],
+          f"the sidecar's retry is pushed on a further pass ({c.sent})")
+
+
+async def test_a_retry_waits_even_when_the_turn_ends_at_once():
+    """⚠️ Second review, finding 3. A mid-turn push answered `unmatched`, then the turn ended a moment
+    later: the retry fired within milliseconds, too soon for the gateway to have written the record,
+    so the one retry was wasted."""
+    c = ReplyCollector(replies=[{"unmatched": ["msg_1"]}, {}], age_seconds=0.0)
+    saved = activity.UNMATCHED_RETRY_SECONDS
+    activity.UNMATCHED_RETRY_SECONDS = 0.3
+    try:
+        c.observe("msg_1", tools=["Write"])
+        c.settle()
+        await c._flush()                                  # the mid-turn push
+        await c.finish()                                  # the turn ends straight away
+    finally:
+        activity.UNMATCHED_RETRY_SECONDS = saved
+    gap = c.sent_at[1] - c.sent_at[0] if len(c.sent_at) > 1 else 0
+    check(len(c.sent) == 2 and gap >= 0.25, f"the retry waited for the gateway ({gap:.2f}s)")
+
+
 async def main_async():
     for fn in (test_a_shifted_mapping_is_never_applied,
                test_a_transient_classify_failure_is_retried_not_forfeited,
@@ -472,7 +531,10 @@ async def main_async():
                test_a_late_block_for_a_labelled_call_is_ignored,
                test_the_ticker_pushes_during_a_long_tool_run,
                test_an_unmatched_label_gets_one_retry,
-               test_an_in_flight_label_is_retried):
+               test_an_in_flight_label_is_retried,
+               test_parallel_subagents_do_not_close_each_others_calls,
+               test_a_retry_produced_by_the_last_pass_is_not_dropped,
+               test_a_retry_waits_even_when_the_turn_ends_at_once):
         print(f"--- {fn.__name__} ---")
         await fn()
 

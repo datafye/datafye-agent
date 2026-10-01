@@ -1939,7 +1939,10 @@ async def stream_agent_response(
                     elif hasattr(block, 'text'):
                         call_texts.append(getattr(block, 'text', '') or '')
                 labeller.observe(getattr(msg, 'message_id', None),
-                                 thinking=call_thinking, texts=call_texts, tools=call_tools)
+                                 thinking=call_thinking, texts=call_texts, tools=call_tools,
+                                 # Per THREAD: subagents run in parallel on this stream,
+                                 # so one thread's new call says nothing about another's.
+                                 thread=getattr(msg, 'parent_tool_use_id', None))
                 # Starts a push in the background when a batch is due. Deliberately
                 # not awaited: this loop is streaming the reply to the browser, and
                 # blocking it on an HTTP round trip would stall the stream.
@@ -2131,7 +2134,7 @@ async def stream_agent_response(
                 # gateway is writing its record, so the labeller may now flush it. Until
                 # this, a call can still be streaming blocks (DAT-319 review).
                 if isinstance(ev, dict) and ev.get('type') == 'message_stop':
-                    labeller.settle()
+                    labeller.settle(getattr(msg, 'parent_tool_use_id', None))
                 if _LOG_RAW_USAGE:
                     # The one place a real PER-STEP output count could come
                     # from: `message_delta` carries the authoritative (and
