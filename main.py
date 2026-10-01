@@ -61,6 +61,11 @@ from claude_agent_sdk import (
 )
 
 from prompt import build_system_prompt
+# ⚠️ Aliased: main.py defines a route handler called `activity` (POST /v1/activity), which
+# shadows the module at RUNTIME while the import itself succeeds - the failure surfaces only
+# when a turn reaches the first use, as AttributeError on a 'function' (found the hard way in
+# the Sutra agent, SUT-114).
+import activity as activity_labels
 import auth
 import broker
 import conversations
@@ -715,7 +720,12 @@ async def generate_title(first_message: str, usage_sink: Optional[list] = None) 
         resp.raise_for_status()
         data = resp.json()
         if usage_sink is not None and data.get("usage"):
-            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"]})
+            # The message id rides along so the collector can label this call at the
+            # gateway. Without it the agent's own cheap calls would be the biggest
+            # contributor to `unclassified`, and that word has to keep meaning
+            # "labelling is broken" (DAT-319).
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"],
+                               "message_id": data.get("id")})
         parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
         title = text.strip().strip('"“”\'').rstrip(".").strip()
@@ -725,92 +735,8 @@ async def generate_title(first_message: str, usage_sink: Optional[list] = None) 
         return None
 
 
-# -- Lifecycle stage classification --------------------------------
-# Cheap, best-effort, post-stream — mirrors generate_title (haiku, direct
-# Anthropic call). Classifies where the project build is in its lifecycle so
-# the workspace stepper can advance. On any failure the stepper keeps its value.
-_LIFECYCLE_PROMPT = (
-    "You classify what a user is doing in an AI quant workspace and where it is "
-    "in its lifecycle, so the UI can show the right workflow.\n\n"
-    "1) INTENT — what the user is doing. Common intents:\n"
-    "   - chat: a general question or discussion (no artifact).\n"
-    "   - research: one-off data analysis / exploration (a report, not a deployable artifact).\n"
-    "   - signal: building a reusable trading-signal generator.\n"
-    "   - algo: building a full trading project.\n"
-    "   - dashboard: building an analytics dashboard or other non-trading tool.\n"
-    "   Intents are NOT limited to this list — if the user is clearly doing\n"
-    "   something else, name it in one lower-case word.\n\n"
-    "2) TRACK — the ordered lifecycle stages for this intent:\n"
-    "   - chat / research: [] (no build lifecycle).\n"
-    "   - algo / signal: [\"Explore\",\"Design\",\"Build\",\"Backtest\",\"Validate\",\"Deploy\"].\n"
-    "   - dashboard / other non-trading build: [\"Explore\",\"Design\",\"Build\",\"Ship\"].\n"
-    "   - a novel build intent: compose a sensible ordered track, starting with \"Explore\".\n\n"
-    "3) STAGE — the ONE stage in the track the work is at NOW (\"\" if the track is empty).\n\n"
-    "Reply with ONLY a JSON object: "
-    "{\"intent\":\"...\",\"track\":[...],\"stage\":\"...\"}.\n\n"
-)
-
-
-async def classify_lifecycle(prior: dict, user_message: str, assistant_text: str,
-                             usage_sink: Optional[list] = None) -> Optional[dict]:
-    """Classify the project's intent + lifecycle track + current stage, returning
-    {"intent","track","stage"} or None on any failure (caller keeps prior). The
-    agent owns the lifecycle: it infers the intent and the ordered track for it
-    (open vocabulary), and the frontend renders whatever track it is given. If
-    `usage_sink` is given, this call's token usage is appended (attributed to the
-    sidecar model) -- it runs outside the agent SDK session, so it's not in
-    ResultMessage.model_usage."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return None
-    try:
-        convo = (f"Prior intent: {(prior or {}).get('intent') or 'chat'}\n"
-                 f"Prior stage: {(prior or {}).get('stage') or ''}\n"
-                 f"User: {(user_message or '')[:1500]}\n"
-                 f"Assistant: {(assistant_text or '')[:1500]}")
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{_anthropic_base()}/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": TITLE_MODEL,
-                    "max_tokens": 200,
-                    "messages": [{"role": "user", "content": _LIFECYCLE_PROMPT + convo}],
-                },
-            )
-        resp.raise_for_status()
-        payload = resp.json()
-        if usage_sink is not None and payload.get("usage"):
-            usage_sink.append({"model": TITLE_MODEL, "usage": payload["usage"]})
-        parts = payload.get("content", [])
-        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
-        try:
-            data = json.loads(text)
-        except Exception:
-            i, j = text.find("{"), text.rfind("}")
-            data = json.loads(text[i:j + 1]) if (i >= 0 and j > i) else None
-        if not isinstance(data, dict):
-            return None
-        intent = str(data.get("intent") or conversations.DEFAULT_INTENT).strip().lower()
-        track = data.get("track")
-        if not isinstance(track, list):
-            track = conversations.track_for_intent(intent)
-        track = [str(s).strip() for s in track if str(s).strip()]
-        stage = str(data.get("stage") or "").strip()
-        if stage and stage not in track:
-            stage = track[0] if track else ""
-        return {"intent": intent, "track": track, "stage": stage}
-    except Exception as e:
-        logger.warning("Lifecycle classification failed: %s", e)
-        return None
-
-
 # -- Satisfaction analysis (inferred sidecar) ----------------------
-# A cheap Haiku sidecar (like classify_lifecycle) that infers a 1-5 satisfaction
+# A cheap Haiku sidecar (like generate_title) that infers a 1-5 satisfaction
 # rank + short reasons from the recent transcript, run post-stream and reported
 # to accounts as source='inferred'. Only the DERIVED signal leaves the sandbox,
 # never the raw conversation, so it is privacy-safe regardless of consent.
@@ -895,7 +821,12 @@ async def classify_environment_intent(transcript: str,
         resp.raise_for_status()
         data = resp.json()
         if usage_sink is not None and data.get("usage"):
-            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"]})
+            # The message id rides along so the collector can label this call at the
+            # gateway. Without it the agent's own cheap calls would be the biggest
+            # contributor to `unclassified`, and that word has to keep meaning
+            # "labelling is broken" (DAT-319).
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"],
+                               "message_id": data.get("id")})
         parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
         obj = _extract_json_object(text)
@@ -948,7 +879,7 @@ def _recent_transcript(messages: list, limit: int = 12) -> str:
 
 async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = None) -> Optional[dict]:
     """Infer the user's satisfaction (1-5) + a short reason from the conversation,
-    via a cheap direct model call (like classify_lifecycle). Best-effort: returns
+    via a cheap direct model call (like generate_title). Best-effort: returns
     {"rank": int, "reasons": str} or None on any failure / unparseable reply."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key or not transcript.strip():
@@ -972,7 +903,12 @@ async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = Non
         resp.raise_for_status()
         data = resp.json()
         if usage_sink is not None and data.get("usage"):
-            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"]})
+            # The message id rides along so the collector can label this call at the
+            # gateway. Without it the agent's own cheap calls would be the biggest
+            # contributor to `unclassified`, and that word has to keep meaning
+            # "labelling is broken" (DAT-319).
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"],
+                               "message_id": data.get("id")})
         parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
         obj = _extract_json_object(text)
@@ -1099,7 +1035,29 @@ def _turn_index(conversation_id: str) -> int:
     return sum(1 for m in msgs if (m or {}).get("role") == "assistant")
 
 
-async def _report_usage_to_accounts(conversation_id: str, stage: str, model: str,
+# Label flushes started from an interrupted turn's `finally`. Held only so the task is not collected
+# before it finishes; the callback drops it again and reads any exception so nothing is left
+# unretrieved.
+_DETACHED_FLUSHES: set = set()
+
+
+def _forget_detached_flush(task) -> None:
+    _DETACHED_FLUSHES.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Activity labelling did not complete after the turn ended: %s",
+                       task.exception())
+
+
+# The single activity every turn's usage is filed under in accounts, until accounts derives usage by
+# activity from the gateway's per-call telemetry (DAT-318). See the note in _report_usage_to_accounts.
+# It must stay a word in the activity vocabulary, so it is asserted at import rather than trusted.
+_USAGE_STAGE_UNTIL_GATEWAY_TELEMETRY = "Build"
+assert _USAGE_STAGE_UNTIL_GATEWAY_TELEMETRY in activity_labels.VOCABULARY, (
+    f"{_USAGE_STAGE_UNTIL_GATEWAY_TELEMETRY!r} is not in the activity vocabulary "
+    f"{activity_labels.VOCABULARY}")
+
+
+async def _report_usage_to_accounts(conversation_id: str, model: str,
                                     delta: dict, idem: str, auth_token: Optional[str]) -> None:
     """Best-effort: POST the turn's usage delta to accounts, forwarding the
     user's JWT. Meta accumulation already happened, so a failure here only misses
@@ -1113,7 +1071,20 @@ async def _report_usage_to_accounts(conversation_id: str, stage: str, model: str
     # reconciled projects.)
     url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
            f"{AGENT_USERNAME}/projects/{conversation_id}/usage")
-    body = {"idempotency_key": idem, "stage": stage, "model": model}
+    # ⚠️ The activity is NOT computed here, deliberately. The agent reports usage PER MODEL PER TURN
+    # and nothing finer (DAT-319): it labels each CALL's activity and pushes that to the metering
+    # gateway, which meters every call exactly, so an activity derived from a turn total here would be
+    # an estimate competing with a measurement.
+    #
+    # So every turn is filed under the one constant above. That is a PLACEHOLDER, not a claim: the
+    # project's own stage is gone, and an activity apportioned here would be invented. ⚠️ DELETE IT
+    # when accounts reads the gateway's activity telemetry and derives usage by model AND activity
+    # itself (DAT-318), at which point the agent should send no activity at all.
+    #
+    # ⚠️ If a parameter is added to this signature, change all three call sites in the SAME commit:
+    # the Sutra agent once left a parameter in the signature after a revert, and every call raised
+    # TypeError inside a catch that exists so usage can never break a turn (see DAT-341).
+    body = {"idempotency_key": idem, "stage": _USAGE_STAGE_UNTIL_GATEWAY_TELEMETRY, "model": model}
     body.update(delta)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -1820,6 +1791,25 @@ async def stream_agent_response(
         outputs_before = {f["name"]: (f["size"], f["modified_at"])
                           for f in conversations.list_outputs(conversation_id)}
 
+    # Declared OUTSIDE the try, deliberately: the `finally` below flushes whatever labels are still
+    # buffered, so a failure before this line would turn a lost batch of labels into a NameError
+    # inside the handler meant to save them.
+    #
+    # The cheap Haiku sidecars' token usage lives here too, so it is counted in the turn's per-model
+    # roll-up (they run outside the SDK session, so they are absent from ResultMessage.model_usage),
+    # and because the activity classifier writes its own spend into it.
+    sidecar_usage: list = []
+    # What KIND of work each model call does, classified per call and pushed to the metering gateway
+    # during the turn (DAT-319). Created per turn; a box not behind a gateway has no records to label,
+    # so it stays switched off.
+    labeller = activity_labels.Collector(
+        gateway_url=activity_labels.gateway_from_env(_DEFAULT_ANTHROPIC_BASE),
+        token=os.environ.get("ANTHROPIC_API_KEY"),
+        model=TITLE_MODEL,
+        base_url=_anthropic_base(),
+        usage_sink=sidecar_usage,
+    )
+
     try:
         msg_count = 0
         # Text the model writes BETWEEN tool calls is work-narration (its running
@@ -1855,7 +1845,7 @@ async def stream_agent_response(
         # its tool_result triggers a mid-turn deployment re-read so the env panel
         # updates as soon as the environment actually changes (not at turn end).
         pending_env_tool_id = None
-        result_metrics = None  # stashed from ResultMessage; reported after stage classification
+        result_metrics = None  # stashed from ResultMessage; reported after the sidecars
 
         async for msg in query(prompt=message, options=options):
             msg_count += 1
@@ -1929,6 +1919,31 @@ async def stream_agent_response(
                 #
                 # Tool calls are still COUNTED so the turn's tool_calls metric
                 # stays honest -- only the rail output is suppressed.
+                #
+                # Evidence for what THIS call was doing. ⚠️ BEFORE the subagent
+                # short-circuit: a subagent's calls are metered and billed exactly
+                # like the main thread's, so leaving them out here would expire
+                # their records to `unclassified`. `is_main` is about which context
+                # the step COUNTER follows, which is a different question entirely.
+                #
+                # ⚠️ The SDK emits several AssistantMessages carrying the same
+                # message_id, one per content block; `observe` merges by message id.
+                # Tool NAMES only, never a tool's input: that would put file
+                # contents and user data through a classifier.
+                call_thinking, call_texts, call_tools = [], [], []
+                for block in msg.content:
+                    if hasattr(block, 'thinking'):
+                        call_thinking.append(getattr(block, 'thinking', '') or '')
+                    elif hasattr(block, 'name') and hasattr(block, 'input'):
+                        call_tools.append(getattr(block, 'name', '') or '')
+                    elif hasattr(block, 'text'):
+                        call_texts.append(getattr(block, 'text', '') or '')
+                labeller.observe(getattr(msg, 'message_id', None),
+                                 thinking=call_thinking, texts=call_texts, tools=call_tools)
+                # Starts a push in the background when a batch is due. Deliberately
+                # not awaited: this loop is streaming the reply to the browser, and
+                # blocking it on an HTTP round trip would stall the stream.
+                labeller.flush_soon()
                 if not is_main:
                     tool_calls_this_turn += sum(
                         1 for b in msg.content
@@ -2112,6 +2127,11 @@ async def stream_agent_response(
             # Stream events
             elif hasattr(msg, 'event'):
                 ev = getattr(msg, 'event', {})
+                # A model call's stream has ENDED: its evidence is complete and the
+                # gateway is writing its record, so the labeller may now flush it. Until
+                # this, a call can still be streaming blocks (DAT-319 review).
+                if isinstance(ev, dict) and ev.get('type') == 'message_stop':
+                    labeller.settle()
                 if _LOG_RAW_USAGE:
                     # The one place a real PER-STEP output count could come
                     # from: `message_delta` carries the authoritative (and
@@ -2183,11 +2203,6 @@ async def stream_agent_response(
                 conversation_id or "", deployment_state['descriptor_text'], auth_token)
 
 
-        # Collect the two cheap Haiku sidecars' token usage so it's counted in
-        # the turn's per-model roll-up (they run outside the SDK session, so
-        # they're absent from ResultMessage.model_usage).
-        sidecar_usage: list = []
-
         # First turn of a new conversation: replace the provisional first-few-
         # words name with an LLM-summarized title. The app adopts it (sidebar +
         # accounts registry). Best-effort — a failure keeps the provisional name.
@@ -2196,24 +2211,6 @@ async def stream_agent_response(
             if title:
                 conversations.rename(conversation_id, title)
                 yield sse_event('title', {'conversation_id': conversation_id, 'name': title})
-
-        # Classify what the user is doing (intent), the lifecycle track for it,
-        # and the current stage — so the workspace shows the right workflow.
-        # Cheap, best-effort, post-stream. The agent owns the track; the frontend
-        # renders whatever it is given (empty track => no stepper).
-        if conversation_id:
-            rec = conversations.get(conversation_id) or {}
-            life = await classify_lifecycle(rec, message, conversation_text, sidecar_usage)
-            if life:
-                updated = conversations.set_intent_track(
-                    conversation_id, life['intent'], life['track'], life['stage']) or {}
-                yield sse_event('stage', {
-                    'conversation_id': conversation_id,
-                    'intent': updated.get('intent', life['intent']),
-                    'track': updated.get('track', life['track']),
-                    'stage': updated.get('stage', life['stage']),
-                    'maxStage': updated.get('maxStage', life['stage']),
-                })
 
         # Infer the user's satisfaction (best-effort, cheap) and report only the
         # derived rank + reasons to accounts, never the raw conversation, so this
@@ -2244,18 +2241,29 @@ async def stream_agent_response(
                 if intended:
                     await _report_foundry_intent_to_accounts(intended, "inferred", auth_token)
 
-        # Record + report this turn's usage, attributed to the stage it landed
-        # in and the model that ran it. Drives the workspace telemetry (meta,
-        # replayed by /history) and the accounts billing/quota roll-up
+        # The agent's own cheap calls are metered by the gateway too, so label them
+        # rather than leaving them to expire into `unclassified`. Then settle up:
+        # everything still buffered is classified and pushed.
+        for sc in sidecar_usage:
+            labeller.observe_sidecar(sc.get('message_id'))
+        try:
+            await labeller.finish()
+        except Exception as e:      # noqa: BLE001 - labelling never breaks a turn
+            logger.warning("Activity labelling did not complete: %s", e)
+        if labeller.classifying:
+            logger.info("[activity] %s: %d call(s) classified, %d labelled, %d batch(es) discarded",
+                        conversation_id, labeller.classified, labeller.pushed,
+                        labeller.discarded_batches)
+
+        # Record + report this turn's usage, per model per turn. Drives the workspace
+        # telemetry (meta, replayed by /history) and the accounts billing/quota roll-up
         # (best-effort, forwarding the user's JWT). Never breaks the turn.
         if conversation_id and result_metrics:
             try:
-                _rec_now = conversations.get(conversation_id) or {}
-                # Fall back to the intent (then a generic label) when there is no
-                # lifecycle stage: a research/chat project has an empty track, so
-                # its stage is blank -- tag usage with the intent (e.g. "research")
-                # instead of leaving it empty, which the UI renders as "unknown".
-                stage_now = _rec_now.get('stage') or _rec_now.get('intent') or 'general'
+                # ⚠️ Usage is reported PER MODEL PER TURN and nothing else. The agent classifies
+                # each call and tells the gateway; it does not apportion usage across activities,
+                # because the gateway meters every call exactly and now knows its activity, so the
+                # MEASURED breakdown belongs there (DAT-319).
                 base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
                 model_usage = result_metrics.get('model_usage')
                 updated_usage = None
@@ -2268,7 +2276,7 @@ async def stream_agent_response(
                     # Preferred path: per-model, whole-turn-CUMULATIVE usage --
                     # every token type (incl. cache read/create) summed across
                     # the whole agentic loop, plus each model's own cost. One
-                    # delta per (stage × model), idempotency-keyed per model so a
+                    # delta per model, idempotency-keyed per model so a
                     # multi-model turn (e.g. Opus main loop + an internal Haiku)
                     # lands in the right cells without double-counting on retry.
                     primary = _model_label(CLAUDE_MODEL)
@@ -2284,8 +2292,8 @@ async def stream_agent_response(
                             attributed_extras = True
                         idem = f"{base_idem}:{model_id}"
                         _accumulate_turn_usage(turn_usage, delta)
-                        updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
-                        await _report_usage_to_accounts(conversation_id, stage_now, model_id, delta, idem, auth_token)
+                        updated_usage = conversations.add_usage(conversation_id, model_id, delta, idem)
+                        await _report_usage_to_accounts(conversation_id, model_id, delta, idem, auth_token)
                     logger.info("[usage] %s: turn attributed across %d model(s): %s",
                                 conversation_id, len(model_usage), list(model_usage.keys()))
                 else:
@@ -2297,10 +2305,11 @@ async def stream_agent_response(
                     model_id = _model_label(CLAUDE_MODEL)
                     idem = f"{base_idem}:{model_id}"
                     _accumulate_turn_usage(turn_usage, delta)
-                    updated_usage = conversations.add_usage(conversation_id, stage_now, model_id, delta, idem)
-                    await _report_usage_to_accounts(conversation_id, stage_now, model_id, delta, idem, auth_token)
+                    updated_usage = conversations.add_usage(conversation_id, model_id, delta, idem)
+                    await _report_usage_to_accounts(conversation_id, model_id, delta, idem, auth_token)
 
-                # Fold in the Haiku sidecars (title + lifecycle classification).
+                # Fold in the Haiku sidecars (title, satisfaction, environment intent and
+                # the activity classifier).
                 # They bill separately from the SDK session, so they're not in
                 # model_usage. Tokens are captured; cost is 0 (the direct API
                 # response carries no cost) -- negligible, derived later if wanted.
@@ -2309,8 +2318,8 @@ async def stream_agent_response(
                     sc_delta = _usage_delta_from_model_entry(sc.get('usage') or {})
                     sc_idem = f"{base_idem}:sidecar:{i}:{sc_model}"
                     _accumulate_turn_usage(turn_usage, sc_delta)
-                    updated_usage = conversations.add_usage(conversation_id, stage_now, sc_model, sc_delta, sc_idem)
-                    await _report_usage_to_accounts(conversation_id, stage_now, sc_model, sc_delta, sc_idem, auth_token)
+                    updated_usage = conversations.add_usage(conversation_id, sc_model, sc_delta, sc_idem)
+                    await _report_usage_to_accounts(conversation_id, sc_model, sc_delta, sc_idem, auth_token)
 
                 # Tag the final reply with this whole turn's usage (all work +
                 # the reply). Best-effort; the reply message exists only if the
@@ -2328,14 +2337,17 @@ async def stream_agent_response(
                         updated_usage['context_tokens'] = context_tokens
 
                 # Hand the frontend the authoritative cumulative usage so its
-                # status bar + per-(stage × model) stepper badges reconcile to
-                # the agent's figures (no client-side arithmetic drift).
+                # status bar reconciles to the agent's figures (no client-side
+                # arithmetic drift).
                 if updated_usage is not None:
                     yield sse_event('usage', {
                         'conversation_id': conversation_id,
                         'usage': updated_usage,
-                        'stage': stage_now,
                         'model': _model_label(CLAUDE_MODEL),
+                        # WHICH kinds of work this turn's calls did - a list, not a cost
+                        # split. The measured per-activity cost comes from the gateway,
+                        # which saw every call; the agent classifies and does not apportion.
+                        'activities': labeller.activities,
                     })
             except Exception:
                 # ⚠️ logger.exception, not warning. This catch exists so that usage tracking can
@@ -2381,6 +2393,23 @@ async def stream_agent_response(
             'message': str(e),
             'error_type': type(e).__name__
         })
+    finally:
+        # A turn can end by Stop, by the box going dormant, or on a mid-stream error, and on every one
+        # of those paths the end-of-turn flush above never runs - so a batch of labels would be lost and
+        # the gateway would release those records as `unclassified`. Everything pushed mid-turn is
+        # already safe; this only rescues the last, unpushed batch.
+        #
+        # ⚠️ Detached rather than awaited, and no `yield`: this can run during GeneratorExit, where
+        # awaiting a network call is not available to us. Kept in a module-level set so the task cannot
+        # be collected mid-flight. Best-effort is the honest ceiling: if the loop goes away first the
+        # records still release `unclassified`, which is visible.
+        if labeller.classifying:
+            try:
+                task = asyncio.ensure_future(labeller.finish())
+                _DETACHED_FLUSHES.add(task)
+                task.add_done_callback(_forget_detached_flush)
+            except RuntimeError:
+                pass        # no running loop left; nothing can be done and nothing is owed
 
 
 # -- App Setup -----------------------------------------------------
@@ -3113,13 +3142,10 @@ async def conversation_history(conversation_id: str):
         "name": record["name"],
         "messages": record.get("messages", []),
         "commentary": record.get("commentary", []),
-        # Lifecycle (intent + track + stage) + per-(stage × model) usage, so the
-        # stepper + telemetry footer survive a reload. The frontend renders the
-        # agent-supplied track (empty => no stepper).
-        "intent": record.get("intent", conversations.DEFAULT_INTENT),
-        "track": record.get("track", []),
-        "stage": record.get("stage", ""),
-        "maxStage": record.get("maxStage", ""),
+        # Per-model usage, so the telemetry footer survives a reload. No lifecycle
+        # position is reported: the project's intent, track and stage were removed
+        # by DAT-319, because a single asserted position was wrong more often than
+        # it was right. What the work WAS is the gateway's measured breakdown.
         "usage": conversations.usage_public(record),
     }
 
