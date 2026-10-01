@@ -236,6 +236,10 @@ class Collector:
         # moment that retry is worth making (the gateway needs a moment to write the record).
         self._retried = set()
         self._retry_not_before = 0.0
+        # Set by a flush whose classify or push failed on TRANSPORT (a timeout, a 429, the gateway
+        # down). The end-of-turn loop stops on it: passing again at once only repeats the failure,
+        # and each pass can cost a 20 s timeout while the user's turn waits to complete.
+        self._transport_failed = False
         self._ticker = None
         self.pushed = 0
         self.classified = 0
@@ -403,13 +407,22 @@ class Collector:
         # call that registers itself as a sidecar to be labelled; a push can hand back a label owed its
         # one retry. Two fixed passes dropped whatever the second produced, silently. A retry waits
         # until it is worth making, however soon after a mid-turn push the turn happened to end.
+        transport_failures = 0
         for _ in range(MAX_FINAL_PASSES):
             if not (self._fixed or self._calls):
                 break
             wait = self._retry_not_before - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
+            self._transport_failed = False
             await self._flush()
+            if self._transport_failed:
+                # One immediate retry absorbs a blip (a single 429 or timeout). A second failure
+                # means the classifier or gateway is down, and another pass now would only fail
+                # again while the user's turn waits on it: stop, and log what is still owed.
+                transport_failures += 1
+                if transport_failures >= 2:
+                    break
         owed = len(self._fixed) + len(self._calls)
         if owed:
             logger.warning("%d activity label(s) still owed at the end of the turn; the gateway will "
@@ -435,6 +448,7 @@ class Collector:
         if to_classify:
             decided, retry = await self._classify(to_classify)
             if retry:
+                self._transport_failed = True
                 # ⚠️ A TRANSPORT failure is not the same as a bad answer. A 429 or a timeout on the
                 # classify call forfeited that batch for good - the buffer was already drained here -
                 # even though the gateway holds those records for about three times the cadence and
@@ -456,6 +470,7 @@ class Collector:
         # Classified either way; pushed only when there is a gateway holding records to label.
         if labels and self.enabled:
             if not await self._push(labels):
+                self._transport_failed = True
                 # ⚠️ Same reasoning as a failed classification, one step later. A push that never
                 # landed means the gateway releases those records as `unclassified` even though they
                 # WERE classified, so the breakdown loses work that was correctly identified. The

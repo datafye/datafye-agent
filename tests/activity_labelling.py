@@ -299,6 +299,10 @@ def test_the_module_is_not_shadowed_in_main():
     # expires to `unclassified` - review finding 2 again, by a different route.
     import inspect
     src = inspect.getsource(main.stream_agent_response)
+    # And a tool RESULT settles the subagent thread it ends: a subagent's last call has no next call
+    # in its own thread, so without this it stayed open whenever its message_stop never came.
+    check("tool_use_id" in src and "labeller.settle(_tid)" in src,
+          "the stream loop settles a subagent's thread when its Task result arrives")
     check("'message_stop'" in src and "labeller.settle(" in src,
           "the stream loop settles the labeller on message_stop")
 
@@ -509,6 +513,18 @@ async def test_a_retry_waits_even_when_the_turn_ends_at_once():
     check(len(c.sent) == 2 and gap >= 0.25, f"the retry waited for the gateway ({gap:.2f}s)")
 
 
+async def test_an_outage_does_not_hold_the_turn():
+    """⚠️ Third review. The settle-up loop passes until nothing is owed, so with the classifier timing
+    out it retried at once on every pass - up to four 20 s timeouts while the user's turn waited to
+    complete. One immediate retry absorbs a blip; a second failure stops the loop."""
+    c = StubCollector(replies=[["Build"]])
+    c.classify_fails = 10                                # the classifier is down for the whole turn
+    c.observe("msg_1", tools=["Write"])
+    await c.finish()
+    check(len(c.classify_calls) == 2, f"two attempts, not one per pass ({len(c.classify_calls)})")
+    check(c.pushes == [], "and nothing is pushed for it")
+
+
 async def main_async():
     for fn in (test_a_shifted_mapping_is_never_applied,
                test_a_transient_classify_failure_is_retried_not_forfeited,
@@ -534,7 +550,8 @@ async def main_async():
                test_an_in_flight_label_is_retried,
                test_parallel_subagents_do_not_close_each_others_calls,
                test_a_retry_produced_by_the_last_pass_is_not_dropped,
-               test_a_retry_waits_even_when_the_turn_ends_at_once):
+               test_a_retry_waits_even_when_the_turn_ends_at_once,
+               test_an_outage_does_not_hold_the_turn):
         print(f"--- {fn.__name__} ---")
         await fn()
 

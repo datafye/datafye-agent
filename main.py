@@ -1849,6 +1849,17 @@ async def stream_agent_response(
 
         async for msg in query(prompt=message, options=options):
             msg_count += 1
+            # A tool RESULT ends the subagent thread it belongs to: a Task's result arrives
+            # on the main thread when that subagent is done, keyed by the Task's tool_use_id,
+            # which is the subagent's thread id. Without this a subagent's last call stays
+            # "open" if its message_stop never arrives (an API error, say) and its record
+            # expires to `unclassified` while the main agent keeps working.
+            _content = getattr(msg, 'content', None)
+            if isinstance(_content, list):
+                for _b in _content:
+                    _tid = getattr(_b, 'tool_use_id', None)
+                    if _tid:
+                        labeller.settle(_tid)
 
             # SystemMessage
             if isinstance(msg, SystemMessage):

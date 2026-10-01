@@ -1171,6 +1171,12 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 - **The end-of-turn settle-up passes until nothing is owed** (at most `MAX_FINAL_PASSES`), and a
   retry waits `UNMATCHED_RETRY_SECONDS` however soon the turn ends after a mid-turn push. Anything
   still owed is logged. Two fixed passes used to drop whatever the second one produced, silently.
+  ⚠️ It stops after a SECOND transport failure (a timeout, a 429, the gateway down): one immediate
+  retry absorbs a blip, but passing again during an outage only repeats a 20 s timeout while the
+  user's turn waits to complete.
+- **A subagent's thread is also settled when its Task RESULT arrives** (the stream loop settles the
+  `tool_use_id` of every tool result). A subagent's last call has no next call in its own thread, so
+  without this it stayed open whenever its `message_stop` never came, and its record expired.
 - ⚠️ **The agent classifies; it does NOT apportion usage.** `ResultMessage.model_usage` is per model
   per turn, so any per-activity split computed here would be an estimate competing with the
   gateway's measurement. Usage stays **per model per turn** (`by_model`), and accounts files it
