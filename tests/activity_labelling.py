@@ -525,6 +525,34 @@ async def test_an_outage_does_not_hold_the_turn():
     check(c.pushes == [], "and nothing is pushed for it")
 
 
+async def test_two_separate_blips_are_not_an_outage():
+    """⚠️ Fourth review. The settle-up counted transport failures across the whole loop, so a blip,
+    then a pass that worked, then another blip stopped it - dropping a label owed with the gateway up.
+    Only two failures IN A ROW mean an outage."""
+    class OneBlipThenSidecar(StubCollector):
+        async def _classify(self, batch):
+            self.classify_calls.append([mid for mid, _ in batch])
+            if len(self.classify_calls) == 1:
+                return [None] * len(batch), True          # blip 1: the classify call times out
+            self.observe_sidecar("msg_classifier")        # the classify call is itself metered
+            return ["Build"] * len(batch), False
+
+        async def _push(self, labels):
+            self.pushes.append(list(labels))
+            if [m for m, _a in labels] == ["msg_classifier"] and not getattr(self, "blipped", False):
+                self.blipped = True                       # blip 2: one 503 on the sidecar's push
+                return False
+            self.pushed += len(labels)
+            return True
+
+    c = OneBlipThenSidecar()
+    c.observe("msg_1", tools=["Write"])
+    await c.finish()
+    landed = [p for p in c.pushes if p == [("msg_classifier", activity.SIDECAR_ACTIVITY)]]
+    check(len(landed) == 2, f"the sidecar's label was retried after the second blip ({c.pushes})")
+    check(c._fixed == {} and c._calls == {}, "and nothing is left owed")
+
+
 async def main_async():
     for fn in (test_a_shifted_mapping_is_never_applied,
                test_a_transient_classify_failure_is_retried_not_forfeited,
@@ -551,7 +579,8 @@ async def main_async():
                test_parallel_subagents_do_not_close_each_others_calls,
                test_a_retry_produced_by_the_last_pass_is_not_dropped,
                test_a_retry_waits_even_when_the_turn_ends_at_once,
-               test_an_outage_does_not_hold_the_turn):
+               test_an_outage_does_not_hold_the_turn,
+               test_two_separate_blips_are_not_an_outage):
         print(f"--- {fn.__name__} ---")
         await fn()
 

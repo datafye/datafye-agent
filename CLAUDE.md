@@ -1171,7 +1171,7 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 - **The end-of-turn settle-up passes until nothing is owed** (at most `MAX_FINAL_PASSES`), and a
   retry waits `UNMATCHED_RETRY_SECONDS` however soon the turn ends after a mid-turn push. Anything
   still owed is logged. Two fixed passes used to drop whatever the second one produced, silently.
-  ⚠️ It stops after a SECOND transport failure (a timeout, a 429, the gateway down): one immediate
+  ⚠️ It stops after a SECOND transport failure IN A ROW (a timeout, a 429, the gateway down): one immediate
   retry absorbs a blip, but passing again during an outage only repeats a 20 s timeout while the
   user's turn waits to complete.
 - **A subagent's thread is also settled when its Task RESULT arrives** (the stream loop settles the

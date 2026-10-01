@@ -417,12 +417,16 @@ class Collector:
             self._transport_failed = False
             await self._flush()
             if self._transport_failed:
-                # One immediate retry absorbs a blip (a single 429 or timeout). A second failure
-                # means the classifier or gateway is down, and another pass now would only fail
+                # One immediate retry absorbs a blip (a single 429 or timeout). A second failure IN A
+                # ROW means the classifier or gateway is down, and another pass now would only fail
                 # again while the user's turn waits on it: stop, and log what is still owed.
                 transport_failures += 1
                 if transport_failures >= 2:
                     break
+            else:
+                # Consecutive, not cumulative: two unrelated blips separated by a pass that worked
+                # are not an outage, and stopping on them dropped labels with the gateway up.
+                transport_failures = 0
         owed = len(self._fixed) + len(self._calls)
         if owed:
             logger.warning("%d activity label(s) still owed at the end of the turn; the gateway will "
