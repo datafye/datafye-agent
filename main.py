@@ -1849,6 +1849,17 @@ async def stream_agent_response(
 
         async for msg in query(prompt=message, options=options):
             msg_count += 1
+            # A tool RESULT ends the subagent thread it belongs to: a Task's result arrives
+            # on the main thread when that subagent is done, keyed by the Task's tool_use_id,
+            # which is the subagent's thread id. Without this a subagent's last call stays
+            # "open" if its message_stop never arrives (an API error, say) and its record
+            # expires to `unclassified` while the main agent keeps working.
+            _content = getattr(msg, 'content', None)
+            if isinstance(_content, list):
+                for _b in _content:
+                    _tid = getattr(_b, 'tool_use_id', None)
+                    if _tid:
+                        labeller.settle(_tid)
 
             # SystemMessage
             if isinstance(msg, SystemMessage):
@@ -1939,7 +1950,10 @@ async def stream_agent_response(
                     elif hasattr(block, 'text'):
                         call_texts.append(getattr(block, 'text', '') or '')
                 labeller.observe(getattr(msg, 'message_id', None),
-                                 thinking=call_thinking, texts=call_texts, tools=call_tools)
+                                 thinking=call_thinking, texts=call_texts, tools=call_tools,
+                                 # Per THREAD: subagents run in parallel on this stream,
+                                 # so one thread's new call says nothing about another's.
+                                 thread=getattr(msg, 'parent_tool_use_id', None))
                 # Starts a push in the background when a batch is due. Deliberately
                 # not awaited: this loop is streaming the reply to the browser, and
                 # blocking it on an HTTP round trip would stall the stream.
@@ -2131,7 +2145,7 @@ async def stream_agent_response(
                 # gateway is writing its record, so the labeller may now flush it. Until
                 # this, a call can still be streaming blocks (DAT-319 review).
                 if isinstance(ev, dict) and ev.get('type') == 'message_stop':
-                    labeller.settle()
+                    labeller.settle(getattr(msg, 'parent_tool_use_id', None))
                 if _LOG_RAW_USAGE:
                     # The one place a real PER-STEP output count could come
                     # from: `message_delta` carries the authoritative (and

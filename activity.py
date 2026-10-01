@@ -96,6 +96,11 @@ TICK_SECONDS = 5.0
 # moment before its record exists. Once is enough for that race; a label that is still unmatched is a
 # real join failure and retrying it forever would hide it.
 UNMATCHED_RETRY_SECONDS = 2.0
+# How many passes the end-of-turn settle-up may make. Each pass can create work for the next (a
+# classification is itself a metered call to label; a push can hand back a label owed its retry), so
+# one or two fixed passes dropped whatever the last one produced. Bounded, because the retry rules
+# already guarantee the work runs out; anything still owed after this is logged, never dropped silently.
+MAX_FINAL_PASSES = 4
 
 # Evidence per call sent to the classifier. Enough to tell design talk from a build step; short
 # enough that 25 of them stay cheap.
@@ -214,15 +219,27 @@ class Collector:
         # so a call's thinking can arrive well before its tool_use - and the gateway only writes the
         # call's record once its stream ends. Flushing an open call classified it on half its evidence
         # (usually without the tool name, the strongest signal), pushed a label the gateway could not
-        # match yet, and then classified its remaining blocks AGAIN as a fresh entry. A call leaves
-        # this set when its stream ends (`settle`), when a later call appears, or at the end of turn.
-        self._open = set()
-        # Calls already labelled and pushed. A late block for one of them is ignored rather than
-        # becoming a second entry that is classified and paid for twice.
+        # match yet, and then classified its remaining blocks AGAIN as a fresh entry.
+        #
+        # ⚠️ Tracked PER THREAD (`parent_tool_use_id`, None for the main agent), not as one set. Calls
+        # within a thread are sequential, so a new call in a thread proves that thread's previous one
+        # ended; but subagents run IN PARALLEL on the same stream, and with a single set one
+        # subagent's call "closed" another's while it was still streaming - the bug back again.
+        # A call leaves this map when its own thread's stream ends (`settle`), when its thread starts
+        # another call, or at the end of turn.
+        self._open = {}
+        # Calls already taken by a flush. A late block for one of them is ignored rather than becoming
+        # a second entry that is classified and paid for twice. Recorded when the flush TAKES the call,
+        # not when its label lands, because classifying takes seconds and a block can arrive meanwhile.
         self._done = set()
-        # Labels that have had their one retry, after `unmatched` or `in_flight`.
+        # Labels that have had their one retry, after `unmatched` or `in_flight`, and the earliest
+        # moment that retry is worth making (the gateway needs a moment to write the record).
         self._retried = set()
-        self._retry_pending = False
+        self._retry_not_before = 0.0
+        # Set by a flush whose classify or push failed on TRANSPORT (a timeout, a 429, the gateway
+        # down). The end-of-turn loop stops on it: passing again at once only repeats the failure,
+        # and each pass can cost a 20 s timeout while the user's turn waits to complete.
+        self._transport_failed = False
         self._ticker = None
         self.pushed = 0
         self.classified = 0
@@ -267,7 +284,8 @@ class Collector:
         """
         return list(self._seen)
 
-    def observe(self, message_id: Optional[str], thinking=(), texts=(), tools=()) -> None:
+    def observe(self, message_id: Optional[str], thinking=(), texts=(), tools=(),
+                thread: Optional[str] = None) -> None:
         """Record what one model call did. Safe to call repeatedly for the same call.
 
         ⚠️ The SDK can emit several AssistantMessages carrying the SAME message_id (one per content
@@ -280,10 +298,9 @@ class Collector:
             return
         if message_id in self._done:
             return
-        # A NEW call means every other one has finished streaming: the model makes its calls one after
-        # another, so a new message id is proof the previous stream ended.
-        if message_id not in self._open:
-            self._open = {message_id}
+        # A NEW call in a thread means that thread's previous call has finished streaming: within one
+        # thread the model makes its calls one after another. Other threads are untouched.
+        self._open[thread] = message_id
         self._start_ticker()
         call = self._calls.get(message_id)
         if call is None:
@@ -304,12 +321,15 @@ class Collector:
                     call[field].append(t[:room])
                     room -= len(t)
 
-    def settle(self) -> None:
-        """Every call seen so far has finished streaming (the caller saw a `message_stop`).
+    def settle(self, thread: Optional[str] = None) -> None:
+        """The current call in ``thread`` has finished streaming (the caller saw its `message_stop`).
 
-        From here a call is eligible for a mid-turn flush. Its evidence is complete and the gateway
-        has, or is about to have, its record."""
-        self._open = set()
+        From here that call is eligible for a mid-turn flush. Its evidence is complete and the gateway
+        has, or is about to have, its record. Other threads' calls are unaffected."""
+        self._open.pop(thread, None)
+
+    def _is_open(self, message_id: str) -> bool:
+        return message_id in self._open.values()
 
     def _start_ticker(self) -> None:
         if self._ticker is not None or not self.classifying:
@@ -348,7 +368,7 @@ class Collector:
     def due(self) -> bool:
         # Only calls whose stream has ENDED count: an open call cannot be flushed, so it cannot make a
         # batch due either.
-        pending = sum(1 for mid in self._calls if mid not in self._open) + len(self._fixed)
+        pending = sum(1 for mid in self._calls if not self._is_open(mid)) + len(self._fixed)
         if not pending:
             return False
         if pending >= BATCH_CALLS:
@@ -376,28 +396,47 @@ class Collector:
             self._ticker.cancel()
             self._ticker = None
         # The turn is over, so every stream has ended.
-        self.settle()
+        self._open = {}
         if self._task is not None:
             try:
                 await self._task
             except Exception as e:      # noqa: BLE001 - never let labelling break a turn
                 logger.warning("Activity label push failed: %s", e)
             self._task = None
-        await self._flush()
-        # ⚠️ A flush classifies, and classifying makes one more metered call, which registers itself
-        # as a sidecar to be labelled. One more pass picks that up; it needs no classification, so
-        # this cannot go round again. The same pass carries any label owed its one retry, after a
-        # pause long enough for the gateway to have written the record it could not find.
-        if self._fixed or self._calls:
-            if self._retry_pending:
-                await asyncio.sleep(UNMATCHED_RETRY_SECONDS)
+        # ⚠️ Pass until nothing is owed. A flush classifies, and classifying makes one more metered
+        # call that registers itself as a sidecar to be labelled; a push can hand back a label owed its
+        # one retry. Two fixed passes dropped whatever the second produced, silently. A retry waits
+        # until it is worth making, however soon after a mid-turn push the turn happened to end.
+        transport_failures = 0
+        for _ in range(MAX_FINAL_PASSES):
+            if not (self._fixed or self._calls):
+                break
+            wait = self._retry_not_before - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._transport_failed = False
             await self._flush()
+            if self._transport_failed:
+                # One immediate retry absorbs a blip (a single 429 or timeout). A second failure IN A
+                # ROW means the classifier or gateway is down, and another pass now would only fail
+                # again while the user's turn waits on it: stop, and log what is still owed.
+                transport_failures += 1
+                if transport_failures >= 2:
+                    break
+            else:
+                # Consecutive, not cumulative: two unrelated blips separated by a pass that worked
+                # are not an outage, and stopping on them dropped labels with the gateway up.
+                transport_failures = 0
+        owed = len(self._fixed) + len(self._calls)
+        if owed:
+            logger.warning("%d activity label(s) still owed at the end of the turn; the gateway will "
+                           "release those records as `unclassified`", owed)
 
     async def _flush(self) -> None:
         async with self._lock:
             # A call still streaming stays behind for the next flush (see `_open`).
             to_classify = [(mid, self._calls[mid]) for mid in self._order
-                           if mid in self._calls and mid not in self._open]
+                           if mid in self._calls and not self._is_open(mid)]
             fixed = dict(self._fixed)
             if not to_classify and not fixed:
                 return
@@ -405,13 +444,15 @@ class Collector:
                 del self._calls[mid]
             self._order = [mid for mid in self._order if mid in self._calls]
             self._fixed = {}
-            self._retry_pending = False
+            self._done.update(mid for mid, _call in to_classify)
+            self._done.update(fixed)
             self._oldest = time.monotonic() if self._calls else None
 
         labels = list(fixed.items())
         if to_classify:
             decided, retry = await self._classify(to_classify)
             if retry:
+                self._transport_failed = True
                 # ⚠️ A TRANSPORT failure is not the same as a bad answer. A 429 or a timeout on the
                 # classify call forfeited that batch for good - the buffer was already drained here -
                 # even though the gateway holds those records for about three times the cadence and
@@ -433,6 +474,7 @@ class Collector:
         # Classified either way; pushed only when there is a gateway holding records to label.
         if labels and self.enabled:
             if not await self._push(labels):
+                self._transport_failed = True
                 # ⚠️ Same reasoning as a failed classification, one step later. A push that never
                 # landed means the gateway releases those records as `unclassified` even though they
                 # WERE classified, so the breakdown loses work that was correctly identified. The
@@ -552,7 +594,7 @@ class Collector:
             self._retried.update(retry)
             owed = set(retry)
             await self._requeue_labels([(m, a) for m, a in labels if m in owed])
-            self._retry_pending = True
+            self._retry_not_before = time.monotonic() + UNMATCHED_RETRY_SECONDS
         given_up = [mid for mid in unmatched if mid not in set(retry)]
         if given_up:
             # Not cosmetic: an unmatched label means that cost is filed under `unclassified` for
