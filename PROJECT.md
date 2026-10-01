@@ -1885,7 +1885,12 @@ So the prompt carries a **RESOURCE GUARD** block. Before any sizeable fetch/repl
 
 The empirical numbers behind all this — per-symbol-per-day byte rates, the sizing formula, an instance-size map, and worked examples — don't belong inline in the prompt (they'd bloat every turn and go stale). Instead they live in a **bundled cheat sheet**, `reference/foundry-resource-cost-cheatsheet.md`, that ships with the app clone. `main.py` computes `CHEATSHEET_PATH` and passes it to `build_system_prompt(cheatsheet_path=...)`; the guard block just tells the agent to read that file on demand when it needs the actual figures. The numbers were measured empirically against a real Yukti project (foundry 2.0.28, 2026-07-17), and the cheat sheet notes to re-measure if the `-Xmx2g` heap or the foundry version changes. The lesson: encode the *policy* ("estimate, check, ask before you overflow") in the always-on prompt, but push the *data* it reasons over into a versioned reference the agent reads only when it's actually sizing a fetch.
 
-### The lifecycle stepper is intent-aware (the agent owns it)
+### The lifecycle stepper is intent-aware (the agent owns it) — *superseded by DAT-319, below*
+
+> **History.** Everything in this section was removed by DAT-319. It is kept because the reasoning
+> that built it is the reasoning that took it apart: see *What Each Call Did, Not Where the Project
+> Is* right after it.
+
 
 The workspace shows a progress stepper for the project, but there is **no single
 global pipeline**. We used to ship one hard-coded six-stage list
@@ -1916,6 +1921,71 @@ which steps to draw. The old `STAGES` constant survives only as a back-compat al
 for the algo track. The lesson: a "lifecycle" that's right for one artifact type is
 wrong for the next — let the agent that understands the project decide its shape,
 and keep the UI a dumb renderer of whatever it's told.
+
+### What Each Call Did, Not Where the Project Is (DAT-319)
+
+The intent-aware stepper above was a better answer to the wrong question. It asked *where is this
+project?* and answered with a position on a track: this algo is in Backtest. People do not work like
+that. They backtest, notice something odd, go back and redesign the entry rule, explore a new
+dataset, rebuild, backtest again. It is a spiral, not a staircase, and a position on a staircase is
+wrong most of the time you look at it.
+
+Worse, that position did a second job it was never fit for: **it decided where the money went.**
+Every turn's entire cost was filed under the stage the project had reached. A turn that spent
+$3 of Opus redesigning the strategy, in a project the classifier had parked at Backtest, was billed
+as backtesting. The breakdown told you where the stepper thought you were, not what you paid for.
+
+So the question changed from *where is the project?* to *what did this call do?* That second
+question has a lovely property: **it has a right answer, and the answer never changes.** A call that
+read three files and wrote a strategy module was Build, and nothing that happens an hour later can
+make it not have been. That is what makes it safe to classify a twelve-hour turn a minute at a time.
+
+The mechanics live in `activity.py`, and they are deliberately boring:
+
+- Each model call's thinking, text and **tool names** (never tool inputs, which would put user data
+  through a classifier) are buffered by `message_id`, the same id the metering gateway records.
+- Every 25 calls, or whenever the oldest one is 60 seconds old, one cheap Haiku call labels the
+  whole batch, and the labels go to the gateway's `POST /gateway/label`. The gateway holds each
+  usage record until its label arrives (DAT-317), so the record it finally delivers to accounts says
+  what the call was for.
+- The vocabulary is one flat set: **Explore, Design, Build, Backtest, Validate, Deploy.** The agent's
+  own little sidecar calls (titling, satisfaction, the classifier itself) are labelled **Platform**
+  without asking anyone, because paying a classifier to label the classifier would be a comedy.
+
+Three things worth stealing from how this was built.
+
+**The agent classifies; it does not apportion.** The obvious next step is to split each turn's cost
+across the activities its calls did. The Sutra agent built exactly that, then deleted it in its last
+commit (SUT-114, `af4c72c`): the SDK reports usage per model *per turn*, so any per-activity split
+the agent computes is an estimate, and the gateway is already measuring every call exactly. **When
+something downstream has the measurement, don't ship an estimate that competes with it.** The agent's
+own usage stays per model per turn, and accounts files it under a placeholder until it learns to read
+the gateway's per-call activity (DAT-318). DAT-319's ticket was written before Sutra learned this, and
+says otherwise; the port follows what Sutra learned, and the PR says so out loud.
+
+**A word that means "broken" must keep meaning broken.** The gateway files anything it never got a
+label for as `unclassified`. That word is an alarm: if it grows, labelling has stopped working. So
+everything that could leak into it without anything being wrong has a home of its own. The sidecars
+get `Platform`. A conversation that never becomes a project, a one-off analysis, a question about
+Datafye itself: all of that is `Explore`, defined wide on purpose. A self-hosted box with no gateway
+is not classified at all (that would spend the user's own key on a report they did not ask for), and
+the workspace calls that state `unlabelled`, a different word, because it is normal. **An alarm that
+fires for normal reasons is an alarm nobody reads.**
+
+**Name the trap in the prompt, then test the trap.** The plain reading of these words pulls the wrong
+way in predictable places. Re-running a backtest carefully *feels* like validation, and isn't.
+Explaining what going live would take *sounds* like Deploy, and isn't. So the classifier prompt names
+each trap outright, and `tests/activity_classifier.py` puts exactly those cases in front of a real
+model three times over: 12 of 12, every run, for about a cent. A classifier that is right once and
+wrong twice is not fixed.
+
+And one bug that was caught before it was written, because the other agent had already paid for it:
+`main.py` has a route handler called `activity()`, the heartbeat behind `POST /v1/activity`. Write
+`import activity` at the top of that file and the import succeeds, the module loads, every test of the
+module passes, and then the `def activity()` further down quietly rebinds the name. The first real turn
+dies with *'function' object has no attribute 'Collector'*. The Sutra agent found that with a green
+unit run and a red end-to-end one. Here it is imported as `activity_labels`, and a test checks that the
+alias is still the module, which a mutation (use `activity.Collector` directly) proves it catches.
 
 ## Broker Integration
 

@@ -333,40 +333,16 @@ def list_conversations() -> list:
     return out
 
 
-# A project's lifecycle is a *track* — an ordered list of stages — that the agent
-# chooses from the project's inferred intent (see main.classify_lifecycle). Chat
-# and research have no build track (empty => the workspace shows no stepper).
-# "Explore" is the common opening stage: a project starts from intent/discovery,
-# not necessarily a pre-formed idea. Trading vocabulary on the tail: Backtest =
-# refine-on-historical-data, Validate = paper-trade on live data, Deploy = live
-# (real-money) trading; a non-trading build ends at Ship instead.
-TRACK_TRADING = ["Explore", "Design", "Build", "Backtest", "Validate", "Deploy"]
-TRACK_BUILD = ["Explore", "Design", "Build", "Ship"]   # non-trading build (dashboard / tool)
-
-# Standard tracks per known intent. Open vocabulary: an intent not listed here
-# resolves via track_for_intent()'s fallback ([]), and the agent may override
-# with a track it composes for a novel build intent.
-TRACKS = {
-    "algo": TRACK_TRADING,
-    "signal": TRACK_TRADING,    # same lifecycle; the artifact is a signal generator
-    "dashboard": TRACK_BUILD,
-    "app": TRACK_BUILD,
-    "tool": TRACK_BUILD,
-    "analysis": [],
-    "research": [],
-    "chat": [],
-}
-DEFAULT_INTENT = "chat"
-
-# Back-compat alias: the full trading track is what "STAGES" used to be.
-STAGES = TRACK_TRADING
-
-
-def track_for_intent(intent: str) -> list:
-    """The ordered stage track for an intent. Known intents map to a standard
-    track; an unknown intent yields no track ([]) unless the agent supplies a
-    composed one. Chat/research are intentionally trackless (no stepper)."""
-    return list(TRACKS.get((intent or "").strip().lower(), []))
+# ⚠️ There is no project lifecycle here any more (DAT-319). A project used to carry an inferred
+# `intent`, a per-intent `track` of stages and a `stage`/`maxStage` position within it, all three
+# existing only to drive the workspace stepper. People work in a spiral, so the asserted position was
+# wrong more often than it was right, and it also decided which stage a turn's whole cost was filed
+# under. What each model CALL did is now classified per call and told to the metering gateway
+# (`activity.py`), and the measured per-activity breakdown is the gateway's.
+#
+# Old records still carry those four keys on disk. Nothing reads or serves them, so they are left
+# rather than rewritten: a migration that touches every project to delete four inert fields buys
+# nothing and risks the record.
 
 # The per-turn usage fields we accumulate, kept as a tuple so the meta record,
 # the totals roll-up, and the accounts report all stay in lockstep.
@@ -380,7 +356,7 @@ _MAX_USAGE_KEYS = 200
 def _empty_usage() -> dict:
     return {
         "totals": {f: 0 for f in _USAGE_FIELDS},
-        "by_stage_model": {},
+        "by_model": {},
         "updated_at": 0,
         "applied_keys": [],
     }
@@ -397,82 +373,26 @@ def _new_record(conversation_id: str, first_message: str = "") -> dict:
         "sdk_session_id": None,
         "messages": [],
         "commentary": [],
-        # Lifecycle: the agent infers `intent` and the `track` (ordered stages)
-        # for this project. `stage` = where it is now; `maxStage` = furthest
-        # reached (never regresses). An empty track (chat/research) => no stepper.
-        "intent": DEFAULT_INTENT,
-        "track": [],
-        "stage": "",
-        "maxStage": "",
-        # Token/cost/tool usage, accumulated one turn-delta at a time, tracked
-        # per (stage × model). Drives the workspace telemetry (survives reload
-        # via /history) and mirrors what the agent reports to accounts (billing +
-        # the hosted-tier quota meter). `applied_keys` is a capped idempotency
-        # ledger so a re-applied turn can't double-count.
+        # Token/cost/tool usage, accumulated one turn-delta at a time, tracked per
+        # MODEL. There is deliberately no stage and no activity here: the agent
+        # classifies each CALL and tells the metering gateway, which meters the
+        # call exactly, so the per-activity breakdown is the gateway's, measured,
+        # rather than an apportionment invented here (DAT-319). Drives the
+        # workspace telemetry (survives reload via /history) and mirrors what the
+        # agent reports to accounts (billing + the hosted-tier quota meter).
+        # `applied_keys` is a capped idempotency ledger so a re-applied delta
+        # can't double-count.
         "usage": _empty_usage(),
     }
 
 
-def _stage_index(stage: str, track: list) -> int:
-    try:
-        return (track or STAGES).index(stage)
-    except ValueError:
-        return 0
-
-
-def set_stage(conversation_id: str, stage: str) -> Optional[dict]:
-    """Set the project's current lifecycle stage *within its track*, promoting
-    the `maxStage` high-water mark if this advances past it. Ignores a stage not
-    in the project's track. Returns the updated record (or None)."""
-    record = _read(conversation_id)
-    if record is None:
-        return None
-    track = record.get("track") or []
-    if stage and stage in track:
-        record["stage"] = stage
-        prev_max = record.get("maxStage") or record.get("stage") or (track[0] if track else "")
-        if _stage_index(stage, track) > _stage_index(prev_max, track):
-            record["maxStage"] = stage
-        elif not record.get("maxStage"):
-            record["maxStage"] = prev_max
-        record["updated_at"] = _now_ms()
-        _write(record)
-    return record
-
-
-def set_intent_track(conversation_id: str, intent: str, track: list,
-                     stage: Optional[str] = None) -> Optional[dict]:
-    """Set the project's inferred `intent` and lifecycle `track` (and optionally
-    the current `stage`), keeping `stage`/`maxStage` consistent with the new
-    track. Returns the updated record (or None)."""
-    record = _read(conversation_id)
-    if record is None:
-        return None
-    record["intent"] = intent or DEFAULT_INTENT
-    record["track"] = list(track or [])
-    cur = stage if stage is not None else record.get("stage", "")
-    if cur and cur in record["track"]:
-        record["stage"] = cur
-    elif record["track"]:
-        record["stage"] = record["track"][0]
-    else:
-        record["stage"] = ""
-    mx = record.get("maxStage", "")
-    if not (mx and mx in record["track"]) or \
-            _stage_index(record["stage"], record["track"]) > _stage_index(mx, record["track"]):
-        record["maxStage"] = record["stage"]
-    record["updated_at"] = _now_ms()
-    _write(record)
-    return record
-
-
 def usage_public(record: dict) -> dict:
-    """The display-facing view of a record's usage: totals + the per-(stage ×
-    model) breakdown, with the internal idempotency ledger stripped."""
+    """The display-facing view of a record's usage: totals + the per-model
+    breakdown, with the internal idempotency ledger stripped."""
     usage = (record or {}).get("usage") or _empty_usage()
     return {
         "totals": dict(usage.get("totals") or {}),
-        "by_stage_model": dict(usage.get("by_stage_model") or {}),
+        "by_model": dict(_cells(usage)),
         "context_tokens": int(usage.get("context_tokens") or 0),
         "updated_at": usage.get("updated_at", 0),
     }
@@ -496,11 +416,40 @@ def set_context_tokens(conversation_id: str, tokens: int) -> None:
     _write(record)
 
 
-def add_usage(conversation_id: str, stage: str, model: str, delta: dict,
+def _cells(usage: dict) -> dict:
+    """The per-model cells, folding a pre-DAT-319 record's `stage|model` cells into place.
+
+    ⚠️ The old map was keyed `stage|model`, so several old cells collapse into one per model. Summed
+    rather than dropped: the totals are the figures a bill was built from, and losing the breakdown is
+    a cosmetic regression while losing the numbers is not."""
+    cells = usage.get("by_model")
+    if cells is None:
+        legacy = usage.pop("by_stage_model", None) or {}
+        cells = {}
+        for key, cell in legacy.items():
+            if not isinstance(cell, dict):
+                continue
+            model = cell.get("model") or (key.split("|")[-1] if "|" in key else key) or "unknown"
+            into = cells.setdefault(model, {"model": model})
+            for f in _USAGE_FIELDS:
+                into[f] = int(into.get(f, 0)) + int(cell.get(f, 0) or 0)
+            into["updated_at"] = max(int(into.get("updated_at", 0)), int(cell.get("updated_at", 0) or 0))
+        usage["by_model"] = cells
+    return cells
+
+
+def add_usage(conversation_id: str, model: str, delta: dict,
               idempotency_key: Optional[str] = None) -> Optional[dict]:
-    """Add one turn's usage delta into the (stage × model) breakdown and the
-    roll-up totals — at most once per `idempotency_key`. Returns the updated
-    usage view (or None if the project does not exist)."""
+    """Add one turn's usage delta into the per-MODEL breakdown and the roll-up
+    totals — at most once per `idempotency_key`. Returns the updated usage view
+    (or None if the project does not exist).
+
+    ⚠️ Per model per turn, and nothing finer. The agent classifies each CALL's
+    activity and pushes that to the metering gateway (DAT-319), but it does not
+    attribute usage per call: `ResultMessage.model_usage` is per model per turn,
+    so any per-activity split here would be an apportionment. The gateway meters
+    every call exactly and knows its activity, so the measured breakdown lives
+    there."""
     record = _read(conversation_id)
     if record is None:
         return None
@@ -509,11 +458,10 @@ def add_usage(conversation_id: str, stage: str, model: str, delta: dict,
     if idempotency_key and idempotency_key in keys:
         return usage_public(record)
 
-    stage = stage or "unknown"
     model = model or "unknown"
-    cell_key = stage + "|" + model
-    cells = usage.setdefault("by_stage_model", {})
-    cell = cells.get(cell_key) or {"stage": stage, "model": model}
+    cells = _cells(usage)
+    cell_key = model
+    cell = cells.get(cell_key) or {"model": model}
     totals = usage.setdefault("totals", {f: 0 for f in _USAGE_FIELDS})
     now = _now_ms()
     for f in _USAGE_FIELDS:

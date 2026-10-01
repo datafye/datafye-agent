@@ -53,8 +53,7 @@ in the signature; the latter also aborted the per-model loop, so usage was UNDER
 than merely un-reported). Nothing in `tests/` runs this path but the real-turn suite.
 
 Checked rather than assumed, because the two agents have drifted: this fork keys usage by
-**`by_stage_model`** (`conversations.py:383`) and the predicate also accepts `by_model`, so it
-survives the **DAT-319** port; and `/history` returns the raw stored messages, so
+**`by_model`** since DAT-319 (it was `by_stage_model`), and the predicate accepts both; and `/history` returns the raw stored messages, so
 `messages[].usage` rides through.
 
 ⚠️ **Datafye is NOT affected by Sutra's `TypeError` — do not "port the fix".** Verified by AST on
@@ -82,6 +81,7 @@ Datafye Agent is a dedicated per-user AI backend for algorithmic trading project
 ```
 datafye-agent/
 ├── main.py          # FastAPI app, endpoints, SSE streaming, session management
+├── activity.py      # Per-call activity classification + labels pushed to the metering gateway (DAT-319)
 ├── prompt.py        # System prompt builder (assembled from runtime context, incl. memory + skills blocks)
 ├── auth.py          # JWT validation against accounts' JWKS (with clock-skew leeway)
 ├── credentials.py   # Encrypted on-disk credentials store
@@ -96,6 +96,9 @@ datafye-agent/
 ├── paths.py         # Single agent state-root (DATAFYE_AGENT_STATE_DIR) all per-user state derives from
 ├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
 ├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
+├── tests/activity_labelling.py  # Offline checks over activity.py's batching, retries and discards
+├── tests/activity_classifier.py # The classifier against a real model (a cent a run)
+├── tests/usage_by_model.py      # Per-model usage, and old stage-keyed records keep their numbers
 ├── tests/test_prompt_audit.py  # Dependency-free prompt audit; renders the REAL prompt and pins every claim that has been wrong
 ├── tests/project_archive.py    # 84 unit checks over export/import — most of them the attacks the module must refuse
 ├── tests/project_archive_api.py # The same four routes against a REAL agent process (auth, ceilings, round-trip)
@@ -1087,7 +1090,7 @@ that grows has to be the volume the data is on.
 | `/v1/conversations` | POST | Create a conversation (agent mints the id, deduces a name). **LEGACY/UNUSED** — accounts mints project ids; new chat threads arrive with an accounts-minted `conversation_id` that `/v1/chat` materialises via `conversations.ensure()` |
 | `/v1/conversations/{id}` | PATCH | Rename a conversation; 404 if absent |
 | `/v1/conversations/{id}` | DELETE | Permanently delete a project's agent-side folder via `conversations.delete()` (path-safety guard refuses anything outside the projects base); 204 on success, 404 if the agent never materialised it. Accounts deletes its own project record separately |
-| `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail; also returns the project's `intent` + `track` (+ `stage`/`maxStage`) so the frontend can rehydrate the right stepper. Each assistant message carries a per-turn `usage` (tokens+cost) tagged by `conversations.set_last_message_usage`, for the accounts Conversation view |
+| `/v1/conversations/{id}/history` | GET | Replay a conversation's `messages` and `commentary` audit trail; plus the per-model `usage`. No lifecycle position: `intent`/`track`/`stage`/`maxStage` were removed by DAT-319. Each assistant message carries a per-turn `usage` (tokens+cost) tagged by `conversations.set_last_message_usage`, for the accounts Conversation view |
 | `/v1/conversations/{id}/export` | GET | Download the agent half of one project as a versioned zip (code, chat history, project memory, uploads, outputs; regenerable trees excluded and named in the manifest). Accounts bundles it with its own project record. 404 when the box never materialised the folder — a real state, since accounts can hold a record for a project nobody chatted to (DAT-293) |
 | `/v1/conversations/{id}/import` | POST | Write that zip back in, as the **caller's** id — accounts mints the id on the target box, and the record inside the archive is retargeted to match. Raw body, staged first; refuses an existing project unless `?overwrite=true` |
 
@@ -1112,8 +1115,8 @@ push lands.
 | `commentary` | A line for the workspace's per-turn **activity rail** (`{text, kind}`). Machine tool-labels (notable Bash + MCP calls) carry `kind` `muted`/`notable`/`check`/`error`; the agent's own **work-narration** (a text burst followed by a tool call) carries `kind` **`narration`** so the frontend renders it a shade brighter than the tool-labels. A `kind` of **`step`** is the per-round cost badge (empty text; carries `usage` = `{new, carried}`), and **`thinking`** is the model's reasoning. Every entry carries the **`step`** it belongs to; a tool-label entry also carries `call_tokens` (what the CALL put into the prompt — for `Write`/`Edit` the model generates the whole file into the call, so a result-only figure reported ~nothing for the most expensive thing in the step). Also appended to the conversation's commentary audit trail (**uncapped** — commentary is the analytics record accounts persists) |
 | `ticker` | The conversation's **context size** for the live status ticker (`{tokens}`). Emitted once per model round as `new + carried` — the whole prompt at that step, so it is exact and needs no summing. The field name is kept for older clients but its **meaning changed**: it used to be a running `input+output` tally, which reads in the tens once the prefix is cached. Gated on a round actually being new, because the SDK repeats one round's usage across every message of that round (the old per-message accumulation was double-counting) |
 | `result` | Final result with metadata |
-| `stage` | Intent-aware lifecycle position the turn landed in, classified post-stream by `classify_lifecycle()` (cheap haiku). `{conversation_id, intent, track, stage, maxStage}` where `track` is the ordered stage list for the project's `intent` and `stage` is the current step within it. Drives the workspace stepper (frontend renders whatever `track` it's given). See **Project lifecycle** below |
-| `usage` | Per-`(stage × model)` token/cost/tool usage, emitted at turn-end after attribution: `{conversation_id, usage, stage, model}` where `usage` = cumulative `{totals, by_stage_model, updated_at}`. Sourced from `ResultMessage.model_usage` (one delta per model the turn actually used, idempotency-keyed per model — replaces the flat single-`usage` read that undercounted multi-step turns), plus the Haiku sidecar tokens folded in via `usage_sink` (`generate_title`, `classify_lifecycle`, `analyze_satisfaction`). Falls back to the flat `usage` if the CLI emits no `model_usage`. When the project has no lifecycle stage (a `research`/`chat` project has an empty track, so its stage is blank), usage is tagged with the project **intent** (e.g. `research`) rather than a blank stage that would render as "unknown" (`stage_now = rec.stage or rec.intent or 'general'`). Drives the telemetry footer + stepper badges; also reported to accounts (`POST …/projects/{id}/usage`, JWT-forwarded, idempotency-keyed) for billing + the hosted-tier quota meter |
+| ~~`stage`~~ | **REMOVED (DAT-319).** It carried the project's inferred intent, per-intent track and the stage within it, which existed only to drive the workspace stepper and was wrong more often than right (people work in a spiral). What each CALL did is now classified per call and pushed to the metering gateway; see **Activity per call** below. Yukti's stepper loses its marker until DAT-320 replaces it with the activity mix |
+| `usage` | Per-model token/cost/tool usage, emitted at turn-end: `{conversation_id, usage, model, activities}` where `usage` = cumulative `{totals, by_model, context_tokens, updated_at}` and `activities` is the LIST of kinds of work this turn's calls were classified as (a list, not a cost split). Sourced from `ResultMessage.model_usage` (one delta per model the turn actually used, idempotency-keyed per model), plus the Haiku sidecars folded in via `usage_sink` (`generate_title`, `analyze_satisfaction`, `classify_environment_intent` and the activity classifier). Falls back to the flat `usage` if the CLI emits no `model_usage`. Also reported to accounts (`POST …/projects/{id}/usage`, JWT-forwarded, idempotency-keyed) under the placeholder stage `Build` until accounts reads the gateway's activity telemetry (DAT-318) |
 | `artifact` | A deliverable the agent wrote to the project's `outputs/` folder this turn (`{conversation_id, name, type, size}`). Emitted post-stream by diffing the `outputs/` snapshot taken before the turn against the snapshot after — one event per new or changed file — so the frontend can offer a download. Best-effort; never breaks the turn |
 | ~~`descriptor` / `env_status`~~ | **REMOVED (DAT-234/DAT-235).** Both were snapshots of BOX state riding a turn stream, so a workspace that had not run a turn knew nothing about its deployment. The workspace now polls `/health`, whose `foundry` block carries readiness, datasets, type, symbols, broker and mode; the descriptor goes agent-to-accounts directly instead of by way of the browser. Nothing about a deployment is published as an event any more |
 | `scorecard_update` | Test results (for frontend) |
@@ -1121,24 +1124,56 @@ push lands.
 | `error` | Error occurred |
 | `done` | Stream complete |
 
-## Project lifecycle (intent-aware tracks)
+## Activity per call (DAT-319)
 
-The lifecycle is **agent-driven and per-project**, not one fixed global pipeline.
-`classify_lifecycle()` (cheap haiku, post-stream) infers the project's **intent**
-and returns `{intent, track, stage}`; the agent owns each project's lifecycle and
-reports it, while the frontend renders whatever track it is handed.
+There is **no project lifecycle** any more. A project used to carry an inferred `intent`, a
+per-intent `track` of stages and a `stage`/`maxStage` position, classified once per turn and used
+as the key the turn's WHOLE cost was filed under. That conflated two things: what the project is
+doing overall (unknowable, because people move between exploring, building and validating
+continuously) and what a given call cost.
 
-- **Tracks** (`conversations.py`): per-intent ordered stage lists.
-  - `algo` / `signal` → `[Explore, Design, Build, Backtest, Validate, Deploy]`
-  - `dashboard` / `app` / `tool` → `[Explore, Design, Build, Ship]`
-  - `chat` / `research` → `[]` (no stepper)
-- The first stage was renamed **Idea → Explore**. The intent vocabulary is open —
-  the agent can compose a track for a novel build intent (common
-  `Explore→Design→Build` spine + an artifact-dependent tail). For `signal`,
-  "Deploy" means *publish* (vs an algo's deploy).
-- Project records carry `intent` + `track` alongside `stage`/`maxStage`; helpers
-  `set_intent_track` / `track_for_intent` manage them. `STAGES` remains as a
-  back-compat alias for the trading (`algo`) track.
+**`activity.py` labels each model CALL instead**, from that call's own evidence, and tells the
+metering gateway, which holds each usage record until it is labelled (DAT-317):
+
+```
+gateway meters each call, holds the record   ─┐
+agent buffers evidence per call               │  joined on message_id
+agent classifies a batch (one cheap call)     │
+agent POSTs /gateway/label                   ─┘  → gateway releases the record, labelled
+```
+
+- **One flat vocabulary**: Explore, Design, Build, Backtest, Validate, Deploy. No per-intent tracks.
+  `Deploy` covers going live for every artifact (real money, publishing a signal, standing up a
+  dashboard), so `Ship` is gone; `Explore` absorbs one-off research and questions about Datafye, so
+  `unclassified` keeps meaning "labelling broke". The agent's own sidecar calls are labelled
+  **`Platform`** without asking a model.
+- **The traps are named in the prompt** (`activity._PROMPT`): a backtest is not Validate, advice about
+  going live is not Deploy, a bare acknowledgement takes the activity of what it wraps up.
+  `tests/activity_classifier.py` checks them against a real model (a cent a run).
+- **Batches go on whichever comes first**: 25 calls, the oldest call passing 60 s, or the end of the
+  turn. The 60 s is also the cadence reported to the gateway, which sizes its hold from it. A
+  twelve-hour turn therefore still reports within a minute, and a Stop or crash loses at most the
+  unpushed batch (the `finally` in `stream_agent_response` tries even that).
+- ⚠️ **The agent classifies; it does NOT apportion usage.** `ResultMessage.model_usage` is per model
+  per turn, so any per-activity split computed here would be an estimate competing with the
+  gateway's measurement. Usage stays **per model per turn** (`by_model`), and accounts files it
+  under the placeholder `Build` until DAT-318 derives activity from the gateway's telemetry. This
+  is SUT-114's final design (its commit `af4c72c` reversed an earlier apportionment); DAT-319's own
+  acceptance criterion predates that decision.
+- ⚠️ **`main.py` imports the module as `activity_labels`.** `main.py` also defines the
+  `POST /v1/activity` handler `activity()`, which rebinds the name at import and turns
+  `activity.Collector` into an AttributeError on the first turn. `tests/activity_labelling.py`
+  asserts the alias.
+- **Not classified on a self-hosted box** unless `DATAFYE_AGENT_CLASSIFY_ACTIVITY=1`: with no
+  gateway there is nothing to label, and classifying would spend the user's key on something they
+  did not ask for.
+- **Old records keep their numbers.** A pre-DAT-319 record's `stage|model` cells are folded into one
+  cell per model on read, SUMMED (they are what a bill was built from). Its four lifecycle keys are
+  left on disk and ignored.
+- **The live-trading gate is unaffected**: `prompt.py` gates on ACTIONS ("confirm ... before going
+  live with real money"), never on a stage variable. Its lifecycle prose is static teaching that was
+  never fed by the classifier, and still says a non-trading build "ends at Ship" (harmless, but
+  out of step with the vocabulary).
 
 ## Environment Variables
 
@@ -1148,6 +1183,7 @@ reports it, while the frontend renders whatever track it is handed.
 | `DATAFYE_AGENT_MODEL` | `opus` | Claude model |
 | `DATAFYE_AGENT_LOG_USAGE` | - | Set to `1` to dump the raw per-round usage object (and the usage-bearing stream events) from the SDK. **Off by default** — it is one line per model round, hundreds per build turn. Logged at INFO deliberately: the service runs at INFO, so a debug-level line would be silently swallowed and the diagnostic would look broken rather than disabled |
 | `DATAFYE_AGENT_TITLE_MODEL` | `claude-haiku-4-5` | Cheap model used only by `generate_title()` to summarize a new project's first message into a title (direct Anthropic `/v1/messages` httpx call, never the main reasoning model) |
+| `DATAFYE_AGENT_CLASSIFY_ACTIVITY` | - | Set to `1` to classify each call's activity on a box with NO metering gateway (DAT-319). Off by default: classifying costs one cheap model call per batch, and on a self-hosted box that is the user's own key. With a gateway it is always on |
 | `DATAFYE_AGENT_PORT` | `18780` | HTTP port |
 | `DATAFYE_AGENT_BOM_PATH` | `/opt/datafye/agent/bom.json` | The BOM the installer writes. Backs `/v1/bom` and `/health`'s **`agent_version`**, which is read ONCE at import into `AGENT_VERSION` — `/health` may only carry facts costing a variable read, and a version cannot change under a running process anyway |
 | `DATAFYE_AGENT_VERSION` | - | Fallback for `agent_version` when there is no BOM (a local run). With neither, the field is `None` — never an invented number |
@@ -1370,7 +1406,7 @@ independently-derived view of an environment the readiness block already describ
 
 ⚠️ **The category error is worth naming, because it is easy to repeat.** Every other frame
 on that stream is something that HAPPENED during the turn — `content`, `thinking`,
-`tool_result`, `step`, `ticker`, `stage`, `usage`, `artifact`. These two were **snapshots
+`tool_result`, `step`, `ticker`, `usage`, `artifact`. These two were **snapshots
 of BOX state**, riding a turn stream because that was the pipe that happened to be open.
 The consequence: state that exists continuously was published on an occasional trigger, so
 **a workspace that had not run a turn knew nothing about its deployment, and one that had
@@ -1419,7 +1455,7 @@ So the agent is the sole production caller of `POST /accounts/{u}/sandbox/foundr
 **Two mechanisms, because a prompt rule alone will not hold.** The model has to classify a request as policy *and* remember a second action after it has already performed the first, and this codebase has paid for trusting that before: the prompt told the agent how to run long operations and it backgrounded a provision anyway, which was then orphaned with the session (DAT-185).
 
 - **`set_environment_intent`** — a tool on the same in-process MCP server as `submit_feedback`/`submit_satisfaction`. The explicit path, for a decision the user actually stated.
-- **`classify_environment_intent`** — a fourth post-stream Haiku sidecar alongside `generate_title`/`classify_lifecycle`/`analyze_satisfaction`. It **always runs**, so it does not depend on the model choosing anything.
+- **`classify_environment_intent`** — a fourth post-stream Haiku sidecar alongside `generate_title`/`analyze_satisfaction` (and, since DAT-319, the activity classifier). It **always runs**, so it does not depend on the model choosing anything.
 
 They cannot fight: `_intent_recorded_this_turn` marks a turn where the tool fired, and the sidecar skips that turn and consumes the mark. **Explicit always beats inferred**, because the model's own statement is better evidence than an inference drawn from the same conversation.
 
@@ -1582,7 +1618,7 @@ and MCP hosts.
 - **Tool lines name the real work**: `Read` is classified by **path** (memory / docs / samples / project) and `Bash` by **`_bash_activity`**, which splits on shell separators and keys on the **program and its arguments** rather than scanning the command string. The old substring net matched `test` anywhere, so `.../agent/latest/install.sh` and `ls src/test/…` both narrated as "Running the backtest". Now: `pytest`/`python -m pytest` are a test run; `backtest`/`paper`/`replay` as a *token* (split on `/_-.`) is a backtest, so `run_backtest.py` counts and `latest` cannot; the Datafye CLI with a `foundry`/`dataset`/`provision`/`apply` subcommand is environment work. Memory reads/writes narrate as **"Recalling from memory"** / **"Saving to memory"** in any scope (the scope is recoverable from Tool Detail), which is what makes it visible that fleet memory was consulted at all. Only the always-on `MEMORY.md` indexes + the small `CLAUDE.md` notes are injected; memory bodies are read on demand. The CLI's own auto-memory is **disabled** (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`) because it has no global tier, is git-repo-scoped, and stores under `~/.claude` — it would be a second, uncontrolled store
 - **Per-STEP cost attribution (DAT-137)**: each model round emits a `step`-kind commentary badge carrying `{new, carried}` — `new` is what the request appended to the prompt (uncached input **plus** cache creation, summed because a span under the minimum cacheable prefix silently bills as input rather than cache-creation), `carried` is the prefix re-read from cache. There is deliberately **no per-step output figure**: what arrives at `message_start` is a placeholder (1-3), and the real count lands on `message_delta`, which the SDK does not surface here. Whole-turn output stays correct via `model_usage`. **An `AssistantMessage` is not a model round** — the SDK emits one per content block and repeats that round's usage object, so a round is detected by the usage object *changing*; counting messages produced a badge per block and was also silently double-counting the old ticker. `step` is stamped on every entry of a round (an identity, not a dense index — gaps are fine) because one round can emit several narration lines, so the grouping cannot be inferred from how the rail renders.
 - **Subagent work stays out of the rail (DAT-138)**: a subagent's messages arrive on the same stream carrying their own conversation's usage, distinguishable only by `parent_tool_use_id` (`None` = main thread). Both its **badge** and its **content** are suppressed — gating only the badge leaves `pending_blocks` thread-blind, so the subagent's prose flushes into the rail as if the agent had said it. Its tool calls are still counted and its tokens still reach accounts via `model_usage`. Delegation itself is off (`Task` absent from `INTERNAL_TOOLS`) because a subagent does **not** inherit `prompt.py`, so no rule about audience or voice governs delegated work.
-- **Per-turn usage from `model_usage`**: usage is attributed from `ResultMessage.model_usage` — one delta per `(stage × model)` the turn actually used, idempotency-keyed per model — instead of the old flat single-`usage` read that undercounted a multi-step turn. The two cheap Haiku sidecars (`generate_title`, `classify_lifecycle`, `analyze_satisfaction`) fold their tokens in through a `usage_sink` param (their direct-API calls never appear in `model_usage`; cost is 0, tokens counted). Helpers: `_usage_delta_from_model_entry`, `_accumulate_turn_usage`, `_TURN_USAGE_FIELDS`. `conversations.set_last_message_usage` tags the assistant reply so `/history` carries `messages[].usage`. Falls back to the flat `usage` if the CLI emits no `model_usage`
+- **Per-turn usage from `model_usage`**: usage is attributed from `ResultMessage.model_usage` — one delta per model the turn actually used, idempotency-keyed per model — instead of the old flat single-`usage` read that undercounted a multi-step turn. The cheap Haiku sidecars (`generate_title`, `analyze_satisfaction`, `classify_environment_intent`, the activity classifier) fold their tokens in through a `usage_sink` param (their direct-API calls never appear in `model_usage`; cost is 0, tokens counted). Helpers: `_usage_delta_from_model_entry`, `_accumulate_turn_usage`, `_TURN_USAGE_FIELDS`. `conversations.set_last_message_usage` tags the assistant reply so `/history` carries `messages[].usage`. Falls back to the flat `usage` if the CLI emits no `model_usage`
 - **Narration routing + guaranteed closing message**: the streamer buffers unrouted text as a **list of distinct blocks** (`pending_blocks`, one per narration sentence / reply paragraph — NOT a concatenated string, so sentences never glue into a run-on line at their periods). Blocks *followed by a tool call* are work-narration: each is flushed as **its own commentary line at `kind="narration"`** (one line per sentence) — a distinct kind from the machine tool-labels so the frontend's activity rail renders the agent's own voice a shade brighter. The final trailing blocks are the reply and go to the Conversation (joined with `\n\n` into `conversation_text`, flushed + persisted in the ResultMessage branch). If a turn ends on a tool call with **no trailing prose**, `conversation_text` falls back to the SDK's `ResultMessage.result` so the Conversation **always gets a closing message** (never a turn that ends silently on an action). `prompt.py` emits short high-level action lines (no commands/flags/filenames, no "Let me…" openers) + a plain final message, and is instructed to always end the turn with that closing message. The frontend renders work-narration + tool-labels + thinking inline as a dim per-turn **activity rail** above the full-weight reply (the old separate Work panel is gone)
 - **Uncapped commentary**: the 400-entry `_MAX_COMMENTARY` cap in `conversations.append_commentary` was removed — commentary is the analytics record accounts persists, so truncating it loses data
 - **Plain ASCII punctuation**: `prompt.py` instructs the agent to use ASCII punctuation everywhere (no em/en dashes, curly quotes, ellipsis char) because non-ASCII breaks the accounts `resultJson` storage
@@ -1590,7 +1626,7 @@ and MCP hosts.
 - **Downloadable output files**: each project gets an `outputs/` folder (distinct from `uploads/`: uploads are context *into* the agent, outputs are deliverables the user takes away). `conversations.list_outputs`/`output_file_path` (path-safety-guarded); endpoints `GET …/outputs` (list) + `GET …/outputs/{filename}` (download, `FileResponse`, JWT-gated). A post-stream diff of the `outputs/` snapshot emits an `artifact` SSE event per new/changed file. The prompt tells the agent to write deliverables into `outputs/`
 - **Environment failures leave a report, and the prompt says to read it (DAT-171)**: a failed `provision`/`apply`/`start`/`stop` used to surface only `Failed to run admin script` wrapping `Command failed with exit code 1: docker exec ...`. The real error is written by the application to a log **inside the container**, and nothing pulled it out — so a root cause needed a live SSH session, which the agent does not have. Two changes outside this repo fixed that: `datafye-deploy` writes `~/.datafye/logs/foundry-<op>-<ts>.log` (cause chain + container inventory + the tail of each container's own app log, found by **searching** the container rather than assuming a path that has drifted), and `datafye-cli` tees every environment command's console output to `~/.datafye/logs/cli-<cmd>-<ts>.log` **flushing on every write** — because a provision killed mid-flight by the idle monitor raises nothing at all, so the only trace is one written as it went. The prompt now tells the agent to READ the newest report before deciding anything, to QUOTE the actual error to the user rather than saying "there is a problem with the platform", and to STOP rather than loop if a rebuild fails the same way (a second identical failure is a defect, not bad luck). ⚠️ The engine deliberately does **not** auto-roll-back a half-built environment: it is the only evidence of why the build failed, and tearing it down destroys the logs just collected. `status` remains the authority on whether the environment is actually partial
 - **Foundry resource guard + cheat sheet**: a **RESOURCE GUARD** prompt block tells the agent to estimate a fetch/replay's worst-case (high-volume-day) peak memory + disk, check the instance's real limits (`free -m`/`df -h`), and if it won't fit with headroom (peak <70% RAM, ≥5 GB disk free) STOP and ask the user to resize to a named size first — plus a hard OOM rule (a combined-ticks one-day buffer >~1.3 GB OOMs the fixed 2 GB history heap and writes zero data; resizing doesn't help — fetch trades/quotes separately or split symbols). The empirical numbers (per-symbol-day rates, formula, instance-size map, worked examples) live in a bundled reference file `reference/foundry-resource-cost-cheatsheet.md` (ships with the app clone); `CHEATSHEET_PATH` is passed to `build_system_prompt` as `cheatsheet_path` and the guard points the agent to read it on demand. Measured empirically via a Yukti project (foundry 2.0.28, 2026-07-17); re-measure if the `-Xmx2g` history heap or version changes. Also see the **dataset gotchas** in the prompt's Environment Management section: crypto symbols are **bare** (`BTCUSD`, never `X:BTCUSD` — the crypto dataset prepends `X:` itself, so `X:BTCUSD` becomes `X:X:BTCUSD` and returns zero data); crypto fetch parameters (including `dataset`) go in the **request body** — for crypto you can omit `dataset` (the `/crypto` path implies Crypto); crypto is **trades-only** (quotes come back empty) and a crypto day is **24h**; and **one dataset at a time** (multi-dataset environments are unreliable — they fail partway, often at the crypto launch step — so switch datasets with `dataset remove`/`dataset add`, not deprovision+reprovision). The sandbox boots with a **pre-provisioned empty foundry** (API + MCP up, no datasets), so the agent ADDS a dataset (`foundry local dataset add`/`apply`) rather than running `provision` (which collides with the running platform and fails — the root cause behind DAT-93's "stale container" misdiagnosis). That empty foundry comes from **`datafye-foundry-boot.service`** (see *Foundry reconciliation at boot* below), which reconciles it on every boot in every mode — for a while it came from nowhere at all, which is DAT-170
-- **Inferred per-project satisfaction**: `analyze_satisfaction` is a cheap Haiku sidecar (like `classify_lifecycle`, uses `TITLE_MODEL`) that infers a 1-5 rank + short reasons from the recent transcript, run post-stream. `_report_satisfaction_to_accounts` POSTs the *derived signal only* (never the raw conversation) to `POST /accounts/{u}/projects/{id}/satisfaction` (`source=inferred`, forwards the user JWT — the same self-scoped agent→accounts pattern the usage reporter uses). `conversations.set_satisfaction` caches it agent-side; a `"user"` source is sticky over an inferred one
+- **Inferred per-project satisfaction**: `analyze_satisfaction` is a cheap Haiku sidecar (like `generate_title`, uses `TITLE_MODEL`) that infers a 1-5 rank + short reasons from the recent transcript, run post-stream. `_report_satisfaction_to_accounts` POSTs the *derived signal only* (never the raw conversation) to `POST /accounts/{u}/projects/{id}/satisfaction` (`source=inferred`, forwards the user JWT — the same self-scoped agent→accounts pattern the usage reporter uses). `conversations.set_satisfaction` caches it agent-side; a `"user"` source is sticky over an inferred one
 - **In-conversation reporting tools (feedback + explicit satisfaction)**: `_build_reporting_mcp` stands up an in-process SDK-MCP server (`create_sdk_mcp_server`/`@tool`) with two tools the model can call mid-chat — `submit_feedback` (logs a bug/suggestion/general note to `POST /accounts/{u}/feedback`, which routes to Slack + a tracking issue; the response's **`ticket`** key — provider-neutral, `jira` kept as a fallback for older builds — is surfaced as "A tracking ticket was opened (`DAT-NNN`)" when one opens) and `submit_satisfaction` (records an *explicit* user rating with `source=user`, which is sticky over the inferred read). Both forward the user's own JWT — the same self-host-safe channel usage/satisfaction reporting uses, so the agent holds no Slack/JIRA creds. The server is only attached when routing is possible (a platform user with a forwarded JWT); a self-hosted run without accounts skips it, so the model falls back to the app's Send-feedback button. Prompt gains FEEDBACK + SATISFACTION sections: offer to log only after the user agrees, and capture a rating only when the user genuinely gives one (never fish for it). Ported from nvx-sutra-agent `219a09d`+`a155c39` (the explicit half)
 - **Report for any registered project (not just `proj-` ids)**: the usage + satisfaction reporters and the post-stream satisfaction gate no longer require a `proj-` id prefix — accounts is the authority, so a **reconciled** browser-local project (a create that failed, imported into the registry via accounts' reconcile endpoint) also gets reported. The reporters accept any id (an unregistered one 404s and the best-effort call just logs it); the post-stream satisfaction gate keys on a **forwarded identity** (`auth_token` + `AGENT_USERNAME`) instead of the prefix, so it still skips a self-hosted run with no accounts. Ported from nvx-sutra-agent `675f63b`
 - **Deployment state is polled, never published (DAT-234, DAT-235)**: the `env_status` and `descriptor` SSE frames are gone, and `_derive_env_status` with them. An event stream carries what HAPPENED during a turn; box state that exists continuously belongs on `/health`, whose `foundry` block carries readiness, type, datasets and (DAT-233) the descriptor's symbols/broker/mode, refreshed every 20s. The old shape meant a workspace that had not run a turn knew nothing about its deployment. The descriptor itself is now PATCHed **agent → accounts directly** on the forwarded JWT (`_report_descriptor_to_accounts`, at both read points) instead of being relayed by the browser, so a headless or CLI-driven change is recorded whether or not a tab was open
