@@ -52,6 +52,7 @@ class StubCollector(activity.Collector):
 
     async def _classify(self, batch):
         self.classify_calls.append([mid for mid, _ in batch])
+        self.evidence = getattr(self, "evidence", []) + [activity._evidence(call) for _, call in batch]
         if self.classify_fails:
             self.classify_fails -= 1
             return [None] * len(batch), True        # absent, not wrong: retryable
@@ -112,6 +113,7 @@ async def test_a_batch_goes_when_it_is_full():
     c = StubCollector(replies=[["Build"] * activity.BATCH_CALLS, ["Design"]])
     for i in range(activity.BATCH_CALLS):
         c.observe(f"msg_{i}", tools=["Write"])
+    c.settle()                      # the last call's stream ended, as `message_stop` says in main
     check(c.due(), "a full batch is due")
     c.flush_soon()
     await asyncio.sleep(0)          # let the background task run
@@ -126,6 +128,7 @@ async def test_an_aging_call_goes_before_the_batch_fills():
     accumulates 25 calls would hold its labels until the end, long past the gateway's deadline."""
     c = StubCollector(replies=[["Build"]], age_seconds=0.0)
     c.observe("msg_1", tools=["Write"])
+    c.settle()
     check(c.due(), "a call older than the age deadline is due on its own")
     await c.finish()
     check(c.pushes == [[("msg_1", "Build")]], "and it goes")
@@ -291,6 +294,13 @@ def test_the_module_is_not_shadowed_in_main():
     check(isinstance(getattr(main, "activity_labels", None), types.ModuleType),
           "main.activity_labels is the module, not something that shadowed it")
     check(hasattr(main.activity_labels, "Collector"), "and it still carries Collector")
+    # ⚠️ The stream's `message_stop` is what tells the labeller a call has ENDED. Without that hook
+    # the last call before a long tool run stays "open", the ticker cannot flush it, and its record
+    # expires to `unclassified` - review finding 2 again, by a different route.
+    import inspect
+    src = inspect.getsource(main.stream_agent_response)
+    check("'message_stop'" in src and "labeller.settle()" in src,
+          "the stream loop settles the labeller on message_stop")
 
 
 async def test_the_age_deadline_cannot_decay_without_bound():
@@ -325,6 +335,121 @@ async def test_a_long_thinking_block_does_not_starve_what_the_call_said():
     check(len(ev) < 1200, f"while the whole stays bounded ({len(ev)} chars)")
 
 
+class ReplyCollector(activity.Collector):
+    """The REAL `_push` with only the HTTP send stood in for, so the reply-handling and retry rules are
+    the code under test. Each element of `replies` is the gateway's JSON for one push."""
+
+    def __init__(self, replies, **kw):
+        kw.setdefault("gateway_url", "http://gw")
+        kw.setdefault("token", "gwt1.test")
+        kw.setdefault("model", "haiku")
+        kw.setdefault("base_url", "http://api")
+        super().__init__(**kw)
+        self.replies = list(replies)
+        self.sent = []
+
+    async def _classify(self, batch):
+        return ["Build"] * len(batch), False
+
+    async def _send_labels(self, body):
+        self.sent.append([c["message_id"] for c in body["calls"]])
+        return 200, (self.replies.pop(0) if self.replies else {})
+
+
+async def test_a_call_still_streaming_is_not_flushed():
+    """⚠️ Review finding 1. The SDK hands over a call's blocks one at a time, and the gateway writes
+    the call's record only when its stream ENDS. Flushing an open call classified it on half its
+    evidence, pushed a label the gateway could not match yet, and then classified the rest of its
+    blocks again as a new entry."""
+    c = StubCollector(replies=[["Build"], ["Design"]], age_seconds=0.0)
+    c.observe("msg_1", thinking=["Planning the module."])
+    c.flush_soon()
+    await asyncio.sleep(0)
+    check(c.pushes == [] and c.classify_calls == [], "an open call is not flushed mid-stream")
+    c.observe("msg_1", tools=["Write"])                 # its tool block arrives later
+    c.settle()                                          # and then its stream ends
+    c.flush_soon()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    check(c.classify_calls == [["msg_1"]], f"classified ONCE, when complete ({c.classify_calls})")
+    ev = (getattr(c, "evidence", None) or [""])[0]
+    check("tools: Write" in ev and "Planning the module" in ev,
+          f"on ALL its evidence, tool name and thinking together ({ev!r})")
+    await c.finish()
+    check(sum(1 for p in c.pushes for mid, _a in p if mid == "msg_1") == 1, "and pushed once")
+
+
+async def test_a_new_call_proves_the_previous_one_ended():
+    c = StubCollector(replies=[["Build"]], age_seconds=0.0)
+    c.observe("msg_1", tools=["Write"])
+    c.observe("msg_2", thinking=["Next step."])         # msg_1's stream must have ended
+    check(c.due(), "the earlier call is due")
+    c.flush_soon()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    check(c.classify_calls == [["msg_1"]], f"only the finished call goes ({c.classify_calls})")
+
+
+async def test_a_late_block_for_a_labelled_call_is_ignored():
+    c = ReplyCollector(replies=[{"unmatched": []}])
+    c.observe("msg_1", tools=["Write"])
+    c.settle()
+    await c._flush()
+    c.observe("msg_1", texts=["one more block"])
+    check("msg_1" not in c._calls, "a labelled call is not re-entered, so it is not paid for twice")
+
+
+async def test_the_ticker_pushes_during_a_long_tool_run():
+    """⚠️ Review finding 2. `flush_soon` was only called when a model message arrived, and during a
+    five-minute backtest none does, so labels sat past the gateway's hold and were released as
+    `unclassified`. The ticker asks on a clock."""
+    c = StubCollector(replies=[["Backtest"]], age_seconds=0.0)
+    saved = activity.TICK_SECONDS
+    activity.TICK_SECONDS = 0.05
+    try:
+        c.observe("msg_1", tools=["Bash"])
+        c.settle()                                      # the call ended; the tool is now running
+        for _ in range(40):                             # no further messages arrive
+            if c.pushes:
+                break
+            await asyncio.sleep(0.05)
+        check(c.pushes == [[("msg_1", "Backtest")]], f"pushed with no new message ({c.pushes})")
+    finally:
+        activity.TICK_SECONDS = saved
+        await c.finish()
+    check(c._ticker is None, "and the ticker stops when the turn finishes")
+
+
+async def test_an_unmatched_label_gets_one_retry():
+    """The gateway can be a moment behind: a label may beat its own record there. One retry covers
+    that; a label still unmatched after it is a real join failure and is reported, not retried
+    forever."""
+    c = ReplyCollector(replies=[{"unmatched": ["msg_1"]}, {"unmatched": ["msg_1"]}])
+    saved = activity.UNMATCHED_RETRY_SECONDS
+    activity.UNMATCHED_RETRY_SECONDS = 0.0
+    try:
+        c.observe("msg_1", tools=["Write"])
+        await c.finish()
+    finally:
+        activity.UNMATCHED_RETRY_SECONDS = saved
+    check(c.sent == [["msg_1"], ["msg_1"]], f"pushed, then retried exactly once ({c.sent})")
+
+
+async def test_an_in_flight_label_is_retried():
+    """⚠️ Review finding 3. `in_flight` is a record being posted right now, which the gateway says
+    becomes labellable again if that post fails. It was ignored, so a classified call could still be
+    filed `unclassified`."""
+    c = ReplyCollector(replies=[{"in_flight": ["msg_1"]}, {"already_delivered": ["msg_1"]}])
+    saved = activity.UNMATCHED_RETRY_SECONDS
+    activity.UNMATCHED_RETRY_SECONDS = 0.0
+    try:
+        c.observe("msg_1", tools=["Write"])
+        await c.finish()
+    finally:
+        activity.UNMATCHED_RETRY_SECONDS = saved
+    check(c.sent == [["msg_1"], ["msg_1"]], f"an in-flight label is pushed again ({c.sent})")
+
+
 async def main_async():
     for fn in (test_a_shifted_mapping_is_never_applied,
                test_a_transient_classify_failure_is_retried_not_forfeited,
@@ -341,7 +466,13 @@ async def main_async():
                test_a_call_with_no_message_id_is_ignored,
                test_nothing_happens_with_neither_a_gateway_nor_a_key,
                test_a_self_hosted_box_is_not_charged_for_classification,
-               test_a_self_hosted_box_can_opt_IN_to_classification):
+               test_a_self_hosted_box_can_opt_IN_to_classification,
+               test_a_call_still_streaming_is_not_flushed,
+               test_a_new_call_proves_the_previous_one_ended,
+               test_a_late_block_for_a_labelled_call_is_ignored,
+               test_the_ticker_pushes_during_a_long_tool_run,
+               test_an_unmatched_label_gets_one_retry,
+               test_an_in_flight_label_is_retried):
         print(f"--- {fn.__name__} ---")
         await fn()
 

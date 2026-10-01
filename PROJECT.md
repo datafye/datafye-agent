@@ -1979,6 +1979,26 @@ each trap outright, and `tests/activity_classifier.py` puts exactly those cases 
 model three times over: 12 of 12, every run, for about a cent. A classifier that is right once and
 wrong twice is not fixed.
 
+**The review found three more, and all three were already live in the Sutra agent.** They share a
+root: the labeller was built as if a model call were a single moment, when it is really a stretch of
+time watched by two clocks. The SDK tells the agent about a call block by block as it streams; the
+gateway writes the call's record only when the stream *ends*. So a flush could land in the middle of a
+call, classify it from its thinking alone (missing the tool name, the strongest signal), push a label
+for a record that did not exist yet, and then pay to classify the rest of the same call again. The fix
+is to treat a call as open until something proves it finished: the stream's own `message_stop`, the
+next call starting, or the turn ending.
+
+The second was quieter. The only thing that ever asked "is a batch due?" was a new model message
+arriving. During a five-minute backtest no message arrives, so the labels for everything before it sat
+there while the gateway's three-minute hold ran out, and those calls landed in `unclassified`: the
+alarm word, fired by the agent's single most common kind of long-running work. The question is now
+asked on a clock. The third was a reply field nobody read: the gateway says `in_flight` when a record
+is mid-delivery and *might* need the label after all, and the agent was dropping it on the floor.
+
+The lesson is the one under all three. **When two systems describe the same event, find out when each
+of them thinks it happened.** Every one of these bugs passed a careful offline test, because the test
+fed the labeller whole calls at whole moments, which is the one thing production never does.
+
 And one bug that was caught before it was written, because the other agent had already paid for it:
 `main.py` has a route handler called `activity()`, the heartbeat behind `POST /v1/activity`. Write
 `import activity` at the top of that file and the import succeeds, the module loads, every test of the

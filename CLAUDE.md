@@ -1154,6 +1154,18 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
   turn. The 60 s is also the cadence reported to the gateway, which sizes its hold from it. A
   twelve-hour turn therefore still reports within a minute, and a Stop or crash loses at most the
   unpushed batch (the `finally` in `stream_agent_response` tries even that).
+- ⚠️ **Two clocks, and a flush must respect both** (review of PR #60). The SDK hands over a call's
+  content blocks as each finishes, but the gateway writes the call's record only when its upstream
+  stream ENDS. So a call is held back while it may still be streaming (`_open`), and becomes
+  flushable on the stream's `message_stop` (`labeller.settle()` in `main.py`), on the next call's
+  first block, or at turn end. Flushing an open call classified it on half its evidence, pushed a
+  label the gateway could not match yet, and paid to classify its later blocks a second time.
+- **A ticker asks "is a batch due?" every few seconds**, not only when a model message arrives.
+  During a long tool run (a backtest, a history fetch, a provision) no message arrives, and without
+  the ticker labels sat past the gateway's hold and were released `unclassified`.
+- **`unmatched` and `in_flight` labels get exactly ONE retry.** A label can beat its own record to
+  the gateway; an in-flight record becomes labellable again if its delivery fails. A label still
+  unmatched after its retry is a real join failure and is logged, not retried forever.
 - ⚠️ **The agent classifies; it does NOT apportion usage.** `ResultMessage.model_usage` is per model
   per turn, so any per-activity split computed here would be an estimate competing with the
   gateway's measurement. Usage stays **per model per turn** (`by_model`), and accounts files it

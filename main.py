@@ -2127,6 +2127,11 @@ async def stream_agent_response(
             # Stream events
             elif hasattr(msg, 'event'):
                 ev = getattr(msg, 'event', {})
+                # A model call's stream has ENDED: its evidence is complete and the
+                # gateway is writing its record, so the labeller may now flush it. Until
+                # this, a call can still be streaming blocks (DAT-319 review).
+                if isinstance(ev, dict) and ev.get('type') == 'message_stop':
+                    labeller.settle()
                 if _LOG_RAW_USAGE:
                     # The one place a real PER-STEP output count could come
                     # from: `message_delta` carries the authoritative (and

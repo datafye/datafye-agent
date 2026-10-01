@@ -86,6 +86,16 @@ DEFAULT_AGE_SECONDS = 60.0
 # call per model call. And a floor, because arithmetic should not be able to make this absurd.
 HOLD_SAFETY_DIVISOR = 3.0
 MIN_AGE_SECONDS = 10.0
+# How often the background ticker asks "is a batch due?". Without it the question is only asked when
+# the next model message arrives, and during a long tool run (a backtest, a history fetch, a 17-minute
+# provision) none arrives - so labels sat past the gateway's hold and their records were released as
+# `unclassified`, exactly on the turns this exists for.
+TICK_SECONDS = 5.0
+# An `unmatched` label is retried ONCE, after this pause. The gateway writes a call's record when that
+# call's upstream stream ENDS, while the SDK hands us its blocks as they finish, so a label can arrive a
+# moment before its record exists. Once is enough for that race; a label that is still unmatched is a
+# real join failure and retrying it forever would hide it.
+UNMATCHED_RETRY_SECONDS = 2.0
 
 # Evidence per call sent to the classifier. Enough to tell design talk from a build step; short
 # enough that 25 of them stay cheap.
@@ -200,6 +210,20 @@ class Collector:
         # sidecars. Without it this call would be the one metered call in the turn that never
         # reaches the project's usage or the accounts roll-up.
         self._usage_sink = usage_sink
+        # ⚠️ Calls that may still be STREAMING. The SDK emits one AssistantMessage per content block,
+        # so a call's thinking can arrive well before its tool_use - and the gateway only writes the
+        # call's record once its stream ends. Flushing an open call classified it on half its evidence
+        # (usually without the tool name, the strongest signal), pushed a label the gateway could not
+        # match yet, and then classified its remaining blocks AGAIN as a fresh entry. A call leaves
+        # this set when its stream ends (`settle`), when a later call appears, or at the end of turn.
+        self._open = set()
+        # Calls already labelled and pushed. A late block for one of them is ignored rather than
+        # becoming a second entry that is classified and paid for twice.
+        self._done = set()
+        # Labels that have had their one retry, after `unmatched` or `in_flight`.
+        self._retried = set()
+        self._retry_pending = False
+        self._ticker = None
         self.pushed = 0
         self.classified = 0
         self.discarded_batches = 0
@@ -254,6 +278,13 @@ class Collector:
             # there is nothing to classify, so a multi-hour turn would accumulate every call's
             # thinking and text for its whole length.
             return
+        if message_id in self._done:
+            return
+        # A NEW call means every other one has finished streaming: the model makes its calls one after
+        # another, so a new message id is proof the previous stream ended.
+        if message_id not in self._open:
+            self._open = {message_id}
+        self._start_ticker()
         call = self._calls.get(message_id)
         if call is None:
             call = {"thinking": [], "texts": [], "tools": []}
@@ -273,14 +304,41 @@ class Collector:
                     call[field].append(t[:room])
                     room -= len(t)
 
+    def settle(self) -> None:
+        """Every call seen so far has finished streaming (the caller saw a `message_stop`).
+
+        From here a call is eligible for a mid-turn flush. Its evidence is complete and the gateway
+        has, or is about to have, its record."""
+        self._open = set()
+
+    def _start_ticker(self) -> None:
+        if self._ticker is not None or not self.classifying:
+            return
+        try:
+            self._ticker = asyncio.ensure_future(self._tick())
+        except RuntimeError:
+            self._ticker = None         # no running loop (a synchronous caller); flush_soon still works
+
+    async def _tick(self) -> None:
+        """Ask "is a batch due?" on a clock, not only when a model message happens to arrive."""
+        try:
+            while True:
+                await asyncio.sleep(min(TICK_SECONDS, max(1.0, self._age / 6)))
+                self.flush_soon()
+        except asyncio.CancelledError:
+            pass
+
     def observe_sidecar(self, message_id: Optional[str]) -> None:
         """One of the agent's own cheap calls. Labelled without asking a model to classify it: we
         know exactly what it was, and paying a classifier call to label a classifier call would be
         an amusing way to spend money."""
         if not message_id:
             return
+        if message_id in self._done:
+            return
         self._fixed[message_id] = SIDECAR_ACTIVITY
         self._seen[SIDECAR_ACTIVITY] = True
+        self._start_ticker()
         if self._oldest is None:
             # ⚠️ Or a turn that goes quiet after a mid-turn flush has nothing to trigger on, and the
             # classifier's own record expires to `unclassified`.
@@ -288,7 +346,9 @@ class Collector:
         # the main model's cost under Platform AND count the sidecars a second time.
 
     def due(self) -> bool:
-        pending = len(self._calls) + len(self._fixed)
+        # Only calls whose stream has ENDED count: an open call cannot be flushed, so it cannot make a
+        # batch due either.
+        pending = sum(1 for mid in self._calls if mid not in self._open) + len(self._fixed)
         if not pending:
             return False
         if pending >= BATCH_CALLS:
@@ -312,6 +372,11 @@ class Collector:
         """End of turn: let any in-flight push complete, then classify and push whatever is left."""
         if not self.classifying:
             return
+        if self._ticker is not None:
+            self._ticker.cancel()
+            self._ticker = None
+        # The turn is over, so every stream has ended.
+        self.settle()
         if self._task is not None:
             try:
                 await self._task
@@ -321,20 +386,27 @@ class Collector:
         await self._flush()
         # ⚠️ A flush classifies, and classifying makes one more metered call, which registers itself
         # as a sidecar to be labelled. One more pass picks that up; it needs no classification, so
-        # this cannot go round again.
+        # this cannot go round again. The same pass carries any label owed its one retry, after a
+        # pause long enough for the gateway to have written the record it could not find.
         if self._fixed or self._calls:
+            if self._retry_pending:
+                await asyncio.sleep(UNMATCHED_RETRY_SECONDS)
             await self._flush()
 
     async def _flush(self) -> None:
         async with self._lock:
-            to_classify = [(mid, self._calls[mid]) for mid in self._order if mid in self._calls]
+            # A call still streaming stays behind for the next flush (see `_open`).
+            to_classify = [(mid, self._calls[mid]) for mid in self._order
+                           if mid in self._calls and mid not in self._open]
             fixed = dict(self._fixed)
             if not to_classify and not fixed:
                 return
-            self._calls = {}
-            self._order = []
+            for mid, _call in to_classify:
+                del self._calls[mid]
+            self._order = [mid for mid in self._order if mid in self._calls]
             self._fixed = {}
-            self._oldest = None
+            self._retry_pending = False
+            self._oldest = time.monotonic() if self._calls else None
 
         labels = list(fixed.items())
         if to_classify:
@@ -438,6 +510,15 @@ class Collector:
         self.classified += len(batch)
         return [p if p in VOCABULARY else None for p in parsed], False
 
+    async def _send_labels(self, body: dict):
+        """The HTTP half of a push: ``(status, parsed body)``. Separate so the reply handling in
+        `_push`, where the retry rules live, can be tested without a gateway."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{self._gateway}/gateway/label", json=body,
+                headers={"x-api-key": self._token, "content-type": "application/json"})
+        return resp.status_code, (resp.json() if resp.content and resp.status_code < 400 else {})
+
     async def _push(self, labels: list) -> bool:
         """True when the gateway accepted the push. False means the labels are still owed."""
         # ⚠️ The CONFIGURED interval, not the tightened one. The gateway needs an upper bound on how
@@ -448,29 +529,36 @@ class Collector:
         body = {"push_interval_seconds": self._configured_age,
                 "calls": [{"message_id": mid, "activity": act} for mid, act in labels]}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{self._gateway}/gateway/label", json=body,
-                    headers={"x-api-key": self._token, "content-type": "application/json"})
-            if resp.status_code >= 400:
-                logger.warning("Gateway label push returned %s for %d call(s)",
-                               resp.status_code, len(labels))
+            status, out = await self._send_labels(body)
+            if status >= 400:
+                logger.warning("Gateway label push returned %s for %d call(s)", status, len(labels))
                 # 4xx other than 429 is our own fault and will not fix itself; retrying a malformed
                 # push every minute for the rest of the turn helps nobody.
-                return resp.status_code < 500 and resp.status_code != 429
-            out = resp.json() if resp.content else {}
+                return status < 500 and status != 429
         except Exception as e:      # noqa: BLE001
             logger.warning("Gateway label push failed for %d call(s): %s", len(labels), e)
             return False
 
         self.pushed += len(labels)
+        self._done.update(mid for mid, _a in labels)
         unmatched = out.get("unmatched") or []
         late = out.get("already_delivered") or []
-        if unmatched:
+        # Owed ONE more try: `unmatched` can be a label that beat its own record to the gateway, and
+        # `in_flight` is a record being posted right now that becomes labellable again if that post
+        # fails. A label still unmatched after its retry is a real join failure.
+        retry = [mid for mid in list(unmatched) + list(out.get("in_flight") or [])
+                 if mid not in self._retried]
+        if retry:
+            self._retried.update(retry)
+            owed = set(retry)
+            await self._requeue_labels([(m, a) for m, a in labels if m in owed])
+            self._retry_pending = True
+        given_up = [mid for mid in unmatched if mid not in set(retry)]
+        if given_up:
             # Not cosmetic: an unmatched label means that cost is filed under `unclassified` for
             # good, so this is the line that says the join is broken.
             logger.warning("Gateway did not recognise %d labelled call(s): %s",
-                           len(unmatched), unmatched[:5])
+                           len(given_up), given_up[:5])
         if late:
             logger.info("%d call(s) were already delivered before we labelled them", len(late))
         # Tighten our own deadline to stay inside whatever hold the gateway settled on. It may have
