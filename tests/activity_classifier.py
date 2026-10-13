@@ -51,6 +51,10 @@ CASES = [
     # ⚠️ The first trap: a careful backtest is still a backtest.
     ("backtest_not_validate", ["Bash"], "Re-running with a tighter stop to see if it holds up.",
      "With the 1.5 ATR stop the drawdown falls to 4.8% and the return to 12.9%.", "Backtest"),
+    # ⚠️ The u1 run (2026-10-13) filed the whole backtest under Build: the call that ran it had also
+    # written the script it ran. Running it and reading the result is the work it served.
+    ("backtest_after_writing_its_script", ["Write", "Bash"], "Script is written; run it over the 3 days.",
+     "Backtest over 3 days: 14 trades, +0.8% return, 0.6% max drawdown, win rate 57%.", "Backtest"),
     ("validate", ["Bash"], "Checking the result on data it was not tuned on.",
      "Out of sample (2024) the Sharpe is 0.4 against 1.6 in sample, so it is overfit.", "Validate"),
     # ⚠️ The second trap: advice about going live is not going live.

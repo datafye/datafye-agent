@@ -102,6 +102,11 @@ UNMATCHED_RETRY_SECONDS = 2.0
 # already guarantee the work runs out; anything still owed after this is logged, never dropped silently.
 MAX_FINAL_PASSES = 4
 
+# Calls in one batch that may be asked about again ON THEIR OWN when the batch answer left them without
+# a usable label (missing from the reply, or not a word in the vocabulary). Each is one more small
+# metered call, so this bounds what a garbled reply can cost; a batch is at most BATCH_CALLS anyway.
+MAX_SINGLE_RETRIES = 8
+
 # Evidence per call sent to the classifier. Enough to tell design talk from a build step; short
 # enough that 25 of them stay cheap.
 #
@@ -153,13 +158,17 @@ _PROMPT = (
     "- Fetching history or adding a dataset so a backtest can run is Build. Pulling data to look at "
     "it or answer a question is Explore.\n"
     "- Explore is the catch-all opener: a conversation that never becomes a project, a one-off "
-    "analysis, a question about Datafye. Use it rather than straining to fit another word.\n\n"
+    "analysis, a question about Datafye. Use it rather than straining to fit another word.\n"
+    "- Writing the code a backtest needs is Build; the call that RUNS the backtest, or reads the "
+    "returns, trades or drawdown it produced, is Backtest, even if it also fixed a small error to get "
+    "it to run.\n\n"
     "Judge EACH call on its own evidence. Do NOT reason about where the project has got to overall, "
     "and do NOT let a later call change an earlier one: a call that did design work is Design even "
     "if the project is mostly built. When a call shows two activities, pick the one its WORK served, "
     "not the one mentioned first - a call that read three files and then wrote one is Build.\n\n"
-    "Reply with ONLY a JSON array of strings, one per call, in the same order, no prose and no "
-    "markdown fences. Each string must be exactly one of: "
+    "Reply with ONLY a JSON object mapping each call's NUMBER to its activity, with one entry for "
+    "every call, for example {\"1\": \"Build\", \"2\": \"Explore\"}. No prose and no markdown "
+    "fences. Each value must be exactly one of: "
     + ", ".join(VOCABULARY) + ".\n\n"
     "The calls:\n\n"
 )
@@ -244,6 +253,9 @@ class Collector:
         self.pushed = 0
         self.classified = 0
         self.discarded_batches = 0
+        # Calls asked about again on their own, and how many of those came back with a label.
+        self.single_retries = 0
+        self.recovered = 0
 
     @property
     def classifying(self) -> bool:
@@ -500,16 +512,43 @@ class Collector:
                 self._oldest = time.monotonic()
 
     async def _classify(self, batch: list) -> list:
-        """One cheap model call for the whole batch. Returns one label per call, or None per call.
+        """Labels for a batch: one per call, or None for a call nothing usable was decided about.
 
         Returns ``(labels, retry)``. ``retry`` is True only when the answer is ABSENT (a transport
-        error, a timeout) rather than WRONG: the caller puts those calls back for the next flush,
+        error, a timeout) rather than wrong: the caller puts those calls back for the next flush,
         because the gateway still holds their records.
 
-        ⚠️ On a COUNT mismatch the whole batch is discarded and NOT retried. A shifted mapping files
-        one call's cost under another call's activity and looks perfectly healthy; an unlabelled call
-        shows up as `unclassified`, which is honest and recoverable. And asking the same question
-        again invites the same wrong answer - it was wrong, not missing.
+        The model answers BY NUMBER (``{"1": "Build", ...}``), so a reply that misses a call, or names
+        it with a word outside the vocabulary, costs only that call, never the batch. Each call it left
+        without a usable label is then asked about ON ITS OWN: a one-call question cannot be matched
+        to the wrong call. (Before this, a positional array of the wrong length was ambiguous about
+        which call it had dropped, so the whole batch was discarded: two such batches cost 6 of 76
+        calls on the first Datafye run, filed `unclassified`.)
+        """
+        labels, retry = await self._ask(batch)
+        if retry:
+            return [None] * len(batch), True
+        missing = [i for i, label in enumerate(labels) if label not in VOCABULARY]
+        if missing and len(batch) > 1:
+            self.single_retries += min(len(missing), MAX_SINGLE_RETRIES)
+            logger.info("Activity classification left %d of %d call(s) without a label; asking about "
+                        "each on its own", len(missing), len(batch))
+            for i in missing[:MAX_SINGLE_RETRIES]:
+                one, failed = await self._ask([batch[i]])
+                # A transport failure here leaves just this call unlabelled: the batch it belongs to
+                # was answered, so there is nothing to put back.
+                if not failed and one[0] in VOCABULARY:
+                    labels[i] = one[0]
+                    self.recovered += 1
+        out = [label if label in VOCABULARY else None for label in labels]
+        self.classified += sum(1 for label in out if label)
+        return out, False
+
+    async def _ask(self, batch: list):
+        """One model call about ``batch``: ``(labels, retry)``, labels matched to calls BY NUMBER.
+
+        A call the reply does not name is None, as is the whole batch when the reply cannot be read
+        at all (counted in ``discarded_batches``). ``retry`` is True only for a transport failure.
         """
         if not self._token or not self._base:
             return [None] * len(batch), False
@@ -522,8 +561,9 @@ class Collector:
                     headers={"x-api-key": self._token, "anthropic-version": "2023-06-01",
                              "content-type": "application/json"},
                     json={"model": self._model,
-                          # 12 characters per label is ample for the longest word plus its quoting.
-                          "max_tokens": 16 + 12 * len(batch),
+                          # 18 characters per entry is ample for its number, the longest word and the
+                          # quoting around both.
+                          "max_tokens": 16 + 18 * len(batch),
                           "messages": [{"role": "user", "content": _PROMPT + numbered}]})
             resp.raise_for_status()
             data = resp.json()
@@ -542,15 +582,12 @@ class Collector:
                                      "message_id": data.get("id")})
         text = "".join(p.get("text", "") for p in data.get("content", [])
                        if p.get("type") == "text")
-        parsed = _parse_labels(text)
-        if parsed is None or len(parsed) != len(batch):
+        labels = _parse_labels(text, len(batch))
+        if labels is None:
             self.discarded_batches += 1
-            logger.warning("Activity classification returned %s labels for %d call(s); discarding "
-                           "the batch so nothing is mislabelled",
-                           "no usable" if parsed is None else len(parsed), len(batch))
+            logger.warning("Activity classification reply for %d call(s) could not be read", len(batch))
             return [None] * len(batch), False
-        self.classified += len(batch)
-        return [p if p in VOCABULARY else None for p in parsed], False
+        return labels, False
 
     async def _send_labels(self, body: dict):
         """The HTTP half of a push: ``(status, parsed body)``. Separate so the reply handling in
@@ -624,20 +661,40 @@ class Collector:
         return True
 
 
-def _parse_labels(text: str):
-    """A JSON array of strings, tolerant of fences and stray prose around it."""
+def _parse_labels(text: str, count: int):
+    """The reply as one label per call, matched BY NUMBER: a list of ``count`` strings or Nones.
+
+    Expects a JSON object keyed by the call's 1-based number, tolerant of fences and stray prose.
+    A call the object does not name is None, and a key outside 1..count is ignored. A JSON ARRAY is
+    accepted only when its length is exactly ``count``: a positional list of the wrong length cannot
+    say WHICH call it dropped, and guessing would file one call's cost under another's activity. Not
+    readable at all is None.
+    """
     if not text:
         return None
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end <= start:
-        return None
-    try:
-        arr = json.loads(text[start:end + 1])
-    except ValueError:
-        return None
-    if not isinstance(arr, list):
-        return None
-    return [s.strip() if isinstance(s, str) else None for s in arr]
+    for open_, close in (("{", "}"), ("[", "]")):
+        start, end = text.find(open_), text.rfind(close)
+        if start < 0 or end <= start:
+            continue
+        try:
+            value = json.loads(text[start:end + 1])
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            out = [None] * count
+            for key, label in value.items():
+                try:
+                    i = int(str(key).strip().rstrip(".")) - 1
+                except ValueError:
+                    continue
+                if 0 <= i < count and isinstance(label, str):
+                    out[i] = label.strip()
+            return out
+        if isinstance(value, list):
+            if len(value) != count:
+                return [None] * count
+            return [s.strip() if isinstance(s, str) else None for s in value]
+    return None
 
 
 def _opted_in() -> bool:
