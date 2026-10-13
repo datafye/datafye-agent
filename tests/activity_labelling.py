@@ -61,6 +61,8 @@ class StubCollector(activity.Collector):
         reply = self.replies.pop(0) if self.replies else None
         if reply is None:
             return [None] * len(batch), False
+        if reply == "__transport_failure__":
+            return [None] * len(batch), True
         labels = activity._parse_labels(json.dumps(reply), len(batch))
         if labels is None:
             self.discarded_batches += 1
@@ -137,6 +139,28 @@ async def test_an_unknown_label_drops_only_its_own_call():
     check(sorted(c.activities) == ["Build", "Design"],
           f"and only the decided ones are recorded (got {sorted(c.activities)})")
     check(c.classify_calls[1:] == [["msg_1"]], "the unknown one was re-asked on its own")
+
+
+async def test_a_failed_re_ask_stops_the_loop_and_is_retried_later():
+    """Review finding: the re-ask loop carried on after a transport failure (each can cost a 20 s
+    timeout, so eight of them held the batch's GOOD labels past the gateway's hold), and the call whose
+    ask failed was forfeited although the gateway still held its record. It stops at the first failure,
+    pushes what it has, and puts the rest back."""
+    c = StubCollector(replies=[{"1": "Build"},                       # msg_1 and msg_2 missed
+                               "__transport_failure__",               # msg_1's own ask fails
+                               {"1": "Design", "2": "Explore"}])      # the next flush, both back
+    for i in range(3):
+        c.observe(f"msg_{i}", tools=["Write"])
+    await c.finish()
+    check(c.classify_calls[:3] == [["msg_0", "msg_1", "msg_2"], ["msg_1"], ["msg_1", "msg_2"]],
+          f"one failed re-ask, then no more; both calls go back for the next flush (got {c.classify_calls})")
+    first = dict(c.pushes[0]) if c.pushes else {}
+    check(first == {"msg_0": "Build"}, f"the good label is pushed without waiting (got {first})")
+    pushed = {}
+    for p in c.pushes:
+        pushed.update(dict(p))
+    check(pushed == {"msg_0": "Build", "msg_1": "Design", "msg_2": "Explore"},
+          f"and the requeued calls are labelled on the next pass (got {pushed})")
 
 
 async def test_re_asks_are_bounded():
@@ -406,7 +430,7 @@ class ReplyCollector(activity.Collector):
         self.sent = []
 
     async def _classify(self, batch):
-        return ["Build"] * len(batch), False
+        return ["Build"] * len(batch), []
 
     async def _send_labels(self, body):
         self.sent.append([c["message_id"] for c in body["calls"]])
@@ -535,7 +559,7 @@ async def test_a_retry_produced_by_the_last_pass_is_not_dropped():
     class Classifies(ReplyCollector):
         async def _classify(self, batch):
             self.observe_sidecar("msg_classifier")        # what the real classify call does
-            return ["Build"] * len(batch), False
+            return ["Build"] * len(batch), []
     c = Classifies(replies=[{}, {"unmatched": ["msg_classifier"]}, {}])
     saved = activity.UNMATCHED_RETRY_SECONDS
     activity.UNMATCHED_RETRY_SECONDS = 0.0
@@ -586,9 +610,9 @@ async def test_two_separate_blips_are_not_an_outage():
         async def _classify(self, batch):
             self.classify_calls.append([mid for mid, _ in batch])
             if len(self.classify_calls) == 1:
-                return [None] * len(batch), True          # blip 1: the classify call times out
+                return [None] * len(batch), list(range(len(batch)))  # blip 1: the classify call times out
             self.observe_sidecar("msg_classifier")        # the classify call is itself metered
-            return ["Build"] * len(batch), False
+            return ["Build"] * len(batch), []
 
         async def _push(self, labels):
             self.pushes.append(list(labels))
@@ -615,6 +639,7 @@ async def main_async():
                test_a_numbered_answer_costs_only_the_call_it_missed,
                test_an_unreadable_reply_is_counted_and_re_asked,
                test_re_asks_are_bounded,
+               test_a_failed_re_ask_stops_the_loop_and_is_retried_later,
                test_a_batch_goes_when_it_is_full,
                test_an_aging_call_goes_before_the_batch_fills,
                test_a_sidecar_is_labelled_without_asking_a_model,

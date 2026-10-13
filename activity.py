@@ -462,15 +462,21 @@ class Collector:
 
         labels = list(fixed.items())
         if to_classify:
-            decided, retry = await self._classify(to_classify)
-            if retry:
+            decided, requeue = await self._classify(to_classify)
+            if requeue and len(requeue) < len(to_classify):
+                # Part of the batch was answered: keep those labels, and put back only the calls whose
+                # single re-ask could not be made.
+                self._transport_failed = True
+                await self._requeue([to_classify[i] for i in requeue])
+            elif requeue:
                 self._transport_failed = True
                 # ⚠️ A TRANSPORT failure is not the same as a bad answer. A 429 or a timeout on the
                 # classify call forfeited that batch for good - the buffer was already drained here -
                 # even though the gateway holds those records for about three times the cadence and
                 # would still accept the labels a minute later. Put them back and let the next flush
-                # try again. A COUNT MISMATCH is deliberately NOT retried: that answer was wrong
-                # rather than absent, and asking the same question again invites the same wrongness.
+                # try again. A WRONG answer is different: a call that shared a batch is re-asked on its
+                # own (in `_classify`), and one already asked alone is not asked again, since the same
+                # question invites the same wrongness.
                 await self._requeue(to_classify)
                 if not labels:
                     return
@@ -496,7 +502,8 @@ class Collector:
     async def _requeue(self, batch: list) -> None:
         """Put unclassified calls back, oldest-first, for the next flush to try again."""
         async with self._lock:
-            for mid, call in batch:
+            # Reversed, so inserting each at the front leaves them in their ORIGINAL order, oldest first.
+            for mid, call in reversed(batch):
                 if mid not in self._calls:          # a later observation of it wins, not this one
                     self._calls[mid] = call
                     self._order.insert(0, mid)
@@ -514,9 +521,10 @@ class Collector:
     async def _classify(self, batch: list) -> list:
         """Labels for a batch: one per call, or None for a call nothing usable was decided about.
 
-        Returns ``(labels, retry)``. ``retry`` is True only when the answer is ABSENT (a transport
-        error, a timeout) rather than wrong: the caller puts those calls back for the next flush,
-        because the gateway still holds their records.
+        Returns ``(labels, requeue)``: ``requeue`` is the indexes of calls whose answer is ABSENT (a
+        transport error, a timeout) rather than wrong, which the caller puts back for the next flush
+        because the gateway still holds their records. Every call when the batch request itself
+        failed; empty when every call got an answer, right or wrong.
 
         The model answers BY NUMBER (``{"1": "Build", ...}``), so a reply that misses a call, or names
         it with a word outside the vocabulary, costs only that call, never the batch. Each call it left
@@ -527,22 +535,30 @@ class Collector:
         """
         labels, retry = await self._ask(batch)
         if retry:
-            return [None] * len(batch), True
+            return [None] * len(batch), list(range(len(batch)))
         missing = [i for i, label in enumerate(labels) if label not in VOCABULARY]
+        requeue = []
         if missing and len(batch) > 1:
-            self.single_retries += min(len(missing), MAX_SINGLE_RETRIES)
             logger.info("Activity classification left %d of %d call(s) without a label; asking about "
                         "each on its own", len(missing), len(batch))
-            for i in missing[:MAX_SINGLE_RETRIES]:
+            for n, i in enumerate(missing[:MAX_SINGLE_RETRIES]):
+                self.single_retries += 1
                 one, failed = await self._ask([batch[i]])
-                # A transport failure here leaves just this call unlabelled: the batch it belongs to
-                # was answered, so there is nothing to put back.
-                if not failed and one[0] in VOCABULARY:
+                if failed:
+                    # ⚠️ Stop at the FIRST transport failure. Each ask can cost a 20 s timeout, and
+                    # carrying on would hold this batch's good labels (and every newer call, since a
+                    # flush is running) past the gateway's hold, which `finish()`'s two-failures rule
+                    # exists to prevent. And put this call and the rest back rather than forfeiting
+                    # them: an ABSENT answer is retried, only a wrong one is not, and the gateway
+                    # still holds their records.
+                    requeue = missing[n:MAX_SINGLE_RETRIES]
+                    break
+                if one[0] in VOCABULARY:
                     labels[i] = one[0]
                     self.recovered += 1
         out = [label if label in VOCABULARY else None for label in labels]
         self.classified += sum(1 for label in out if label)
-        return out, False
+        return out, requeue
 
     async def _ask(self, batch: list):
         """One model call about ``batch``: ``(labels, retry)``, labels matched to calls BY NUMBER.
