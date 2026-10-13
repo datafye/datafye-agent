@@ -2265,9 +2265,10 @@ async def stream_agent_response(
         except Exception as e:      # noqa: BLE001 - labelling never breaks a turn
             logger.warning("Activity labelling did not complete: %s", e)
         if labeller.classifying:
-            logger.info("[activity] %s: %d call(s) classified, %d labelled, %d batch(es) discarded",
+            logger.info("[activity] %s: %d call(s) classified, %d labelled, %d batch(es) unreadable, "
+                        "%d call(s) re-asked on their own (%d recovered)",
                         conversation_id, labeller.classified, labeller.pushed,
-                        labeller.discarded_batches)
+                        labeller.discarded_batches, labeller.single_retries, labeller.recovered)
 
         # Record + report this turn's usage, per model per turn. Drives the workspace
         # telemetry (meta, replayed by /history) and the accounts billing/quota roll-up

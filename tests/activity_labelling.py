@@ -50,7 +50,9 @@ class StubCollector(activity.Collector):
         self.classify_fails = 0
         self.push_fails = 0
 
-    async def _classify(self, batch):
+    async def _ask(self, batch):
+        """Stands in for the ONE network call. The real `_classify` around it (numbering, the re-ask
+        of unlabelled calls) and the real parser are the code under test."""
         self.classify_calls.append([mid for mid, _ in batch])
         self.evidence = getattr(self, "evidence", []) + [activity._evidence(call) for _, call in batch]
         if self.classify_fails:
@@ -59,14 +61,13 @@ class StubCollector(activity.Collector):
         reply = self.replies.pop(0) if self.replies else None
         if reply is None:
             return [None] * len(batch), False
-        # Go through the real parsing and the real count check, so a stub cannot make a bug
-        # disappear by handing back a clean list.
-        parsed = activity._parse_labels(json.dumps(reply))
-        if parsed is None or len(parsed) != len(batch):
+        if reply == "__transport_failure__":
+            return [None] * len(batch), True
+        labels = activity._parse_labels(json.dumps(reply), len(batch))
+        if labels is None:
             self.discarded_batches += 1
-            return [None] * len(batch), False       # wrong, not absent: never retried
-        self.classified += len(batch)
-        return [p if p in activity.VOCABULARY else None for p in parsed], False
+            return [None] * len(batch), False
+        return labels, False
 
     async def _push(self, labels):
         self.pushes.append(list(labels))
@@ -78,23 +79,53 @@ class StubCollector(activity.Collector):
 
 
 async def test_a_shifted_mapping_is_never_applied():
-    """A count mismatch discards the WHOLE batch. A shifted mapping files one call's cost under
-    another call's activity and looks perfectly healthy; an unlabelled call shows up as
-    `unclassified`, which is honest and recoverable."""
-    c = StubCollector(replies=[["Build", "Design"]])       # two labels for three calls
+    """A positional answer of the wrong length is never mapped onto the calls. It cannot say WHICH call
+    it dropped, and guessing files one call's cost under another call's activity while looking
+    perfectly healthy. Each call is asked about again on its own instead (the first Datafye run lost 6
+    of 76 calls to exactly this reply, when the batch used to be discarded outright)."""
+    c = StubCollector(replies=[["Build", "Design"],                  # two labels for three calls
+                               {"1": "Design"}, {"1": "Build"}, {"1": "Backtest"}])
     for i in range(3):
         c.observe(f"msg_{i}", tools=["Write"])
     await c.finish()
-    check(c.pushes == [], "nothing is pushed when the label count does not match")
-    check(c.discarded_batches == 1, "the discard is counted, not silent")
-    # ⚠️ The weight goes to `unclassified`, NOT nowhere. Dropping it redistributes the discarded
-    # calls' cost across whatever else was labelled, which is how a turn with three heavy discarded
-    # calls and one light `Explore` call files the whole turn under Explore - confidently wrong, and
-    # disagreeing with the gateway, which calls those same calls `unclassified`.
-    # ⚠️ And nothing is RECORDED as an activity either: nothing was decided about those calls, so the
-    # agent claims nothing. The gateway releases their records as `unclassified`, which is the one
-    # place that fact belongs.
-    check(c.activities == [], f"no activity is claimed for a discarded batch (got {c.activities})")
+    pushed = dict(c.pushes[0]) if c.pushes else {}
+    check(pushed == {"msg_0": "Design", "msg_1": "Build", "msg_2": "Backtest"},
+          f"each call carries its OWN single-call answer, never the shifted pair (got {pushed})")
+    check(c.classify_calls[1:] == [["msg_0"], ["msg_1"], ["msg_2"]],
+          f"each call was re-asked alone (got {c.classify_calls})")
+    check(c.single_retries == 3 and c.recovered == 3, "the re-asks are counted")
+
+    # And when the single asks get nothing usable either, nothing is claimed: the gateway releases
+    # those records as `unclassified`, which is the honest answer.
+    c = StubCollector(replies=[["Build", "Design"]])
+    for i in range(3):
+        c.observe(f"msg_{i}", tools=["Write"])
+    await c.finish()
+    check(c.pushes == [], "nothing is pushed when no call got a usable label")
+    # ⚠️ Nothing is RECORDED as an activity either: nothing was decided about those calls, so the
+    # agent claims nothing.
+    check(c.activities == [], f"no activity is claimed (got {c.activities})")
+
+
+async def test_a_numbered_answer_costs_only_the_call_it_missed():
+    c = StubCollector(replies=[{"1": "Build", "3": "Design"}, {"1": "Explore"}])
+    for i in range(3):
+        c.observe(f"msg_{i}", tools=["Write"])
+    await c.finish()
+    pushed = dict(c.pushes[0])
+    check(pushed == {"msg_0": "Build", "msg_1": "Explore", "msg_2": "Design"},
+          f"the named calls keep their labels and only the missed one is re-asked (got {pushed})")
+    check(c.classify_calls[1:] == [["msg_1"]], f"one re-ask, for the missed call (got {c.classify_calls})")
+
+
+async def test_an_unreadable_reply_is_counted_and_re_asked():
+    c = StubCollector(replies=["not json at all", {"1": "Build"}, {"1": "Build"}])
+    for i in range(2):
+        c.observe(f"msg_{i}", tools=["Write"])
+    await c.finish()
+    check(c.discarded_batches == 1, "an unreadable reply is counted, not silent")
+    check(dict(c.pushes[0]) == {"msg_0": "Build", "msg_1": "Build"} if c.pushes else False,
+          f"and each call is then asked about on its own (got {c.pushes})")
 
 
 async def test_an_unknown_label_drops_only_its_own_call():
@@ -107,6 +138,51 @@ async def test_an_unknown_label_drops_only_its_own_call():
           f"the two good labels still apply (got {pushed})")
     check(sorted(c.activities) == ["Build", "Design"],
           f"and only the decided ones are recorded (got {sorted(c.activities)})")
+    check(c.classify_calls[1:] == [["msg_1"]], "the unknown one was re-asked on its own")
+
+
+async def test_a_failed_re_ask_stops_the_loop_and_is_retried_later():
+    """Review finding: the re-ask loop carried on after a transport failure (each can cost a 20 s
+    timeout, so eight of them held the batch's GOOD labels past the gateway's hold), and the call whose
+    ask failed was forfeited although the gateway still held its record. It stops at the first failure,
+    pushes what it has, and puts the rest back."""
+    c = StubCollector(replies=[{"1": "Build"},                       # msg_1 and msg_2 missed
+                               "__transport_failure__",               # msg_1's own ask fails
+                               {"1": "Design", "2": "Explore"}])      # the next flush, both back
+    for i in range(3):
+        c.observe(f"msg_{i}", tools=["Write"])
+    await c.finish()
+    check(c.classify_calls[:3] == [["msg_0", "msg_1", "msg_2"], ["msg_1"], ["msg_1", "msg_2"]],
+          f"one failed re-ask, then no more; both calls go back for the next flush (got {c.classify_calls})")
+    first = dict(c.pushes[0]) if c.pushes else {}
+    check(first == {"msg_0": "Build"}, f"the good label is pushed without waiting (got {first})")
+    pushed = {}
+    for p in c.pushes:
+        pushed.update(dict(p))
+    check(pushed == {"msg_0": "Build", "msg_1": "Design", "msg_2": "Explore"},
+          f"and the requeued calls are labelled on the next pass (got {pushed})")
+
+
+async def test_re_asks_are_bounded():
+    n = activity.MAX_SINGLE_RETRIES + 5
+    c = StubCollector(replies=[[]])          # an empty array for n calls: none of them labelled
+    for i in range(n):
+        c.observe(f"msg_{i}", tools=["Write"])
+    await c.finish()
+    singles = [b for b in c.classify_calls[1:] if len(b) == 1]
+    check(len(singles) == activity.MAX_SINGLE_RETRIES,
+          f"a garbled reply costs at most MAX_SINGLE_RETRIES extra calls (got {len(singles)})")
+
+
+def test_the_parser_matches_by_number():
+    P = activity._parse_labels
+    check(P('{"1": "Build", "2": "Explore"}', 2) == ["Build", "Explore"], "an object maps by number")
+    check(P('```json\n{"2": "Design"}\n```', 3) == [None, "Design", None], "fences tolerated, gaps are None")
+    check(P('{"0": "Build", "4": "Build", "x": "Build"}', 3) == [None, None, None], "out-of-range keys ignored")
+    check(P('["Build", "Design"]', 2) == ["Build", "Design"], "an array of the right length still reads")
+    check(P('["Build", "Design"]', 3) == [None, None, None], "an array of the WRONG length is never mapped")
+    check(P("no idea", 2) is None, "unreadable is None")
+    check(P("", 2) is None, "empty is None")
 
 
 async def test_a_batch_goes_when_it_is_full():
@@ -229,8 +305,9 @@ async def test_a_transient_classify_failure_is_retried_not_forfeited():
 
 
 async def test_a_wrong_answer_is_NOT_retried():
-    """A count mismatch is a WRONG answer, not an absent one, so asking again invites the same
-    wrongness. Discarded for good, and the calls land in `unclassified` - which is honest."""
+    """A call that was ALREADY asked about on its own gets no second go: a wrong answer is not an
+    absent one, and asking the same single question again invites the same wrongness. Only calls
+    that shared a batch are re-asked, singly. This one lands in `unclassified`, which is honest."""
     c = StubCollector(replies=[["Build", "Design"]])       # two labels for one call
     c.observe("msg_1", tools=["Write"])
     await c.finish()
@@ -353,7 +430,7 @@ class ReplyCollector(activity.Collector):
         self.sent = []
 
     async def _classify(self, batch):
-        return ["Build"] * len(batch), False
+        return ["Build"] * len(batch), []
 
     async def _send_labels(self, body):
         self.sent.append([c["message_id"] for c in body["calls"]])
@@ -482,7 +559,7 @@ async def test_a_retry_produced_by_the_last_pass_is_not_dropped():
     class Classifies(ReplyCollector):
         async def _classify(self, batch):
             self.observe_sidecar("msg_classifier")        # what the real classify call does
-            return ["Build"] * len(batch), False
+            return ["Build"] * len(batch), []
     c = Classifies(replies=[{}, {"unmatched": ["msg_classifier"]}, {}])
     saved = activity.UNMATCHED_RETRY_SECONDS
     activity.UNMATCHED_RETRY_SECONDS = 0.0
@@ -533,9 +610,9 @@ async def test_two_separate_blips_are_not_an_outage():
         async def _classify(self, batch):
             self.classify_calls.append([mid for mid, _ in batch])
             if len(self.classify_calls) == 1:
-                return [None] * len(batch), True          # blip 1: the classify call times out
+                return [None] * len(batch), list(range(len(batch)))  # blip 1: the classify call times out
             self.observe_sidecar("msg_classifier")        # the classify call is itself metered
-            return ["Build"] * len(batch), False
+            return ["Build"] * len(batch), []
 
         async def _push(self, labels):
             self.pushes.append(list(labels))
@@ -559,6 +636,10 @@ async def main_async():
                test_a_wrong_answer_is_NOT_retried,
                test_a_failed_push_is_retried_so_the_two_series_agree,
                test_an_unknown_label_drops_only_its_own_call,
+               test_a_numbered_answer_costs_only_the_call_it_missed,
+               test_an_unreadable_reply_is_counted_and_re_asked,
+               test_re_asks_are_bounded,
+               test_a_failed_re_ask_stops_the_loop_and_is_retried_later,
                test_a_batch_goes_when_it_is_full,
                test_an_aging_call_goes_before_the_batch_fills,
                test_a_sidecar_is_labelled_without_asking_a_model,
@@ -587,6 +668,8 @@ async def main_async():
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+    print("--- test_the_parser_matches_by_number ---")
+    test_the_parser_matches_by_number()
     print("--- test_the_vocabulary_is_one_flat_set ---")
     test_the_vocabulary_is_one_flat_set()
     print("--- test_the_prompt_names_the_traps ---")
