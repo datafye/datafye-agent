@@ -123,7 +123,9 @@ CHEATSHEET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # User credentials (injected per-user at launch)
 MASSIVE_API_KEY = os.getenv("DATAFYE_AGENT_MASSIVE_API_KEY", "")
-PALPHA_API_KEY = os.getenv("DATAFYE_AGENT_PALPHA_API_KEY", "")
+# No Precision Alpha key. Access is an account-level AWS role that Datafye Ops
+# configures on the agent box, so there is no user-supplied credential to hold,
+# and nothing here can tell whether PA is reachable.
 HWAI_API_KEY = os.getenv("DATAFYE_AGENT_HWAI_API_KEY", "")
 CONNECTTRADE_CLIENT_ID = os.getenv("DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID", "")
 CONNECTTRADE_CLIENT_SECRET = os.getenv("DATAFYE_AGENT_CONNECTTRADE_CLIENT_SECRET", "")
@@ -446,7 +448,6 @@ class HealthResponse(BaseModel):
 class CredentialsUpdate(BaseModel):
     """Update user credentials at runtime."""
     massive_api_key: Optional[str] = None
-    palpha_api_key: Optional[str] = None
     hwai_api_key: Optional[str] = None
     connecttrade_client_id: Optional[str] = None
     connecttrade_client_secret: Optional[str] = None
@@ -484,7 +485,6 @@ def _credential_env_seed() -> dict:
     return {
         "anthropic_api_key": os.getenv("DATAFYE_AGENT_ANTHROPIC_API_KEY", ""),
         "massive_api_key": MASSIVE_API_KEY,
-        "palpha_api_key": PALPHA_API_KEY,
         "hwai_api_key": HWAI_API_KEY,
         "connecttrade_client_id": CONNECTTRADE_CLIENT_ID,
         "connecttrade_client_secret": CONNECTTRADE_CLIENT_SECRET,
@@ -561,13 +561,16 @@ def _apply_anthropic_key() -> None:
 
 # Maps credentials-store keys to the env-var names the Datafye CLI /
 # deployment descriptors expect via ${VAR} substitution. Each store key
-# maps to one or more env-var aliases — historical renames (Polygon ->
-# Massive, Palpha -> Precision Alpha) are exported under both names so a
-# descriptor written against either resolves. The Anthropic key is handled
-# separately by _apply_anthropic_key because it also validates the key.
+# maps to one or more env-var aliases — the historical rename (Polygon ->
+# Massive) is exported under both names so a descriptor written against either
+# resolves. The Anthropic key is handled separately by _apply_anthropic_key
+# because it also validates the key.
+#
+# Precision Alpha is deliberately absent: it has no user-supplied key. Access is
+# an account-level AWS role configured on the box by Datafye Ops, so there is
+# nothing to export and a descriptor never references a PA credential.
 _CREDENTIAL_ENV_MAP = {
     "massive_api_key":             ["POLYGON_API_KEY", "MASSIVE_API_KEY"],
-    "palpha_api_key":              ["PALPHA_API_KEY", "PRECISION_ALPHA_API_KEY"],
     "hwai_api_key":                ["HWAI_API_KEY"],
     "connecttrade_client_id":      ["CONNECTTRADE_CLIENT_ID"],
     "connecttrade_client_secret":  ["CONNECTTRADE_CLIENT_SECRET"],
@@ -637,11 +640,11 @@ def get_credential_summary() -> str:
     else:
         lines.append("- Massive (Polygon) API key: NOT configured (needed for SIP and Crypto datasets)")
 
-    if credentials.get("palpha_api_key"):
-        lines.append("- Precision Alpha API key: configured (for Palpha dataset)")
-    else:
-        lines.append("- Precision Alpha API key: NOT configured (needed for Palpha dataset)")
-
+    # Palpha is NOT listed here. It takes no user credential: access is an
+    # account-level AWS role that Datafye Ops configures on the agent box. Saying
+    # "Precision Alpha API key: NOT configured" was worse than saying nothing --
+    # it read as a hard blocker and twice sent the agent several steps into
+    # talking itself back out of one before provisioning anything.
     if credentials.get("hwai_api_key"):
         lines.append("- HWAI API key: configured (for HWAI dataset)")
     else:
@@ -2556,7 +2559,6 @@ async def health():
         api_mcp_available=check_api_mcp_reachable(DATAFYE_API_MCP_URL),
         credentials={
             "massive": bool(creds.get("massive_api_key")),
-            "precision_alpha": bool(creds.get("palpha_api_key")),
             "hwai": bool(creds.get("hwai_api_key")),
             "connecttrade": all([
                 creds.get("connecttrade_client_id"),
@@ -3046,7 +3048,7 @@ async def update_credentials_deprecated(update: CredentialsUpdate):
 
 class CredentialUpdate(BaseModel):
     """Single-credential push from the accounts service."""
-    provider: str   # e.g. "massive_api_key", "palpha_api_key", "github_token", "connecttrade_user_secret"
+    provider: str   # e.g. "massive_api_key", "github_token", "connecttrade_user_secret"
     value: str
 
 
@@ -3082,7 +3084,6 @@ async def credentials_status():
     sandbox URL can't be probed for which integrations are wired up."""
     return {
         "massive": bool(credentials.get("massive_api_key")),
-        "precision_alpha": bool(credentials.get("palpha_api_key")),
         "hwai": bool(credentials.get("hwai_api_key")),
         "connecttrade": all([
             credentials.get("connecttrade_client_id"),
