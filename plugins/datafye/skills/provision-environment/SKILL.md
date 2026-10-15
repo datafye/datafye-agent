@@ -15,7 +15,9 @@ Turn a plain-language data requirement into a running Datafye environment. Do th
    - **Symbols**: the tickers the user named, or sensible defaults if they only described a universe.
    - **Mode**: `backtest` (foundry, no broker) for development and historical testing, or `paper` (trading, broker-connected) for simulated trading.
 
-2. **Check credentials.** Each dataset has a provider key (SIP/Crypto → Massive; Palpha → Precision Alpha; HWAI → HWAI). If the required key is not configured, tell the user to add it in Settings (gear icon). Do not ask them to paste keys in chat. Do not proceed with a dataset whose key is missing.
+2. **Check credentials.** Most datasets have a provider key (SIP/Crypto → Massive; HWAI → HWAI). If the required key is not configured, tell the user to add it in Settings (gear icon). Do not ask them to paste keys in chat. Do not proceed with a dataset whose key is missing.
+
+   ⚠️ **Palpha is the exception: it takes no key and you cannot check it.** Precision Alpha access is an account-level AWS role that **Datafye Ops** configures on the agent box, so there is no credential for the user to add and nothing in Settings to point them at. Do not treat Palpha as blocked on a credential, and do not report a Precision Alpha key as missing — it does not exist. Provision Palpha the same as any other dataset; if the role is not configured on the box, the on-demand service's connector fails at startup and `datafye foundry local status` shows `palpha-ondemand` not answering. That is the signal, and the fix is an Ops request, not a user action.
 
 3. **Build the deployment descriptor.** Write a YAML descriptor for the datasets, schemas, symbols, and mode. Provider keys are referenced with shell-style substitution (e.g. `${MASSIVE_API_KEY}`) — the agent exports configured credentials into the environment, so leave them as `${VAR}` references, never inline literal keys.
 
