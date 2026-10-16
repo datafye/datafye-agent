@@ -29,6 +29,7 @@ including custom events for environment status, scorecard, and chart data.
 """
 
 import io
+import base64
 import json
 import os
 import zipfile
@@ -566,16 +567,21 @@ def _apply_anthropic_key() -> None:
 # resolves. The Anthropic key is handled separately by _apply_anthropic_key
 # because it also validates the key.
 #
-# Precision Alpha is deliberately absent: it has no user-supplied key. Access is
-# an account-level AWS role configured on the box by Datafye Ops, so there is
-# nothing to export and a descriptor never references a PA credential.
+# ⚠️ The four CONNECTTRADE_* exports that used to be here are GONE (DAT-404).
+# Nothing had read them since DAT-76 moved the broker to the vault model: the
+# deploy engine reads none of them, and the `connecttrade_*` strings in the
+# platform are PROVIDER NAMES in the accounts fetch, not environment variables.
+# The agent was simply never updated, so it exported four values nothing
+# consumed while omitting the two that are mandatory (see
+# _ensure_deployment_token).
+#
+# ⚠️ Neither Precision Alpha nor the broker has a user-supplied key here, and
+# that is still true. What a deployment needs is not a provider credential but a
+# Datafye DEPLOYMENT TOKEN, which the agent mints for itself — see
+# _ensure_deployment_token. A descriptor never references either.
 _CREDENTIAL_ENV_MAP = {
     "massive_api_key":             ["POLYGON_API_KEY", "MASSIVE_API_KEY"],
     "hwai_api_key":                ["HWAI_API_KEY"],
-    "connecttrade_client_id":      ["CONNECTTRADE_CLIENT_ID"],
-    "connecttrade_client_secret":  ["CONNECTTRADE_CLIENT_SECRET"],
-    "connecttrade_user_id":        ["CONNECTTRADE_USER_ID"],
-    "connecttrade_user_secret":    ["CONNECTTRADE_USER_SECRET"],
     "github_user":                 ["GITHUB_USER"],
     "github_token":                ["GITHUB_TOKEN"],
 }
@@ -599,6 +605,85 @@ def _apply_credentials_env() -> None:
                 os.environ[name] = val
             else:
                 os.environ.pop(name, None)
+
+
+# The deployment token the CLI needs, and the window it is valid for. Refreshed
+# when it is inside _DEPLOYMENT_TOKEN_MARGIN_S of expiry; a box can outlive a
+# 90-day token.
+_DEPLOYMENT_TOKEN_MARGIN_S = 24 * 3600
+
+
+def _deployment_token_expiry(token: str) -> int:
+    """The `exp` claim (epoch seconds) of a JWT, read WITHOUT verifying it.
+
+    Not authenticating anything: this is our own token and we only want to know
+    when to replace it. Accounts verifies it. A token we cannot parse is treated
+    as expiring now, so it gets replaced rather than used forever.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0))
+    except Exception:
+        return 0
+
+
+async def _ensure_deployment_token(auth_token: Optional[str]) -> None:
+    """Mint a deployment token and put it, with the accounts URL, into the
+    process environment so a `datafye ... provision` inherits them (DAT-404).
+
+    A deployment carrying a broker or the Precision Alpha dataset cannot be
+    provisioned without these two: LocalBrokerSystemHandler has required them
+    since DAT-76 and LocalPalphaSystemHandler since DAT-402, and both refuse up
+    front. Nothing here set them, so Yukti could not stand either one up.
+
+    ⚠️ The user never sees this and must never be asked for it. It is minted
+    from the user's OWN forwarded session over the same agent->accounts channel
+    the usage reporter and the ConnectTrade write-back already use, so it is no
+    new credential. A credential line the user is expected to satisfy is exactly
+    what DAT-399 removed, at a cost of several wasted steps per run.
+
+    ⚠️ Best-effort, and silent on the happy path. It runs on every chat turn, so
+    raising here would fail a conversation over an environment variable that
+    most turns do not need. A deployment that genuinely needs the token and does
+    not have it gets a clear refusal from the CLI naming both variables.
+
+    ⚠️ Skipped with no identity forwarded (a self-hosted run), which is correct
+    rather than degraded: there is no account to mint against, so palpha and
+    broker deployments are simply not available there. Same guard as
+    broker.py's write-back.
+    """
+    accounts_url = getattr(auth, "ACCOUNTS_URL", None)
+    user = auth.username()
+    if not auth_token or not user or not accounts_url:
+        return
+
+    existing = os.environ.get("DATAFYE_DEPLOYMENT_TOKEN")
+    if existing and _deployment_token_expiry(existing) - time.time() > _DEPLOYMENT_TOKEN_MARGIN_S:
+        return
+
+    url = f"{accounts_url}/datafye-accounts-api/v1/accounts/{user}/deployment-token"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.post(url, headers={"Authorization": f"Bearer {auth_token}"})
+        if resp.status_code >= 400:
+            logger.warning("Could not mint a deployment token (HTTP %s); a deployment with a "
+                           "broker or Precision Alpha cannot be provisioned until this works",
+                           resp.status_code)
+            return
+        token = resp.json().get("token")
+        if not token:
+            logger.warning("Deployment-token mint returned no token")
+            return
+        # ⚠️ Never log the value. Both go in together: the token is useless
+        # without knowing which accounts service issued it, and a stale URL
+        # beside a fresh token would send the fetch to the wrong place.
+        os.environ["DATAFYE_ACCOUNTS_URL"] = accounts_url
+        os.environ["DATAFYE_DEPLOYMENT_TOKEN"] = token
+        logger.info("Deployment token minted for %s; broker and Precision Alpha deployments "
+                    "can be provisioned", user)
+    except Exception as e:
+        logger.warning("Could not mint a deployment token: %s", e)
 
 
 def build_mcp_config() -> tuple[dict, list[str]]:
@@ -1660,6 +1745,9 @@ async def tracked_stream_agent_response(
     accounts' idle monitor."""
     global last_chat_activity_at, running_jobs
     last_chat_activity_at = int(time.time() * 1000)
+    # Before the SDK subprocess is spawned, so a provision it runs inherits the
+    # token. Best-effort and never raises; see _ensure_deployment_token.
+    await _ensure_deployment_token(auth_token)
     running_jobs += 1
     try:
         async for event in stream_agent_response(message, conversation_id, algo_id, auth_token):
