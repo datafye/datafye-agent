@@ -1080,7 +1080,7 @@ that grows has to be the volume the data is on.
 | `/v1/activity` | POST | Presence heartbeat from the SPA (DAT-169). Advances `last_chat_activity_at` without running a chat turn, so a user who is *reading* still counts as present. JWT-protected, self-scoped, one assignment and no I/O. 204 |
 | `/v1/foundry/intent` | POST | Accounts-only, `agent-lifecycle`-token-gated. Record the foundry intent accounts has decided (`{intended, source}`); written to the on-disk replica the boot service reads. Errors are reported rather than swallowed — a push that did not land must not look like one that did |
 | `/v1/foundry/stop` | POST | Accounts-only, `agent-lifecycle`-token-gated. Bring the foundry down cleanly before the box is powered off (DAT-125). Returns `{status, detail}` where status is `stopped`/`absent`/`busy`/`failed` — `busy` tells accounts to ABORT the instance stop |
-| `/v1/credentials/status` | GET | Check which credentials are configured (JWT-protected) |
+| `/v1/credentials/status` | GET | Check which credentials are configured (JWT-protected). ⚠️ **No longer returns `precision_alpha`** (DAT-399) — Yukti was its only consumer and has been updated |
 | `/v1/broker/brokers` | GET | List brokers Datafye supports (StocksBroker enum) |
 | `/v1/broker/connections` | GET | List the user's brokerage connections with linked accounts |
 | `/v1/broker/connections` | POST | Create a ConnectTrade OAuth URL for a chosen broker; body `{type, broker}` |
@@ -1216,8 +1216,54 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 | `DATAFYE_AGENT_SAMPLES_DIR` | `/home/datafye/samples` | Path to datafye-samples (API reference) |
 | `DATAFYE_AGENT_ALLOWED_ORIGINS` | `*` | CORS origins |
 | `DATAFYE_AGENT_MASSIVE_API_KEY` | - | Massive (Polygon) API key |
-| `DATAFYE_AGENT_PALPHA_API_KEY` | - | Precision Alpha API key |
 | `DATAFYE_AGENT_HWAI_API_KEY` | - | HWAI API key |
+## The deployment token the CLI needs (DAT-404)
+
+A deployment carrying a **broker** or the **Precision Alpha** dataset cannot be provisioned without
+`DATAFYE_ACCOUNTS_URL` + `DATAFYE_DEPLOYMENT_TOKEN` in the environment: the deploy engine refuses up
+front (`LocalBrokerSystemHandler` since DAT-76, `LocalPalphaSystemHandler` since DAT-402). The agent
+does not invoke the CLI with a constructed environment — it runs a Claude Agent SDK subprocess that
+inherits `os.environ`, and the model issues CLI commands through Bash — so whatever is not in
+`os.environ` is not available to a provision.
+
+⚠️ **Nothing here set either variable, so Yukti could not stand up a broker or palpha deployment at
+all.** The broker half was a silent, pre-existing break: the agent was never updated when DAT-76
+moved the broker to the vault model.
+
+`_ensure_deployment_token` mints one and exports both, on every chat turn, before the SDK subprocess
+is spawned.
+
+- ⚠️ **Minted from the USER's own forwarded session**, over the same agent→accounts channel the usage
+  reporter and `broker.py`'s ConnectTrade write-back already use. `POST /accounts/{u}/deployment-token`
+  is self-or-admin and needs only a login JWT, **no password**. So this is no new credential.
+- ⚠️ **The user must never be asked for it, and it must never appear in `/credentials/status` or
+  Yukti's Settings.** That is precisely what DAT-399 removed, at a cost of several wasted steps per
+  run reasoning out of a blocker that could not be satisfied. Needing a value is fine; needing one
+  the person being asked cannot obtain is not.
+- ⚠️ **Best-effort and silent on the happy path.** It runs on every turn, so raising would fail a
+  conversation over a variable most turns do not need. A deployment that actually needs it gets a
+  clear refusal from the CLI naming both variables.
+- ⚠️ **Both go in together, or neither.** A token is useless without knowing which accounts service
+  issued it, and a stale URL beside a fresh token sends the fetch to the wrong place.
+- **Refreshed inside a day of expiry** (the token is 90 days; a box can outlive one). An expiry that
+  cannot be parsed is treated as expired, so a malformed token is replaced rather than trusted
+  forever.
+- ⚠️ **Skipped with no forwarded identity** (a self-hosted run), which is correct rather than
+  degraded: there is no account to mint against, so palpha and broker deployments are simply not
+  available there. Same guard as `broker.py`'s write-back.
+
+⚠️ **The four `CONNECTTRADE_*` exports to the CLI are GONE.** Nothing had read them since DAT-76:
+the deploy engine reads none of them, and the `connecttrade_*` strings in the platform are **provider
+names in the accounts fetch**, not environment variables. The agent was exporting four values nothing
+consumed while omitting the two that are mandatory. ⚠️ The `DATAFYE_AGENT_CONNECTTRADE_*` **inbound**
+variables below are a different thing and still live — they seed the credential store in local dev.
+
+**Tests:** `tests/deployment_token.py` (offline, run by hand like its siblings). ⚠️ **Run it with
+`.venv/bin/python` or `python3`** — `python` on the dev Mac is **2.7.18**, and under it the suite dies
+with a `SyntaxError` in its own f-strings, which looks exactly like a failing test and is not one. A
+whole mutation run was invalidated by this before it was noticed: every mutation "failed" identically
+because none of them ran.
+
 | `DATAFYE_AGENT_CONNECTTRADE_CLIENT_ID` | - | ConnectTrade client ID — **local-dev seed only**; in production accounts pushes it as the `connecttrade_client_id` credential (see Broker-Credential Foundation) |
 | `DATAFYE_AGENT_CONNECTTRADE_CLIENT_SECRET` | - | ConnectTrade client secret — local-dev seed only; pushed by accounts as `connecttrade_client_secret` in production |
 | `DATAFYE_AGENT_CONNECTTRADE_USER_ID` | - | ConnectTrade user ID — minted by the agent on first broker-link and written back to accounts; this env var only seeds local dev |
@@ -1625,6 +1671,7 @@ and MCP hosts.
 - **Anthropic key as a credential**: The Anthropic key is not a startup env var; it lives in the encrypted credentials store and is delivered via the credentials push channel. The agent starts and stays manageable with no key — chat just returns 503/502 until a valid key arrives
 - **Credentials via accounts**: The accounts service pushes credential updates to `/v1/credentials/update`; the old direct-write `/v1/credentials` endpoint is gone
 - **Credentials synced to the environment**: `_apply_credentials_env()` exports the data-provider/broker/GitHub credentials from the encrypted store into `os.environ` (under both historical and current names, e.g. `POLYGON_API_KEY`+`MASSIVE_API_KEY`) on bootstrap and after every credentials push, so the Datafye CLI's `${VAR}` substitution in deployment descriptors resolves. (Previously only `ANTHROPIC_API_KEY` was exported.)
+- **⚠️ Precision Alpha has NO credential, and a check that cannot succeed is worse than none (DAT-399)**: PA access is an account-level **AWS role that Datafye Ops configures on the agent box** — there is no user-supplied credential, and there never was. Removed: the `DATAFYE_AGENT_PALPHA_API_KEY` env var, the `palpha_api_key` field on `CredentialsUpdate`, the legacy env seed, the `_CREDENTIAL_ENV_MAP` entry, the credential-summary lines, **both** readiness booleans, and the provider comment. The old summary line read `Precision Alpha API key: NOT configured (needed for Palpha dataset)` and the provision skill said *do not proceed with a dataset whose key is missing* — so on **two separate runs** the agent called it "a critical blocker" and then spent four to five steps reading docs to talk itself back out of one. `plugins/datafye/skills/provision-environment/SKILL.md` now says PA takes no key and cannot be checked, and names the real signal instead: if the role is missing, the on-demand connector fails at startup and `datafye foundry local status` shows `palpha-ondemand` not answering. Palpha is still offered as a capability — only the key field is gone. ⚠️ `palphaApiKey` still exists in `datafye-accounts`' ADM `Credentials` state entity, left deliberately: it is inert, and dropping a field from a replicated state entity on the service holding every user's credentials is a schema change with tlog implications.
 - **Summary-generated project titles**: on the first turn of a new conversation, `generate_title()` makes one cheap direct Anthropic call (haiku, `DATAFYE_AGENT_TITLE_MODEL`) to summarize the first message, renames the project, and emits a `title` SSE event that Yukti adopts. It's best-effort — any failure (no key, API error) returns None and the provisional `deduce_name` first-few-words name stays. This is the one place the agent calls the model directly rather than through the Agent SDK
 - **Resumable turns (background buffer + resume/stop)**: a chat turn runs as a **background task** buffering its SSE frames (`_Turn`/`_turn_emit`/`_run_turn`/`_drain_turn` + a `_turns` registry), **decoupled from the HTTP response**, so a client that drops mid-turn can reconnect and replay. `POST /v1/chat` mints a `turn_id`, starts the task, and returns a response that **drains the buffer**; the first frame is a `turn` SSE event `{turn_id}`. `GET /v1/chat/resume?turn_id=&after=<seq>` replays buffered frames after `after` then continues live (404 if evicted → client reloads `/history`). `POST /v1/chat/stop?turn_id=` cancels the task; `_run_turn` `aclose()`s the SDK generator (kills `query()`'s subprocess promptly) and emits `Stopped`+`done`. Each frame carries an SSE `id: <seq>` the client uses as the resume cursor. Because a disconnect no longer cancels the turn (hence explicit Stop), a **watchdog** (`_turn_sweeper`) cancels a running turn with no consumer for **300s** (bumped from 90s so a **parked** turn — e.g. the client switching away to another project — survives a detour and can be resumed on switch-back) and evicts finished buffers after 120s. Core algorithm unit-tested.
 - **Persisted Tool Detail (command + capped output)**: the machine tool-label commentary entry now carries the raw detail so the frontend's Tool Detail toggle can **replay it on reopen**, not just during a live turn. At `tool_use_start`, `append_commentary` stamps the entry with the `tool_id` + a formatted `command` (`_tool_command_text`, mirroring the frontend's `toolCommandText`); at `tool_result`, `conversations.attach_tool_output` matches by `tool_id` and attaches the output **capped at 2000 chars** (with an `output_error` flag on `is_error`). It rides through `/history` (no new endpoint) and reverses the earlier live-only design. The accounts Conversation view reads the same `command`/`output`/`output_error` fields off the commentary entries
