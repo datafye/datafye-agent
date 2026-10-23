@@ -1168,6 +1168,28 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 - **`unmatched` and `in_flight` labels get exactly ONE retry.** A label can beat its own record to
   the gateway; an in-flight record becomes labellable again if its delivery fails. A label still
   unmatched after its retry is a real join failure and is logged, not retried forever.
+- **Answers are matched to calls BY NUMBER, and a call left unlabelled is re-asked ALONE (DAT-370).**
+  The classifier replies `{"1": "Build", "2": "Explore", ...}` (`activity._parse_labels(text, count)`).
+  A positional list of the wrong length cannot say which call it skipped, so it used to discard the
+  WHOLE batch: on u1's first labelled run two "2 labels for 3 calls" replies filed 6 of 76 calls
+  `unclassified`. Now a missing or out-of-vocabulary answer costs only its call, and `_classify`
+  re-asks each such call on its own (`_ask([call])`; a one-call question cannot be matched to the
+  wrong call), bounded at `MAX_SINGLE_RETRIES` (8) per batch. A list is still read only when its
+  length is exact. A call that was already asked alone is not re-asked.
+  - ⚠️ **The first transport failure in a re-ask STOPS the loop.** Each ask can cost a 20 s timeout,
+    so carrying on held the batch's good labels (and every newer call) past the gateway's hold. That
+    call and the ones not yet asked are returned as indexes to requeue (`_classify` returns
+    `(labels, requeue)`), pushed back by `_flush` for the next pass: an ABSENT answer is retried, only
+    a WRONG one is not. `_requeue` keeps them in their original order.
+  - `_ask` is the ONE network call; `tests/activity_labelling.py`'s stub replaces only it, so the real
+    numbering, re-ask and requeue logic is what the offline suite tests.
+  - The end-of-turn log line reports `N call(s) re-asked on their own (M recovered)` and
+    `batch(es) unreadable` (a reply that would not parse at all).
+  - The prompt also says the call that RUNS a backtest, or reads its results, is Backtest even if it
+    fixed a small error first. The u1 run had no Backtest label; a synthetic case passes with or
+    without that line, so that miss's real cause is unconfirmed.
+  - Released in **2.0.54** and verified on u1 (2026-10-13): 41 calls, 40 labelled, the only
+    `unclassified` call the session opener, Backtest and Validate both present.
 - **The end-of-turn settle-up passes until nothing is owed** (at most `MAX_FINAL_PASSES`), and a
   retry waits `UNMATCHED_RETRY_SECONDS` however soon the turn ends after a mid-turn push. Anything
   still owed is logged. Two fixed passes used to drop whatever the second one produced, silently.
