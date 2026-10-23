@@ -2010,6 +2010,40 @@ dies with *'function' object has no attribute 'Collector'*. The Sutra agent foun
 unit run and a red end-to-end one. Here it is imported as `activity_labels`, and a test checks that the
 alias is still the module, which a mutation (use `activity.Collector` directly) proves it catches.
 
+### A list that cannot say what it left out (DAT-370)
+
+The first labelled run on u1 went well, mostly. Seventy-six model calls, labels arriving in time, the
+gateway happy. And six calls filed `unclassified`, in two clumps of three. The agent's log said why,
+twice: *Activity classification returned 2 labels for 3 call(s); discarding the batch so nothing is
+mislabelled.*
+
+That discard was deliberate, and it was right about the danger. The classifier was asked for a JSON
+list "one per call, in the same order", and a list of two for three calls is like a seating chart with
+one name rubbed out: you know someone is missing, you cannot tell who, and sliding everyone along one
+seat bills one call's cost under another call's activity while looking perfectly healthy. So the agent
+threw the whole batch away rather than guess, and never asked again. Safe, and lossy.
+
+The fix changes the question rather than the guesswork. The classifier now answers **by number**,
+`{"1": "Build", "3": "Design"}`, so a missing answer is a missing *key*: it costs exactly that call and
+nothing else. And any call still without a usable label is asked about again **on its own**, where
+there is only one seat to put the name in. Review then found the classic second bug in a retry loop: it
+kept going after a timeout, so eight slow re-asks could hold the batch's *good* labels past the
+gateway's three-minute hold, and a re-ask that timed out was forfeited even though the gateway still
+held its record. Now the first failure stops the loop and the unfinished calls go back in the queue.
+**An answer that is wrong is not retried; an answer that is missing always is.** The rerun on 2.0.54
+labelled every call except the session's opener.
+
+**Design an answer format that can say what it left out.** Positional output is fine until the producer
+miscounts, and a model will eventually miscount. Keys make an omission local and visible; positions
+make it global and silent.
+
+**And read the exit code, not the last line.** Partway through this, the test suite printed `all checks
+pass`, and it was wrong. Three tests still stubbed the old return value, so the LAST async test crashed
+with a `TypeError`. That crash killed the run before the remaining checks (and the summary) ever ran,
+and the "all checks pass" being read was from an earlier run. The suite's exit code was 1 the whole
+time. A green summary only means something if the thing printing it got to the end; `echo $?` is the
+one line that cannot lie about that.
+
 ## Broker Integration
 
 Eventually a project has to touch real money — or at least money-shaped money (paper trading). That means connecting the user's brokerage account. We don't want to be in the business of collecting and storing broker OAuth tokens ourselves, so we punt that to **ConnectTrade**, a broker-aggregator that speaks a single API and handles the OAuth dance for every supported broker.
