@@ -1,6 +1,8 @@
 # Datafye as a Claude connector — design
 
-Status: **designed, not built** (2026-10-23). Tracker: Linear ticket TBD.
+Status: **designed, not built** (2026-10-23). Tracker: **DAT-418** (team Datafye, GTM
+project). Post-Release-1; the build phases in §8 become their own tickets once committed
+to.
 
 Companion to **`nvx-sutra/docs/SUTRA-CONNECTOR-DESIGN.md`** (SUT-77), which was written
 first. That document is the authority on the parts that are **architecture** and therefore
