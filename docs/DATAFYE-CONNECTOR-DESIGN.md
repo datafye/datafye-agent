@@ -148,19 +148,29 @@ is the authority. In summary, and without re-arguing it:
 - The proxy must pass `X-Forwarded-Proto` / `-Host` / `-Port` so OAuth protected-resource
   metadata built from the request advertises the 443 URL.
 
-### ⚠️ The gap this review found: Datafye previews are unreachable from a connector
+### ⚠️ Datafye app previews are not routed at all, which is an opportunity
 
-`https://<username>.app.datafye.io:<port>` is **port-bearing**, which is precisely the form
-SUT-146 established a Claude connector cannot reach. Two consequences, and the first is
-independent of this whole design:
+An earlier draft of this section said previews are port-bearing and therefore unreachable
+from a connector. That understates it. Per this repo's `CLAUDE.md` (DAT-202/220): **the
+jump-server half is not in this repo and is not done** — nginx does not route
+`<username>.app.datafye.io:10010-10019` to the box, and the jump SG does not allow the
+band. So an app the model builds here is currently reachable from nowhere.
 
-1. **A Datafye user who builds an MCP server or a dashboard today cannot add it to Claude
-   as a connector**, and the failure looks like the server being down rather than
-   unreachable. Sutra fixed this in SUT-146 by adding a 443 hostname
-   (`<user>-<port>.sutra.n5corp.ai`) alongside the port form; the equivalent here would be
-   `<user>-<port>.app.datafye.io` with the regex matching **10010-10019**, not Sutra's
-   `808[0-9]`. Worth its own ticket regardless of whether the Datafye platform connector is
-   built, and it is the cheaper and more immediately useful of the two.
+**That makes this cheaper than the Sutra equivalent, not harder.** SUT-146 had to add a 443
+hostname *alongside* a port-bearing form already in the field and keep both working
+forever. Nothing is in the field here, so **build only the 443 form and never ship the
+port-bearing one**: `<user>-<port>.app.datafye.io`, regex matching `1001[0-9]` rather than
+Sutra's `808[0-9]`. One shape, no legacy, no dual-route to maintain.
+
+⚠️ The agent's prompt currently hands out the `:<port>` form, so that changes with it, as
+does the marker URL.
+
+Two further consequences:
+
+1. Until this exists, **a Datafye user who builds an MCP server or a dashboard cannot open
+   it at all**, let alone add it to Claude as a connector. Worth its own ticket regardless
+   of whether the platform connector is built, and it is the cheapest useful thing in this
+   whole document.
 2. There is **no MCP-server recipe in this repo's fleet memory**. Sutra's
    `mcp-server-on-rumi.md` was earned over several round trips; a Datafye box asked to
    build an MCP server would pay for that learning again. The protocol half ports as-is.
@@ -252,6 +262,27 @@ make the Sutra connector's docs path four times cheaper and pre-synthesized, for
 
 **The box keeps its on-disk docs regardless.** The agent's prompt grounds in
 `/opt/datafye/docs`, and a self-hosted box cannot depend on GitBook being up.
+
+⚠️ **This brushes against a recorded design decision and must not be read as overturning
+it.** `CLAUDE.md` lists *"Local docs over MCP: Datafye docs are on disk, not via a docs MCP
+server — faster and more reliable."* That decision is about **the agent on the box**, and it
+stands: the agent keeps reading `/opt/datafye/docs` and nothing here changes that. What is
+new is a **second consumer** — a remote client model that has no filesystem and for which
+"on disk" is not an option at all.
+
+But the stated reasons deserve answering rather than sidestepping, because they apply to
+the new consumer too:
+
+- *Faster* — true for the agent, where a read is a local file. For a remote client the
+  comparison is GitBook's hosted index against our own capping wrapper over the same
+  content, and the latency is a network hop either way.
+- *More reliable* — the real objection, and it survives. GitBook is a third-party
+  dependency on the critical path of every docs question, and `askQuestion` adds a model
+  call on their side. So the connector should degrade to the box's on-disk copy when
+  GitBook is unreachable, rather than treating the hosted index as the only path.
+
+If the spike concludes otherwise, update that `CLAUDE.md` line in the same change rather
+than leaving the two documents disagreeing.
 
 ### Why `backtest` is a job but not an agentic one
 
