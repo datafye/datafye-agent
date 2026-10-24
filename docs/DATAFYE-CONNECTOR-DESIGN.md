@@ -88,7 +88,9 @@ Verified against the installer, `/health`, `prompt.py` and the system skills on
 - **Datafye CLI**, which provisions, upgrades, tears down and reports foundry status
 - Claude Code CLI (installed as the `datafye` user), Python with a pre-installed package
   set for project code
-- Datafye docs at `/opt/datafye/docs`, plus samples
+- Datafye docs at `/opt/datafye/docs`, plus samples. ✅ The same content is also served by
+  GitBook's hosted MCP at `docs.datafye.io/~gitbook/mcp` (§5), which is what the connector
+  uses; the on-disk copy is for the agent and for self-host
 - User workspace at `/home/datafye/workspace`; a project is a **folder** under
   `<state>/projects/<id>/` carrying `meta.json`, `CLAUDE.md`, `PROJECT.md`, `memory/` and
   `.claude/skills/`, and that folder is the turn's cwd
@@ -171,7 +173,8 @@ Workspace altitude. Every result compacted server-side; no raw harness output or
 tick dumps across the wire.
 
 **Knowledge and orientation**
-- `search_docs(query)` — the pinned docs at `/opt/datafye/docs`
+- `docs.ask(question)` / `docs.search(query)` / `docs.read(url, full?)` — ✅ **a thin
+  wrapper over GitBook's own hosted MCP**, not a search engine of ours. See below.
 - `bom()` — pinned versions, capability flags, agent version; also the skew handshake
 - `env.status()` — the `foundry` block from `/health`: what is provisioned, what is
   answering, what is flowing
@@ -200,6 +203,55 @@ tick dumps across the wire.
 | `teardown_environment` | No | CLI. |
 
 **No `deploy` kind yet.** Paper and live trading are a separate decision; see §7.
+
+### ✅ Docs: wrap GitBook's MCP, and Datafye's has a tool Rumi's does not
+
+**Probed 2026-10-23.** GitBook hosts an MCP server per docs site, and
+`https://docs.datafye.io/~gitbook/mcp` is **live, public, unauthenticated, stateless and
+spec-correct** ("Datafye Docs MCP Server" v0.27.2, protocol 2025-06-18). So the docs tools
+are a capping wrapper over someone else's index rather than construction of ours.
+
+⚠️ **The two sites are not configured the same, and Datafye has the better end of it.**
+
+| | Rumi (`docs.rumi.systems`) | Datafye (`docs.datafye.io`) |
+|---|---|---|
+| `searchDocumentation` | yes | yes |
+| `getPage` | yes | yes |
+| `sendFeedback` | yes | yes |
+| **`askQuestion`** | **no** | **yes** |
+
+`askQuestion(question, goal)` returns a **synthesized answer with links to its source
+pages**. Measured against the real thing: *"What datasets and schemas can a Datafye
+environment be provisioned with?"* came back in **672 tokens**, correct and complete —
+datasets, the per-dataset schema matrix, the Palpha same-deployment requirement, and which
+providers are marked work-in-progress. The equivalent `searchDocumentation` call cost
+**2,678 tokens** of ten page excerpts the client model then has to collate itself.
+
+So on this product **`docs.ask` is the primary docs tool**, roughly four times cheaper than
+search for anything question-shaped and pre-collated, with `docs.search` / `docs.read` as
+the browse path behind it. That is a better position than the Sutra connector has.
+
+Two cautions, because a synthesized answer is not the same kind of thing as a page:
+
+- **It can be confidently wrong in a way an excerpt cannot.** It is a model call on
+  GitBook's side. Good for orientation; verify specifics against `docs.read` whenever the
+  answer feeds something the platform will validate.
+- **It has its own latency and its own failure modes**, and it is a third-party dependency
+  on the critical path of every docs question.
+
+**Sizing, for the record.** Datafye's `searchDocumentation` responses measured 10,715 and
+12,535 chars (~2.7k and ~3.1k tokens) with the largest single result at 39-46% — more even
+than Rumi's, which has a 94 KB configuration reference that dominated one response at 84%.
+Cap per-result content **by default, never as a gate**: `full: true` must be available,
+because the client's tokens ride the user's own subscription rather than our bill, and the
+real constraints are token-denominated rate limits and compaction timing.
+
+**Worth raising with whoever owns the Rumi space:** `askQuestion` appears to be a per-site
+GitBook setting, since both servers run v0.27.2. Enabling it on `docs.rumi.systems` would
+make the Sutra connector's docs path four times cheaper and pre-synthesized, for free.
+
+**The box keeps its on-disk docs regardless.** The agent's prompt grounds in
+`/opt/datafye/docs`, and a self-hosted box cannot depend on GitBook being up.
 
 ### Why `backtest` is a job but not an agentic one
 
@@ -353,7 +405,8 @@ Settle this with a real run before building the job runner.
 2. **Skills only.** The strategy and environment vocabulary, the dataset and credential
    rules including the Palpha exception, and the reporting honesty rules. No server work,
    reaches Cowork immediately, and tests whether the model reaches for Datafye at all.
-3. **Read-only connector.** `search_docs`, `bom`, `env.status`, `projects.list`. Proves
+3. **Read-only connector.** `docs.*` (a wrapper, not a build — §5), `bom`, `env.status`,
+   `projects.list`. Proves
    the gateway, OAuth and resolution with nothing destructive behind it.
 4. **Data and files.** `data.*` over `datafye-api`, project-scoped file tools.
 5. **Jobs.** `backtest` first, which is the valuable one and the one with a real schema to
