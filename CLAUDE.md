@@ -921,6 +921,44 @@ under `~/.datafye/logs` in place, and retries next boot rather than leaving the 
 service down. It never auto-rebuilds — the broken environment is the only evidence of
 why it failed.
 
+### Every installer setting must survive an upgrade (DAT-449)
+
+An upgrade is **unattended** — a root cron job, no operator, no arguments. So a setting that is
+written to `agent.env` but not read back is not "defaulted" on the next upgrade, it is **silently
+reverted on a box somebody deliberately configured**.
+
+The carry-forward block used to restore three values (port, mode, dns) while `agent.env` carried
+more and the flag set carried more again. Both gaps were real:
+
+- **`--pin` was written and never read**, so re-running the installer **un-pinned a pinned box** —
+  and a re-run is exactly what someone does while repairing a box they pinned on purpose.
+- **Nothing persisted the accounts URL**, so step 11's `foundry local upgrade` refused on a Palpha
+  deployment **after shutting it down**, leaving the environment dead on every agent upgrade.
+
+`existing_env_var` is now the single reader, and `tests/installer_carry_forward.sh` pins the
+invariant: every persisted key is read back, and every flag is either persisted or declared a
+deliberate one-shot, so a **new flag cannot be added without a decision**.
+
+⚠️ **`sudo` drops the environment.** Step 11 runs `sudo -u datafye`, so anything the CLI reads from
+the environment must be handed over explicitly — persisting a value and not passing it achieves
+nothing. ⚠️ **`sudo -E` is NOT the fix** and the CLI's own error message misleads here by
+suggesting it: on a cron-driven upgrade the variables are not set for root either, so there is
+nothing to preserve.
+
+⚠️ **Not everything belongs in carry-forward**, and the distinction is whether it describes the
+BOX or this INVOCATION. `--agent-source` seeds the agent tree from a local checkout; re-applying it
+on every later upgrade would silently re-seed from whatever that path holds now, overriding the
+version being installed. `--force`, `--ami-cleanup` and `--version` are likewise about this run.
+Values derived from the install itself (paths, CLI path, the version) must take the NEW value, or a
+box would be pinned to its first install forever.
+
+⚠️ **The deployment token is deliberately NOT persisted.** It is minted per session by the agent
+from the user's JWT and expires in 90 days, so writing it to disk would convert a deterministic
+failure into an intermittent one three months later — strictly harder to diagnose. A deployment
+that needs one (broker, Precision Alpha) therefore still cannot have its foundry upgraded from the
+installer; that half of DAT-449 is the ordering fix in `datafye-deploy` (refuse **before** shutting
+anything down) plus deciding where an unattended token comes from.
+
 ### `--version` selects what to install; `--pin` disables upgrades (DAT-187)
 
 They used to be the same flag, and that silently disabled auto-upgrade **across the

@@ -67,6 +67,8 @@ PINNED=false
 MODE=""
 DNS_NAME=""
 GITHUB_TOKEN=""
+ACCOUNTS_URL=""
+PORT_EXPLICIT=false
 FORCE=false
 AMI_CLEANUP=false
 AGENT_PORT=18780
@@ -100,7 +102,8 @@ while [[ $# -gt 0 ]]; do
         --agent-source)   AGENT_SOURCE_DIR="$2"; shift 2 ;;
         --force)          FORCE=true; shift ;;
         --ami-cleanup)    AMI_CLEANUP=true; shift ;;
-        --port)           AGENT_PORT="$2"; shift 2 ;;
+        --port)           AGENT_PORT="$2"; PORT_EXPLICIT=true; shift 2 ;;
+        --accounts-url)   ACCOUNTS_URL="$2"; shift 2 ;;
         -h|--help)
             cat <<EOF
 Datafye Agent Installer
@@ -228,19 +231,58 @@ if [ -f "${INSTALL_DIR}/version" ]; then
 fi
 
 # ── Preserve existing config on upgrade ───────────────────────────
+#
+# (!) EVERY setting that is still meaningful after the install finishes must be
+# written to agent.env AND read back here. An upgrade is unattended -- it runs
+# from a root cron job with no operator and no arguments -- so a setting that is
+# not carried forward is not "defaulted", it is SILENTLY REVERTED on a box
+# somebody deliberately configured.
+#
+# This block used to restore three of them (port, mode, dns) while agent.env
+# carried more and the flag set carried more again. The gaps were not
+# theoretical: --pin was written and never read, so re-running the installer
+# un-pinned a pinned box; and nothing persisted the accounts URL, so the foundry
+# upgrade at step 11 refused on a Palpha deployment AFTER shutting it down,
+# leaving the environment dead on every single agent upgrade (DAT-449).
+#
+# ⚠️ Not everything belongs here. A setting is carried forward only if it
+# describes the box; a one-shot instruction about THIS run is not config:
+#   --agent-source  seeds the agent tree from a local checkout. Re-applying it
+#                   on every later upgrade would silently re-seed from whatever
+#                   that path holds now, overriding the version being installed.
+#   --force, --ami-cleanup, --version   are about this invocation only.
+
+# Read one value out of the existing agent.env. Empty when absent, so a caller
+# can test it and decide; never echoes the value, since some are secrets.
+existing_env_var() {
+    [ -f "${ENV_FILE}" ] || return 0
+    grep -oP "^$1=\K.*" "${ENV_FILE}" 2>/dev/null || true
+}
+
 if [ "$IS_UPGRADE" = true ] && [ -f "${ENV_FILE}" ]; then
     info "Preserving existing configuration..."
-    EXISTING_PORT=$(grep -oP '^DATAFYE_AGENT_PORT=\K.*' "${ENV_FILE}" || true)
-    if [ -n "$EXISTING_PORT" ]; then
-        AGENT_PORT="${EXISTING_PORT}"
+
+    # An explicitly passed flag always wins; the stored value fills the gap.
+    [ -z "$MODE" ]          && MODE=$(existing_env_var DATAFYE_AGENT_MODE)
+    [ -z "$DNS_NAME" ]      && DNS_NAME=$(existing_env_var DATAFYE_AGENT_DNS)
+    [ -z "$GITHUB_TOKEN" ]  && GITHUB_TOKEN=$(existing_env_var DATAFYE_AGENT_GITHUB_TOKEN)
+    [ -z "$ACCOUNTS_URL" ]  && ACCOUNTS_URL=$(existing_env_var DATAFYE_ACCOUNTS_URL)
+
+    # Port has a non-empty default, so "was it passed?" cannot be read off the
+    # variable the way it can for the others -- the stored value wins unless the
+    # flag was given explicitly.
+    _stored_port=$(existing_env_var DATAFYE_AGENT_PORT)
+    if [ -n "${_stored_port}" ] && [ "$PORT_EXPLICIT" != true ]; then
+        AGENT_PORT="${_stored_port}"
     fi
-    # Preserve mode from existing config
-    if [ -z "$MODE" ]; then
-        MODE=$(grep -oP '^DATAFYE_AGENT_MODE=\K.*' "${ENV_FILE}" || true)
-    fi
-    # Preserve DNS from existing config
-    if [ -z "$DNS_NAME" ]; then
-        DNS_NAME=$(grep -oP '^DATAFYE_AGENT_DNS=\K.*' "${ENV_FILE}" || true)
+
+    # Same for --pin: its default is `false`, which is indistinguishable from
+    # "the operator asked for false". Without this a pinned box silently
+    # un-pins itself the first time anything re-runs the installer -- which is
+    # exactly when someone is repairing a box they pinned on purpose.
+    if [ "$PINNED" != true ]; then
+        _stored_pinned=$(existing_env_var DATAFYE_AGENT_PINNED)
+        [ "${_stored_pinned}" = "true" ] && PINNED=true
     fi
 fi
 
@@ -1022,7 +1064,15 @@ if [ "$AMI_CLEANUP" = true ]; then
     ok "Foundry: deferred to first boot"
 elif [ "$IS_UPGRADE" = true ]; then
     info "[${STEP}/${TOTAL_STEPS}] Upgrading local Datafye foundry environment..."
-    if sudo -u datafye "${CLI_PATH}" foundry local upgrade; then
+    # (!) sudo DROPS the environment, so anything the CLI reads from it has to be
+    # handed over explicitly. DATAFYE_ACCOUNTS_URL is stable box config and is
+    # carried forward above; DATAFYE_DEPLOYMENT_TOKEN is NOT -- it is minted per
+    # session by the agent from the user's JWT and expires in 90 days, so there is
+    # nothing here to pass and persisting one would only move the failure to the
+    # day it expired. A deployment that needs a token (broker, Precision Alpha)
+    # therefore still cannot be upgraded from here; see DAT-449.
+    if sudo -u datafye ${ACCOUNTS_URL:+DATAFYE_ACCOUNTS_URL="${ACCOUNTS_URL}"} \
+            "${CLI_PATH}" foundry local upgrade; then
         ok "Foundry environment upgraded"
     else
         # Non-fatal (DAT-115): a stale/broken foundry left by prior testing can fail
@@ -1062,6 +1112,8 @@ DATAFYE_AGENT_SAMPLES_DIR=${SAMPLES_DIR}
 DATAFYE_AGENT_CLI_PATH=${CLI_PATH}
 DATAFYE_AGENT_DNS=${DNS_NAME}
 DATAFYE_AGENT_PINNED=${PINNED}
+DATAFYE_AGENT_GITHUB_TOKEN=${GITHUB_TOKEN}
+DATAFYE_ACCOUNTS_URL=${ACCOUNTS_URL}
 DATAFYE_AGENT_API_MCP_URL=http://local-foundry-dev-mcp-api.datafye.local:3200/mcp
 EOF
 chmod 600 "${ENV_FILE}"
