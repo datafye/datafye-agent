@@ -3171,6 +3171,15 @@ async def credentials_status():
     """Check which credentials are configured. JWT-protected so a leaked
     sandbox URL can't be probed for which integrations are wired up."""
     return {
+        # Reported so the SPA can state what is configured without reading its
+        # own input boxes (DAT-454). An API key is write-only -- it is never
+        # echoed back -- so a client that infers "is this set" from an empty
+        # field is really reporting whether the user has typed since page load.
+        # anthropic comes from the validated status rather than the stored
+        # value, because a key that is present and REJECTED is not configured
+        # in any sense the user cares about.
+        "anthropic": anthropic_key_status != "missing",
+        "anthropic_key_status": anthropic_key_status,
         "massive": bool(credentials.get("massive_api_key")),
         "hwai": bool(credentials.get("hwai_api_key")),
         "connecttrade": all([
