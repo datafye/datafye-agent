@@ -68,6 +68,7 @@ MODE=""
 DNS_NAME=""
 GITHUB_TOKEN=""
 ACCOUNTS_URL=""
+MCP_SERVER=""
 PORT_EXPLICIT=false
 FORCE=false
 AMI_CLEANUP=false
@@ -104,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --ami-cleanup)    AMI_CLEANUP=true; shift ;;
         --port)           AGENT_PORT="$2"; PORT_EXPLICIT=true; shift 2 ;;
         --accounts-url)   ACCOUNTS_URL="$2"; shift 2 ;;
+        --mcp-server)     MCP_SERVER="$2"; shift 2 ;;
         -h|--help)
             cat <<EOF
 Datafye Agent Installer
@@ -131,6 +133,11 @@ Options:
                         the remote. The local checkout's remote URL is
                         rewritten to the canonical AGENT_REPO so auto-upgrade
                         keeps working.
+  --mcp-server <s>      Which Datafye API MCP server the agent uses (DAT-439):
+                          java - the deployment's own /mcp on the REST API (default)
+                          npm  - the separate datafye-mcp-api container on :3200
+                        Persists across upgrades, so this is the switch back if
+                        the Java server misbehaves.
   --force               Reinstall even if same version (useful for SNAPSHOT)
   --ami-cleanup         Clean up for AMI snapshot (clear keys, logs, history)
   --port <port>         Agent port (default: 18780)
@@ -267,6 +274,7 @@ if [ "$IS_UPGRADE" = true ] && [ -f "${ENV_FILE}" ]; then
     [ -z "$DNS_NAME" ]      && DNS_NAME=$(existing_env_var DATAFYE_AGENT_DNS)
     [ -z "$GITHUB_TOKEN" ]  && GITHUB_TOKEN=$(existing_env_var DATAFYE_AGENT_GITHUB_TOKEN)
     [ -z "$ACCOUNTS_URL" ]  && ACCOUNTS_URL=$(existing_env_var DATAFYE_ACCOUNTS_URL)
+    [ -z "$MCP_SERVER" ]    && MCP_SERVER=$(existing_env_var DATAFYE_AGENT_API_MCP_SERVER)
 
     # Port has a non-empty default, so "was it passed?" cannot be read off the
     # variable the way it can for the others -- the stored value wins unless the
@@ -284,6 +292,15 @@ if [ "$IS_UPGRADE" = true ] && [ -f "${ENV_FILE}" ]; then
         _stored_pinned=$(existing_env_var DATAFYE_AGENT_PINNED)
         [ "${_stored_pinned}" = "true" ] && PINNED=true
     fi
+fi
+
+# ── Validate the MCP server choice ───────────────────────────────
+# A box with no recorded choice (a fresh install, or one installed before the
+# switch existed) gets the Java server.
+MCP_SERVER="${MCP_SERVER:-java}"
+if [ "$MCP_SERVER" != "java" ] && [ "$MCP_SERVER" != "npm" ]; then
+    error "Invalid --mcp-server: $MCP_SERVER. Must be 'java' or 'npm'."
+    exit 1
 fi
 
 # ── Validate mode ────────────────────────────────────────────────
@@ -1114,7 +1131,7 @@ DATAFYE_AGENT_DNS=${DNS_NAME}
 DATAFYE_AGENT_PINNED=${PINNED}
 DATAFYE_AGENT_GITHUB_TOKEN=${GITHUB_TOKEN}
 DATAFYE_ACCOUNTS_URL=${ACCOUNTS_URL}
-DATAFYE_AGENT_API_MCP_URL=http://local-foundry-dev-mcp-api.datafye.local:3200/mcp
+DATAFYE_AGENT_API_MCP_SERVER=${MCP_SERVER}
 EOF
 chmod 600 "${ENV_FILE}"
 echo "${VERSION}" > "${INSTALL_DIR}/version"
