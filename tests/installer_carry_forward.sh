@@ -34,7 +34,7 @@ echo "== every persisted setting is read back on upgrade =="
 # Values derived from the install itself rather than from operator intent. These
 # describe the build being installed, not how this box was configured, so the NEW
 # value must win -- carrying them forward would pin a box to its first version.
-derived_regex='^DATAFYE_AGENT_(VERSION|CLI_PATH|WORKSPACE|DOCS_DIR|SAMPLES_DIR|API_MCP_URL)$'
+derived_regex='^DATAFYE_AGENT_(VERSION|CLI_PATH|WORKSPACE|DOCS_DIR|SAMPLES_DIR)$'
 
 for key in ${persisted}; do
     if [[ "${key}" =~ ${derived_regex} ]]; then
@@ -48,7 +48,7 @@ for key in ${persisted}; do
 done
 
 echo "== the settings that bit us are specifically covered =="
-for key in DATAFYE_AGENT_PINNED DATAFYE_ACCOUNTS_URL DATAFYE_AGENT_GITHUB_TOKEN; do
+for key in DATAFYE_AGENT_PINNED DATAFYE_ACCOUNTS_URL DATAFYE_AGENT_GITHUB_TOKEN DATAFYE_AGENT_API_MCP_SERVER; do
     grep -qx "${key}" <<< "${persisted}" || fail "${key} is not persisted at all"
     grep -qx "${key}" <<< "${carried}"   || fail "${key} is not carried forward"
 done
@@ -57,13 +57,17 @@ grep -qx DATAFYE_AGENT_PINNED <<< "${persisted}" \
   && ok "--pin survives a re-run (it used to silently un-pin a pinned box)"
 grep -qx DATAFYE_ACCOUNTS_URL <<< "${carried}" \
   && ok "the accounts URL survives (its absence killed the foundry on every upgrade)"
+grep -qx DATAFYE_AGENT_API_MCP_SERVER <<< "${carried}" \
+  && ok "the MCP server choice survives (it is the switch back to npm, DAT-439)"
+grep -q 'DATAFYE_AGENT_API_MCP_URL=' <(awk '/^cat > "\$\{ENV_FILE\}"/,/^EOF$/' "${TEMPLATE}") \
+  && fail "agent.env pins DATAFYE_AGENT_API_MCP_URL, which overrides the MCP server switch"
 
 echo "== a flag that exists must be persisted, or be a deliberate one-shot =="
 # Flags about THIS invocation only. Carrying them forward would re-apply an
 # instruction the operator gave once: --agent-source in particular would re-seed
 # the agent tree from a local checkout on every later upgrade, overriding the
 # version being installed.
-oneshot='--force|--ami-cleanup|--version|--agent-source|--mode|--dns|--port|--pin|--github-token|--accounts-url'
+oneshot='--force|--ami-cleanup|--version|--agent-source|--mode|--dns|--port|--pin|--github-token|--accounts-url|--mcp-server'
 for flag in $(grep -oE '^\s+--[a-z-]+\)' "${TEMPLATE}" | tr -d ' )' | sort -u); do
     if [[ "${flag}" =~ ^(${oneshot})$ ]]; then
         ok "${flag} is accounted for"
