@@ -115,9 +115,10 @@ Verified against the installer, `/health`, `prompt.py` and the system skills on
   `sizing-and-resource-cost.md`, plus `reference/foundry-resource-cost-cheatsheet.md`
 
 **App preview**
-- Apps the model builds bind the band **10010-10019** and are served at
-  `https://<username>.app.datafye.io:<port>`, the jump server routing that band straight
-  through. ⚠️ The band is deliberately **not** Sutra's 8080-8089: the Datafye platform
+- Apps the model builds bind the band **10010-10019** and the prompt hands out
+  `https://<username>.app.datafye.io:<port>`. ⚠️ **Nothing routes that yet** — see §4; the
+  jump-server half is not done, so the URL resolves nowhere.
+  ⚠️ The band is deliberately **not** Sutra's 8080-8089: the Datafye platform
   occupies the 80xx space (`rumi-solace` publishes 8080 and `rumi-influxdb` 8086 on every
   box, empty foundry or not), so the first port of an 80xx band could never bind (DAT-220).
 
@@ -231,15 +232,30 @@ are a capping wrapper over someone else's index rather than construction of ours
 | **`askQuestion`** | **no** | **yes** |
 
 `askQuestion(question, goal)` returns a **synthesized answer with links to its source
-pages**. Measured against the real thing: *"What datasets and schemas can a Datafye
-environment be provisioned with?"* came back in **672 tokens**, correct and complete —
-datasets, the per-dataset schema matrix, the Palpha same-deployment requirement, and which
-providers are marked work-in-progress. The equivalent `searchDocumentation` call cost
-**2,678 tokens** of ten page excerpts the client model then has to collate itself.
+pages**. On *"What datasets and schemas can a Datafye environment be provisioned with?"* it
+answered in **748 tokens** against **1,930** for `searchDocumentation` on the identical
+question: correct as far as could be checked, covering the datasets, the per-dataset schema
+matrix, the Palpha same-deployment requirement and which providers are work-in-progress.
 
-So on this product **`docs.ask` is the primary docs tool**, roughly four times cheaper than
-search for anything question-shaped and pre-collated, with `docs.search` / `docs.read` as
-the browse path behind it. That is a better position than the Sutra connector has.
+⚠️ **An earlier draft of this section recommended it as the primary docs tool and reported
+4x. Both were wrong, and the correction matters more than the number.**
+
+- **The 4x compared two different questions.** Measured properly, same question, it is
+  **2.6x** — 748 against 1,930.
+- **More importantly, 1,930 tokens is not a problem.** `askQuestion` looked valuable
+  because *uncapped* `searchDocumentation` can spike: on Rumi one unrequested result was
+  84% of a 5,800-token response. This design already wraps and caps. Against **capped**
+  search the advantage largely disappears, because the thing it was solving is the thing
+  the cap solves.
+- **The evidence is one call.** A synthesized answer is precisely the output class that is
+  confidently wrong, and one sample cannot detect that.
+- **It is also a model's paraphrase rather than the page**, which suits a summarisation
+  question ("which datasets exist") and suits exact literals badly — parameter names,
+  config paths, factory ids.
+
+**So use it where it fits, but do not plan around it, and do not pay for it.** Treat
+`docs.search` / `docs.read` as the primary path on both products, with `docs.ask` as a
+cheap first move for orientation questions on Datafye only.
 
 Two cautions, because a synthesized answer is not the same kind of thing as a page:
 
@@ -256,9 +272,13 @@ Cap per-result content **by default, never as a gate**: `full: true` must be ava
 because the client's tokens ride the user's own subscription rather than our bill, and the
 real constraints are token-denominated rate limits and compaction timing.
 
-**Worth raising with whoever owns the Rumi space:** `askQuestion` appears to be a per-site
-GitBook setting, since both servers run v0.27.2. Enabling it on `docs.rumi.systems` would
-make the Sutra connector's docs path four times cheaper and pre-synthesized, for free.
+**Do NOT seek it for the Rumi space.** An earlier draft recommended raising it; that is
+withdrawn. Both servers run v0.27.2, so it looked like a per-site setting, but it requires
+an **upgraded GitBook plan** (Girish, 2026-11-02) and it is **not worth paying for** on the
+evidence above. The economics also run backwards: we would pay GitBook to run a model over
+search results in order to save tokens that ride the **user's own** Pro/Max subscription,
+sparing a frontier client model the work of reading ten excerpts it can read perfectly
+well. Keep the asymmetry recorded as an observation; it is not an action.
 
 **The box keeps its on-disk docs regardless.** The agent's prompt grounds in
 `/opt/datafye/docs`, and a self-hosted box cannot depend on GitBook being up.
