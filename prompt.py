@@ -86,8 +86,14 @@ def build_system_prompt(
     cheatsheet_path: str = "",
     foundry_status: str = "",
     app_preview_base: str = "",
+    api_mcp_url: str = "",
 ) -> str:
     """Build the complete system prompt for the agent."""
+
+    # the MCP server the agent is actually configured for (DAT-439): the deployment's own
+    # /mcp on the REST port by default, or the separate npm container when switched back
+    api_mcp_url = api_mcp_url or "http://local-foundry-dev-api.datafye.local:7776/mcp"
+    mcp_on_rest_port = ":3200/" not in api_mcp_url
 
     # Report the ceiling that is ACTUALLY in force rather than the number we shipped
     # (DAT-203). `main.py` sets BASH_MAX_TIMEOUT_MS and an operator can override it in
@@ -554,7 +560,7 @@ CAPABILITIES:
 
      REST API + Swagger   http://local-foundry-dev-api.datafye.local:7776
      WebSocket            ws://local-foundry-dev-api.datafye.local:7775
-     API MCP server       http://local-foundry-dev-mcp-api.datafye.local:3200/mcp
+     API MCP server       {api_mcp_url}
      Admin console        http://local-foundry-dev-admin.datafye.local:8001
      Monitoring console   http://local-foundry-dev-monitor.datafye.local:3000
 
@@ -562,7 +568,7 @@ CAPABILITIES:
    (`local-trading-dev-api.datafye.local`, and so on). Note the API host is
    `...-dev-api...`, NOT `...-dev-api-rest...`; guessing that variant wastes a
    turn on hostnames that do not resolve. If a `--port` was given, it shifts the
-   REST port and the WebSocket port (one below it); the admin, monitor and MCP
+   REST port and the WebSocket port (one below it){' and the MCP server with the REST port' if mcp_on_rest_port else ''}; the admin, monitor{'' if mcp_on_rest_port else ' and MCP'}
    ports do not move. `cat /etc/hosts` is the authority if you are unsure.
 
    After the dataset is added, use the `datafye-api` MCP server (capability 1) to

@@ -138,14 +138,6 @@ GITHUB_USER = os.getenv("DATAFYE_AGENT_GITHUB_USER", "")
 GITHUB_TOKEN = os.getenv("DATAFYE_AGENT_GITHUB_TOKEN", "")
 GITHUB_ORG = os.getenv("DATAFYE_AGENT_GITHUB_ORG", "datafye")
 
-# Datafye API MCP server — provisioned alongside every foundry/trading
-# deployment by the CLI. The installer configures /etc/hosts so this URL
-# resolves to 127.0.0.1 on the agent machine.
-DATAFYE_API_MCP_URL = os.getenv(
-    "DATAFYE_AGENT_API_MCP_URL",
-    "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp",
-)
-
 # Datafye deployment REST API — part of the same datafye-api service the MCP
 # server fronts, but the plain HTTP REST surface (Jersey/Jetty on port 7776).
 # The CLI writes a /etc/hosts entry mapping this hostname to 127.0.0.1 on the
@@ -156,6 +148,30 @@ DATAFYE_API_MCP_URL = os.getenv(
 DATAFYE_DEPLOYMENT_API_URL = os.getenv(
     "DATAFYE_AGENT_DEPLOYMENT_API_URL",
     "http://local-foundry-dev-api.datafye.local:7776",
+)
+
+# Datafye API MCP server (DAT-439). Two exist while the Java one proves itself:
+#   java  the REST service's own /mcp, served by every deployment, whose tools
+#         are generated from the API's OpenAPI spec (the default)
+#   npm   the hand-written datafye-mcp-api server, the separate container the
+#         CLI still runs beside a local deployment on :3200
+# Switching back is one setting: DATAFYE_AGENT_API_MCP_SERVER=npm in agent.env
+# (or the installer's --mcp-server npm, which persists across upgrades), then a
+# restart. DATAFYE_AGENT_API_MCP_URL, when set, overrides both, for a box
+# pointed at some other server entirely.
+_API_MCP_SERVER_URLS = {
+    "java": DATAFYE_DEPLOYMENT_API_URL.rstrip("/") + "/mcp",
+    "npm": "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp",
+}
+DATAFYE_API_MCP_SERVER = (os.getenv("DATAFYE_AGENT_API_MCP_SERVER") or "java").strip().lower()
+if DATAFYE_API_MCP_SERVER not in _API_MCP_SERVER_URLS:
+    raise SystemExit(
+        f"DATAFYE_AGENT_API_MCP_SERVER={DATAFYE_API_MCP_SERVER!r} is not valid: "
+        f"use one of {sorted(_API_MCP_SERVER_URLS)}"
+    )
+DATAFYE_API_MCP_URL = (
+    os.getenv("DATAFYE_AGENT_API_MCP_URL")
+    or _API_MCP_SERVER_URLS[DATAFYE_API_MCP_SERVER]
 )
 
 # MCP servers (optional, for additional tooling)
@@ -1523,7 +1539,9 @@ def _tool_commentary(tool: str, tool_input: dict):
         return ("Planning the next steps", "muted")
     if tool.startswith("mcp__datafye-api__"):
         op = tool.split("mcp__datafye-api__", 1)[1].lower()
-        if any(k in op for k in ("backtest", "validate", "paper", "test")):
+        # the Java server's tools are named from the REST operations, which call a backtest
+        # fetch or replay a history fetch or a tick replay, so those words count too
+        if any(k in op for k in ("backtest", "validate", "paper", "test", "replay", "history_fetch")):
             return ("Validating against market data", "check")
         if any(k in op for k in ("provision", "deploy", "create", "morph")):
             return ("Setting up the trading environment", "notable")
@@ -1791,6 +1809,8 @@ async def stream_agent_response(
     system_prompt = build_system_prompt(
         docs_dir=DOCS_DIR,
         cli_path=CLI_PATH,
+        # the MCP server this box is switched to (DAT-439), so the prompt names the one in use
+        api_mcp_url=DATAFYE_API_MCP_URL,
         workspace_dir=cwd,
         samples_dir=SAMPLES_DIR,
         credential_summary=get_credential_summary(),
@@ -2553,8 +2573,22 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("  Fleet memory: none shipped with this build")
 
+    logger.info(f"  Datafye API MCP server: {DATAFYE_API_MCP_SERVER} ({DATAFYE_API_MCP_URL})")
     if check_api_mcp_reachable(DATAFYE_API_MCP_URL):
         logger.info(f"  Datafye API MCP: reachable at {DATAFYE_API_MCP_URL}")
+        # the java server shares the REST port, so the port answering says nothing about /mcp;
+        # a deployment older than DAT-439 answers 404 there, where the server itself answers 405
+        if DATAFYE_API_MCP_SERVER == "java":
+            try:
+                status = httpx.get(DATAFYE_API_MCP_URL, timeout=5.0).status_code
+                if status == 404:
+                    logger.warning(
+                        f"  Datafye API MCP: the deployment has no /mcp (HTTP 404), so it predates "
+                        f"the Java MCP server. Upgrade the foundry, or set "
+                        f"DATAFYE_AGENT_API_MCP_SERVER=npm in agent.env and restart."
+                    )
+            except Exception as e:
+                logger.warning(f"  Datafye API MCP: could not probe {DATAFYE_API_MCP_URL}: {e}")
     else:
         logger.warning(
             f"  Datafye API MCP: NOT REACHABLE at {DATAFYE_API_MCP_URL}. "
