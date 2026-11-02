@@ -1666,7 +1666,7 @@ and MCP hosts.
 - **Native execution**: Agent runs directly on the host (not in Docker) because it needs to manage Docker containers for Datafye environments
 - **Per-user instances**: Each user gets their own agent process (not shared)
 - **Open source agent**: Agent source is public on GitHub — the value is in the Datafye platform, not the glue code
-- **Local docs over MCP**: Datafye docs are on disk, not via a docs MCP server - faster and more reliable
+- **Local docs over MCP**: Datafye docs are on disk, not via a docs MCP server - faster and more reliable. ⚠️ **Stands for the AGENT; revisited for the connector (DAT-418).** A remote client model has no filesystem, so for that consumer docs come from GitBook's public hosted MCP (`docs.datafye.io/~gitbook/mcp`) wrapped to bound its output. The agent still reads `/opt/datafye/docs`. The reason that survives the move intact is **completeness** - GitBook offers query-and-read with no Glob or Grep, so a client cannot sweep the corpus. See `docs/DATAFYE-CONNECTOR-DESIGN.md` §5 and the fuller treatment in `PROJECT.md`
 - **Push bootstrap**: The agent learns its identity and its credentials-store encryption key from an accounts-signed JWT pushed to `POST /bootstrap` — it never reads AWS instance metadata. Accounts is the only writer in the relationship
 - **Anthropic key as a credential**: The Anthropic key is not a startup env var; it lives in the encrypted credentials store and is delivered via the credentials push channel. The agent starts and stays manageable with no key — chat just returns 503/502 until a valid key arrives
 - **Credentials via accounts**: The accounts service pushes credential updates to `/v1/credentials/update`; the old direct-write `/v1/credentials` endpoint is gone

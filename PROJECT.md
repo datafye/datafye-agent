@@ -1853,6 +1853,29 @@ The docchat backend uses a GitBook MCP server for documentation. We deliberately
 
 The docs are synced from the `datafye-docs` repo.
 
+**This decision stands for the agent, and is being revisited for a second consumer
+(DAT-418, 2026-11).** The Claude-connector design puts a remote client model in front of
+this box — one with no filesystem, for which "on disk" is not an option at all. For *that*
+consumer the docs come from GitBook's own hosted MCP (`docs.datafye.io/~gitbook/mcp`, which
+is public and unauthenticated), wrapped to bound its output. The agent keeps reading
+`/opt/datafye/docs` and nothing above changes.
+
+Worth noting how the three reasons hold up against the new consumer, because two of them
+weaken and one does not:
+
+- **Faster** — true for the agent, where a lookup is a local file read. Not a distinction
+  for a remote client, where either path is a network hop.
+- **Complete** — ⚠️ **this is the reason that survives intact, and it is the strongest.**
+  GitBook offers `searchDocumentation` and `getPage`: query-and-read, with no Glob and no
+  Grep. A client model cannot sweep the corpus the way the agent can, so a question best
+  answered by "grep for this symbol everywhere" has no good remote equivalent. The
+  connector design does not solve this; it accepts it.
+- **Reliable** — survives. GitBook becomes a third-party dependency on the critical path of
+  every docs question, so the connector degrades to this box's on-disk copy when GitBook is
+  unreachable rather than treating the hosted index as the only path.
+
+Full reasoning and the spike that settles it: `docs/DATAFYE-CONNECTOR-DESIGN.md` §5.
+
 ### Why Python-Only Algos (Not SDK/Java)?
 
 The Datafye platform has a Java-based Algo SDK for high-performance, integrated projects. We're not using it here because:
