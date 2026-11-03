@@ -203,8 +203,10 @@ class Collector:
 
     def __init__(self, gateway_url: Optional[str], token: Optional[str], model: str,
                  base_url: Optional[str] = None, age_seconds: float = DEFAULT_AGE_SECONDS,
-                 usage_sink: Optional[list] = None):
+                 usage_sink: Optional[list] = None, call_context: Optional["CallContext"] = None):
         self._gateway = (gateway_url or "").rstrip("/")
+        # Its own classification calls are metered, so they carry the turn's project and session.
+        self._context = call_context or CallContext()
         self._token = token
         self._model = model
         # Classification is a direct API call like the title sidecar, so it follows the same base
@@ -575,7 +577,8 @@ class Collector:
                 resp = await client.post(
                     f"{self._base}/v1/messages",
                     headers={"x-api-key": self._token, "anthropic-version": "2023-06-01",
-                             "content-type": "application/json"},
+                             "content-type": "application/json",
+                             **self._context.headers("activity")},
                     json={"model": self._model,
                           # 18 characters per entry is ample for its number, the longest word and the
                           # quoting around both.
@@ -729,3 +732,58 @@ def gateway_from_env(default_base: str) -> Optional[str]:
     if not base or base == default_base.rstrip("/"):
         return None
     return base
+
+
+# ── who a call is for (SUT-102 / DAT-314, SUT-99 / DAT-312) ─────────────────────────────────────
+# The gateway records these off each call's headers. Claude Code sends the session and agent ids on
+# every call it makes; the project id is ours, and the agent's direct calls send all three themselves.
+PROJECT_HEADER = "x-gateway-project-id"
+SESSION_HEADER = "x-claude-code-session-id"
+AGENT_HEADER = "x-claude-code-agent-id"
+
+
+def _header_value(value) -> Optional[str]:
+    """A value that can travel as a header, or None. `ANTHROPIC_CUSTOM_HEADERS` is newline-separated,
+    so an unprintable id would not just be dropped, it could inject a second header."""
+    value = str(value or "").strip()
+    return value if value and value.isprintable() else None
+
+
+class CallContext:
+    """Who one turn's model calls are for: its project, and the SDK session it runs in.
+
+    ⚠️ One per TURN, never process-wide. Turns run concurrently as their own tasks, so a project id
+    set on the process would attribute one project's calls to another. The SDK subprocess gets it
+    through `ClaudeAgentOptions.env`, which applies to that invocation alone; the direct calls take
+    it as headers.
+
+    Off the gateway this sends nothing: the ids are the gateway's business, not the provider's.
+    """
+
+    def __init__(self, project_id: Optional[str] = None, session_id: Optional[str] = None,
+                 on_gateway: bool = False):
+        self.project_id = _header_value(project_id)
+        # Known up front on a resumed project; otherwise set from the SDK's init message.
+        self.session_id = _header_value(session_id)
+        self.on_gateway = on_gateway
+
+    def set_session(self, session_id: Optional[str]) -> None:
+        self.session_id = _header_value(session_id) or self.session_id
+
+    def sdk_env(self) -> dict:
+        """The environment the SDK subprocess adds to every call it makes."""
+        if not (self.on_gateway and self.project_id):
+            return {}
+        return {"ANTHROPIC_CUSTOM_HEADERS": "%s: %s" % (PROJECT_HEADER, self.project_id)}
+
+    def headers(self, caller: str) -> dict:
+        """Headers for one of the agent's direct calls. ``caller`` names it on the trail's agent id
+        (``sidecar:title``, ...), so a side-call is told apart from the SDK's own calls and subagents."""
+        if not self.on_gateway:
+            return {}
+        out = {AGENT_HEADER: "sidecar:%s" % caller}
+        if self.session_id:
+            out[SESSION_HEADER] = self.session_id
+        if self.project_id:
+            out[PROJECT_HEADER] = self.project_id
+        return out
