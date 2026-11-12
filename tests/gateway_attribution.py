@@ -105,6 +105,9 @@ def main_():
     os.environ["ANTHROPIC_CUSTOM_HEADERS"] = "x-route: blue"
     check(on.sdk_env() == {"ANTHROPIC_CUSTOM_HEADERS": f"x-route: blue\n{P}: proj-a"},
           "custom headers the box already sets are kept, with the project line added")
+    os.environ["ANTHROPIC_CUSTOM_HEADERS"] = f"x-route: blue\n{P}: box-default"
+    check(on.sdk_env() == {"ANTHROPIC_CUSTOM_HEADERS": f"x-route: blue\n{P}: proj-a"},
+          "a project line the box already sets is REPLACED: the gateway reads the first one")
     del os.environ["ANTHROPIC_CUSTOM_HEADERS"]
     flag = [True]
     moving = activity.CallContext("proj-a", on_gateway=lambda: flag[0])
@@ -125,8 +128,25 @@ def main_():
     asyncio.run(collector._ask([("msg_x", {"tools": ["Bash"], "texts": [], "thinking": []})]))
     sides = [h for path, h in SEEN if path == "/v1/messages"]
     agents = [h.get(A) for h in sides]
+    # The classifier's URL is fixed when the turn begins, so it sends the ids only when THAT URL is
+    # the gateway, whatever the box is on by now: after a mid-turn bootstrap the two disagree.
+    SEEN.clear()
+    moved_on = activity.Collector(gateway_url="http://the-new-gateway", token="tok",
+                                  model="claude-haiku-4-5", base_url=gw, call_context=ctx)
+    asyncio.run(moved_on._ask([("msg_y", {"tools": ["Bash"], "texts": [], "thinking": []})]))
+    check(SEEN and P not in SEEN[-1][1] and S not in SEEN[-1][1],
+          "a classifier posting to a URL that is not its gateway sends no ids")
+    SEEN.clear()
+    moved_off = activity.CallContext("proj-a", on_gateway=False)
+    moved_off.set_session("sess-a")
+    asyncio.run(activity.Collector(gateway_url=gw, token="tok", model="claude-haiku-4-5",
+                                   base_url=gw, call_context=moved_off)._ask(
+        [("msg_z", {"tools": ["Bash"], "texts": [], "thinking": []})]))
+    check(SEEN and SEEN[-1][1].get(P) == "proj-a",
+          "and one still posting to its gateway keeps sending them, so those calls stay attributed")
+
     check(agents == ["sidecar:title", "sidecar:satisfaction", "sidecar:environment-intent",
-                     "sidecar:activity"], f"all four direct calls reached the gateway, named ({agents})")
+                     "sidecar:activity"], f"every direct call reached the gateway, named ({agents})")
     check(all(h.get(S) == "sess-a" and h.get(P) == "proj-a" for h in sides),
           "every direct call carries the turn's session and project")
 

@@ -36,6 +36,7 @@ class StubCollector(activity.Collector):
     """
 
     def __init__(self, replies=None, **kw):
+        kw.setdefault("call_context", activity.CallContext())
         kw.setdefault("gateway_url", "http://gw")
         kw.setdefault("token", "gwt1.test")
         kw.setdefault("model", "haiku")
@@ -421,6 +422,7 @@ class ReplyCollector(activity.Collector):
     the code under test. Each element of `replies` is the gateway's JSON for one push."""
 
     def __init__(self, replies, **kw):
+        kw.setdefault("call_context", activity.CallContext())
         kw.setdefault("gateway_url", "http://gw")
         kw.setdefault("token", "gwt1.test")
         kw.setdefault("model", "haiku")

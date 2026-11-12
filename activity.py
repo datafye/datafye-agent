@@ -203,11 +203,11 @@ class Collector:
 
     def __init__(self, gateway_url: Optional[str], token: Optional[str], model: str,
                  base_url: Optional[str] = None, age_seconds: float = DEFAULT_AGE_SECONDS,
-                 usage_sink: Optional[list] = None, call_context: Optional["CallContext"] = None):
+                 usage_sink: Optional[list] = None, *, call_context: "CallContext"):
         self._gateway = (gateway_url or "").rstrip("/")
-        # Its own classification calls are metered, so they carry the turn's project and session. The
-        # turn always passes one; the default (off the gateway, so no headers) is for tests.
-        self._context = call_context or CallContext()
+        # Its own classification calls are metered, so they carry the turn's project and session.
+        # Required: a Collector built without one would classify through the gateway unattributed.
+        self._context = call_context
         self._token = token
         self._model = model
         # Classification is a direct API call like the title sidecar, so it follows the same base
@@ -577,7 +577,12 @@ class Collector:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post(
                     f"{self._base}/v1/messages",
-                    headers=direct_call_headers(self._token, self._context, "activity"),
+                    # ⚠️ The ids go only where THIS call goes. Its URL was fixed when the turn
+                    # began, so "is the box on the gateway now" would be the wrong question: after a
+                    # mid-turn bootstrap the two disagree, and the ids would reach the provider.
+                    headers=direct_call_headers(
+                        self._token, self._context, "activity",
+                        on_gateway=bool(self._gateway) and self._base == self._gateway),
                     json={"model": self._model,
                           # 18 characters per entry is ample for its number, the longest word and the
                           # quoting around both.
@@ -796,14 +801,17 @@ class CallContext:
         every call behind the gateway and keep them everywhere else."""
         if not (self.on_gateway and self.project_id):
             return {}
-        line = "%s: %s" % (PROJECT_HEADER, self.project_id)
-        existing = (os.environ.get("ANTHROPIC_CUSTOM_HEADERS") or "").strip()
-        return {"ANTHROPIC_CUSTOM_HEADERS": existing + "\n" + line if existing else line}
+        # A project line already in the box's own headers is REPLACED, not kept beside ours: the
+        # gateway reads the first value, so a box-wide one would bill every turn to one project.
+        kept = [h for h in (os.environ.get("ANTHROPIC_CUSTOM_HEADERS") or "").splitlines()
+                if h.strip() and h.split(":", 1)[0].strip().lower() != PROJECT_HEADER]
+        return {"ANTHROPIC_CUSTOM_HEADERS": "\n".join(kept + ["%s: %s" % (PROJECT_HEADER, self.project_id)])}
 
-    def headers(self, caller: str) -> dict:
+    def headers(self, caller: str, on_gateway: Optional[bool] = None) -> dict:
         """Headers for one of the agent's direct calls. ``caller`` names it on the trail's agent id
-        (``sidecar:title``, ...), so a side-call is told apart from the SDK's own calls and subagents."""
-        if not self.on_gateway:
+        (``sidecar:title``, ...), so a side-call is told apart from the SDK's own calls and subagents.
+        ``on_gateway`` overrides the context's own answer for a caller whose URL is fixed separately."""
+        if not (self.on_gateway if on_gateway is None else on_gateway):
             return {}
         out = {AGENT_HEADER: "sidecar:%s" % caller}
         if self.session_id:
@@ -813,10 +821,11 @@ class CallContext:
         return out
 
 
-def direct_call_headers(api_key: str, context: CallContext, caller: str) -> dict:
+def direct_call_headers(api_key: str, context: CallContext, caller: str,
+                        on_gateway: Optional[bool] = None) -> dict:
     """Every header one of the agent's own model calls sends.
 
     The ONE place they are built, and the context is required: a direct call that skipped it would
     be the one call in the turn the gateway cannot attribute, with nothing to say so."""
     return {"x-api-key": api_key, "anthropic-version": "2023-06-01",
-            "content-type": "application/json", **context.headers(caller)}
+            "content-type": "application/json", **context.headers(caller, on_gateway)}
