@@ -74,6 +74,7 @@ async def run(runs):
         print("SKIP: no ANTHROPIC_API_KEY / DATAFYE_AGENT_ANTHROPIC_API_KEY set")
         return 0
     c = activity.Collector(gateway_url=None, token=os.environ["ANTHROPIC_API_KEY"],
+                           call_context=activity.CallContext(),
                            model=os.environ.get("DATAFYE_AGENT_TITLE_MODEL", "claude-haiku-4-5"),
                            base_url=os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com")
     failed = 0

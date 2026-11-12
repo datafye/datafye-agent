@@ -203,8 +203,11 @@ class Collector:
 
     def __init__(self, gateway_url: Optional[str], token: Optional[str], model: str,
                  base_url: Optional[str] = None, age_seconds: float = DEFAULT_AGE_SECONDS,
-                 usage_sink: Optional[list] = None):
+                 usage_sink: Optional[list] = None, *, call_context: "CallContext"):
         self._gateway = (gateway_url or "").rstrip("/")
+        # Its own classification calls are metered, so they carry the turn's project and session.
+        # Required: a Collector built without one would classify through the gateway unattributed.
+        self._context = call_context
         self._token = token
         self._model = model
         # Classification is a direct API call like the title sidecar, so it follows the same base
@@ -574,8 +577,12 @@ class Collector:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post(
                     f"{self._base}/v1/messages",
-                    headers={"x-api-key": self._token, "anthropic-version": "2023-06-01",
-                             "content-type": "application/json"},
+                    # ⚠️ The ids go only where THIS call goes. Its URL was fixed when the turn
+                    # began, so "is the box on the gateway now" would be the wrong question: after a
+                    # mid-turn bootstrap the two disagree, and the ids would reach the provider.
+                    headers=direct_call_headers(
+                        self._token, self._context, "activity",
+                        on_gateway=bool(self._gateway) and self._base == self._gateway),
                     json={"model": self._model,
                           # 18 characters per entry is ample for its number, the longest word and the
                           # quoting around both.
@@ -729,3 +736,96 @@ def gateway_from_env(default_base: str) -> Optional[str]:
     if not base or base == default_base.rstrip("/"):
         return None
     return base
+
+
+# ── who a call is for (SUT-102 / DAT-314, SUT-99 / DAT-312) ─────────────────────────────────────
+# The gateway records these off each call's headers. Claude Code sends the session and agent ids on
+# every call it makes; the project id is ours, and the agent's direct calls send all three themselves.
+PROJECT_HEADER = "x-gateway-project-id"
+SESSION_HEADER = "x-claude-code-session-id"
+AGENT_HEADER = "x-claude-code-agent-id"
+# The gateway refuses a longer project id (it records the call with no project rather than cut it
+# short), so one that long is not sent at all.
+MAX_PROJECT_ID_LENGTH = 128
+
+
+def _header_value(value, limit: Optional[int] = None) -> Optional[str]:
+    """A value that can travel as a header, or None.
+
+    ASCII and printable, both: `ANTHROPIC_CUSTOM_HEADERS` is newline-separated, so a newline would
+    inject a second header, and a non-ASCII value is not a legal header value: Node (under Claude
+    Code) refuses a character past U+00FF, failing the SDK's call, and httpx raises on it in a direct
+    call."""
+    value = str(value or "").strip()
+    if not value or not (value.isascii() and value.isprintable()):
+        return None
+    if limit is not None and len(value) > limit:
+        return None
+    return value
+
+
+class CallContext:
+    """Who one turn's model calls are for: its project, and the SDK session it runs in.
+
+    ⚠️ One per TURN, never process-wide. Turns run concurrently as their own tasks, so a project id
+    set on the process would attribute one project's calls to another. The SDK subprocess gets it
+    through `ClaudeAgentOptions.env`, which applies to that invocation alone; the direct calls take
+    it as headers.
+
+    Off the gateway this sends nothing: the ids are the gateway's business, not the provider's.
+    ``on_gateway`` may be a callable, and the turn passes one: a bootstrap can move the box on or off
+    the gateway mid-turn, and the direct calls follow `ANTHROPIC_BASE_URL` at the moment they run, so
+    the question has to be asked then too.
+    """
+
+    def __init__(self, project_id: Optional[str] = None, on_gateway=False):
+        self.project_id = _header_value(project_id, MAX_PROJECT_ID_LENGTH)
+        # ⚠️ Only from the SDK's own init message, never seeded from the id being resumed: if the
+        # subprocess dies before init, this turn's calls belong to no session rather than to the
+        # previous run's.
+        self.session_id = None
+        self._on_gateway = on_gateway
+
+    @property
+    def on_gateway(self) -> bool:
+        return bool(self._on_gateway() if callable(self._on_gateway) else self._on_gateway)
+
+    def set_session(self, session_id: Optional[str]) -> None:
+        self.session_id = _header_value(session_id) or self.session_id
+
+    def sdk_env(self) -> dict:
+        """The environment the SDK subprocess adds to every call it makes.
+
+        ADDED to any custom headers the box already sets, never replacing them: the SDK lays
+        `options.env` over the process environment, so a bare assignment would silently drop them on
+        every call behind the gateway and keep them everywhere else."""
+        if not (self.on_gateway and self.project_id):
+            return {}
+        # A project line already in the box's own headers is REPLACED, not kept beside ours: the
+        # gateway reads the first value, so a box-wide one would bill every turn to one project.
+        kept = [h for h in (os.environ.get("ANTHROPIC_CUSTOM_HEADERS") or "").splitlines()
+                if h.strip() and h.split(":", 1)[0].strip().lower() != PROJECT_HEADER]
+        return {"ANTHROPIC_CUSTOM_HEADERS": "\n".join(kept + ["%s: %s" % (PROJECT_HEADER, self.project_id)])}
+
+    def headers(self, caller: str, on_gateway: Optional[bool] = None) -> dict:
+        """Headers for one of the agent's direct calls. ``caller`` names it on the trail's agent id
+        (``sidecar:title``, ...), so a side-call is told apart from the SDK's own calls and subagents.
+        ``on_gateway`` overrides the context's own answer for a caller whose URL is fixed separately."""
+        if not (self.on_gateway if on_gateway is None else on_gateway):
+            return {}
+        out = {AGENT_HEADER: "sidecar:%s" % caller}
+        if self.session_id:
+            out[SESSION_HEADER] = self.session_id
+        if self.project_id:
+            out[PROJECT_HEADER] = self.project_id
+        return out
+
+
+def direct_call_headers(api_key: str, context: CallContext, caller: str,
+                        on_gateway: Optional[bool] = None) -> dict:
+    """Every header one of the agent's own model calls sends.
+
+    The ONE place they are built, and the context is required: a direct call that skipped it would
+    be the one call in the turn the gateway cannot attribute, with nothing to say so."""
+    return {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+            "content-type": "application/json", **context.headers(caller, on_gateway)}

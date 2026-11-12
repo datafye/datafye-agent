@@ -97,6 +97,7 @@ datafye-agent/
 ├── plugins/datafye/ # System (predefined) skills, installer-managed/read-only — ship with the app clone
 ├── tests/sanity_e2e.py  # Manual end-to-end sanity suite (real agent + real model calls; not CI)
 ├── tests/activity_labelling.py  # Offline checks over activity.py's batching, retries and discards
+├── tests/gateway_attribution.py # Offline: every model call a turn makes carries its project + session to the gateway
 ├── tests/activity_classifier.py # The classifier against a real model (a cent a run)
 ├── tests/usage_by_model.py      # Per-model usage, and old stage-keyed records keep their numbers
 ├── tests/test_prompt_audit.py  # Dependency-free prompt audit; renders the REAL prompt and pins every claim that has been wrong
@@ -1257,6 +1258,36 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
   live with real money"), never on a stage variable. Its lifecycle prose is static teaching that was
   never fed by the classifier, and still says a non-trading build "ends at Ship" (harmless, but
   out of step with the vocabulary).
+
+### Which project and session a call was for (DAT-314 / DAT-312)
+
+Every model call a turn makes tells the metering gateway its project (the conversation id) and SDK
+session, so the gateway can attribute cost per project and a per-session view is complete.
+
+- `activity.CallContext` holds them, **one per turn**. Turns run concurrently as their own tasks, so a
+  project id set on the process would attribute one project's calls to another.
+- The SDK subprocess gets the project through `ClaudeAgentOptions.env` →
+  `ANTHROPIC_CUSTOM_HEADERS: x-gateway-project-id: <id>`, which applies to that invocation only.
+  Claude Code sends the session and agent ids itself.
+- The direct calls (`generate_title`, `analyze_satisfaction`, `classify_environment_intent`,
+  the activity classifier's `_ask`; `git grep direct_call_headers` is the list) send the project,
+  session and agent headers themselves. Their agent id is
+  `sidecar:<name>`, which tells them apart on the trail. All of them build their headers with
+  `activity.direct_call_headers(key, call_context, name)`, and `call_context` is a REQUIRED keyword:
+  a new direct model call that skipped it would be the one call the gateway cannot attribute.
+- The session id comes ONLY from the SDK's `init` message, never from the id being resumed: if the
+  subprocess dies before `init`, the side-calls carry no session rather than the previous run's.
+- Off the gateway nothing is sent: the ids are the gateway's business, not the provider's. That is
+  asked at EACH call, since a bootstrap can move the box on or off the gateway mid-turn.
+- An id that is not ASCII and printable, or is longer than `MAX_PROJECT_ID_LENGTH` (the gateway's limit), is dropped rather than
+  sent: `ANTHROPIC_CUSTOM_HEADERS` is newline-separated (a newline would inject a header), and a
+  non-ASCII value is not a legal header value (Node refuses characters past U+00FF, so the SDK call fails).
+- The project line is ADDED to any `ANTHROPIC_CUSTOM_HEADERS` the box already sets, and replaces
+  a project line already there (the gateway reads the first).
+- The activity classifier's URL is fixed when the turn begins, so it sends the ids only when THAT URL
+  is its gateway, not when the box is on one now.
+- `tests/gateway_attribution.py` drives a real turn with the SDK faked and checks the wiring, including
+  two turns on different projects running at once (a threaded stub proves their calls overlapped).
 
 ## Environment Variables
 
