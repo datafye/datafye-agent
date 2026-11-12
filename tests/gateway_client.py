@@ -70,7 +70,7 @@ def main_():
     status = main._validate_anthropic_key(os.environ["ANTHROPIC_API_KEY"])
     check(status == "ok" and SEEN[-1][:2] == ("GET", "/v1/models"), f"key check goes to the gateway ({status})")
 
-    title = asyncio.run(main.generate_title("Backtest a momentum strategy on SPY"))
+    title = asyncio.run(main.generate_title("Backtest a momentum strategy on SPY", call_context=main.activity_labels.CallContext("proj-x", on_gateway=True)))
     check(bool(SEEN) and SEEN[-1][:2] == ("POST", "/v1/messages"), "title side-call goes to the gateway")
     check(SEEN[-1][2] == os.environ["ANTHROPIC_API_KEY"], "side-call presents the gateway token")
     check(title is not None, f"side-call result is used ({title!r})")

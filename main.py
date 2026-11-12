@@ -795,7 +795,7 @@ _TITLE_PROMPT = (
 
 
 async def generate_title(first_message: str, usage_sink: Optional[list] = None,
-                         call_context: Optional[activity_labels.CallContext] = None) -> Optional[str]:
+                         *, call_context: activity_labels.CallContext) -> Optional[str]:
     """Summarize the user's first message into a short project title via a
     cheap model call (direct Anthropic API, the key is already in the env).
     Returns None on any failure, in which case the caller keeps the provisional
@@ -811,13 +811,8 @@ async def generate_title(first_message: str, usage_sink: Optional[list] = None,
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 f"{_anthropic_base()}/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                    # The turn's project and session, so the gateway files this call with it (DAT-312/314).
-                    **(call_context or activity_labels.CallContext()).headers("title"),
-                },
+                # With the turn's project and session, so the gateway files this call with it.
+                headers=activity_labels.direct_call_headers(key, call_context, "title"),
                 json={
                     "model": TITLE_MODEL,
                     "max_tokens": 24,
@@ -892,7 +887,7 @@ _ENVIRONMENT_INTENT_PROMPT = (
 
 async def classify_environment_intent(transcript: str,
                                       usage_sink: Optional[list] = None,
-                                      call_context: Optional[activity_labels.CallContext] = None) -> Optional[str]:
+                                      *, call_context: activity_labels.CallContext) -> Optional[str]:
     """Infer a standing decision about the environment the model did not report.
 
     The safety net under `set_environment_intent` (DAT-214). A prompt rule asks
@@ -914,13 +909,8 @@ async def classify_environment_intent(transcript: str,
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
                 f"{_anthropic_base()}/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                    # The turn's project and session, so the gateway files this call with it (DAT-312/314).
-                    **(call_context or activity_labels.CallContext()).headers("environment-intent"),
-                },
+                # With the turn's project and session, so the gateway files this call with it.
+                headers=activity_labels.direct_call_headers(key, call_context, "environment-intent"),
                 json={
                     "model": TITLE_MODEL,
                     "max_tokens": 150,
@@ -988,7 +978,7 @@ def _recent_transcript(messages: list, limit: int = 12) -> str:
 
 
 async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = None,
-                               call_context: Optional[activity_labels.CallContext] = None) -> Optional[dict]:
+                               *, call_context: activity_labels.CallContext) -> Optional[dict]:
     """Infer the user's satisfaction (1-5) + a short reason from the conversation,
     via a cheap direct model call (like generate_title). Best-effort: returns
     {"rank": int, "reasons": str} or None on any failure / unparseable reply."""
@@ -1000,13 +990,8 @@ async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = Non
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
                 f"{_anthropic_base()}/v1/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                    # The turn's project and session, so the gateway files this call with it (DAT-312/314).
-                    **(call_context or activity_labels.CallContext()).headers("satisfaction"),
-                },
+                # With the turn's project and session, so the gateway files this call with it.
+                headers=activity_labels.direct_call_headers(key, call_context, "satisfaction"),
                 json={
                     "model": TITLE_MODEL,
                     "max_tokens": 200,
@@ -1853,7 +1838,8 @@ async def stream_agent_response(
     # Per turn: turns run concurrently, so a project id on the process would mis-attribute one.
     call_context = activity_labels.CallContext(
         project_id=conversation_id,
-        on_gateway=activity_labels.gateway_from_env(_DEFAULT_ANTHROPIC_BASE) is not None)
+        # Asked at each call, not once: a bootstrap can move the box on or off the gateway mid-turn.
+        on_gateway=lambda: activity_labels.gateway_from_env(_DEFAULT_ANTHROPIC_BASE) is not None)
 
     options = ClaudeAgentOptions(
         model=CLAUDE_MODEL,
@@ -1902,7 +1888,6 @@ async def stream_agent_response(
         resume_id = conversations.get_sdk_session(conversation_id) or sessions.get(conversation_id)
         if resume_id:
             options.resume = resume_id
-            call_context.set_session(resume_id)
             logger.info(f"Resuming session for conversation {conversation_id}")
 
     logger.info(f"[TRACE] === Starting Agent Query ===")
@@ -2352,7 +2337,7 @@ async def stream_agent_response(
         # words name with an LLM-summarized title. The app adopts it (sidebar +
         # accounts registry). Best-effort — a failure keeps the provisional name.
         if conversation_id and is_first_turn:
-            title = await generate_title(message, sidecar_usage, call_context)
+            title = await generate_title(message, sidecar_usage, call_context=call_context)
             if title:
                 conversations.rename(conversation_id, title)
                 yield sse_event('title', {'conversation_id': conversation_id, 'name': title})
@@ -2367,7 +2352,7 @@ async def stream_agent_response(
         if conversation_id and auth_token and AGENT_USERNAME:
             rec2 = conversations.get(conversation_id) or {}
             transcript = _recent_transcript(rec2.get("messages") or [])
-            sat = await analyze_satisfaction(transcript, sidecar_usage, call_context)
+            sat = await analyze_satisfaction(transcript, sidecar_usage, call_context=call_context)
             if sat:
                 conversations.set_satisfaction(conversation_id, sat["rank"], sat["reasons"], "inferred")
                 await _report_satisfaction_to_accounts(
@@ -2382,7 +2367,7 @@ async def stream_agent_response(
             if turn_key in _intent_recorded_this_turn:
                 _intent_recorded_this_turn.discard(turn_key)
             else:
-                intended = await classify_environment_intent(transcript, sidecar_usage, call_context)
+                intended = await classify_environment_intent(transcript, sidecar_usage, call_context=call_context)
                 if intended:
                     await _report_foundry_intent_to_accounts(intended, "inferred", auth_token)
 

@@ -1271,15 +1271,19 @@ session, so the gateway can attribute cost per project and a per-session view is
   Claude Code sends the session and agent ids itself.
 - The four direct calls (`generate_title`, `analyze_satisfaction`, `classify_environment_intent`,
   the activity classifier's `_ask`) send all three headers themselves. Their agent id is
-  `sidecar:<name>`, which tells them apart on the trail. A **new** direct model call must take the
-  turn's `call_context` too, or it is the one call in the turn the gateway cannot attribute.
-- The session id comes from the resumed session, then from the SDK's `init` message, so the
-  side-calls after the stream always have it.
-- Off the gateway nothing is sent: the ids are the gateway's business, not the provider's. An id that
-  is not printable is dropped rather than sent, because `ANTHROPIC_CUSTOM_HEADERS` is
-  newline-separated and a newline would inject a header.
+  `sidecar:<name>`, which tells them apart on the trail. All of them build their headers with
+  `activity.direct_call_headers(key, call_context, name)`, and `call_context` is a REQUIRED keyword:
+  a new direct model call that skipped it would be the one call the gateway cannot attribute.
+- The session id comes ONLY from the SDK's `init` message, never from the id being resumed: if the
+  subprocess dies before `init`, the side-calls carry no session rather than the previous run's.
+- Off the gateway nothing is sent: the ids are the gateway's business, not the provider's. That is
+  asked at EACH call, since a bootstrap can move the box on or off the gateway mid-turn.
+- An id that is not ASCII and printable, or is longer than the gateway's 128, is dropped rather than
+  sent: `ANTHROPIC_CUSTOM_HEADERS` is newline-separated (a newline would inject a header), and a
+  non-ASCII value is not a legal header value (Node refuses characters past U+00FF, so the SDK call fails).
+- The project line is ADDED to any `ANTHROPIC_CUSTOM_HEADERS` the box already sets, never replacing it.
 - `tests/gateway_attribution.py` drives a real turn with the SDK faked and checks the wiring, including
-  two concurrent turns on different projects.
+  two turns on different projects running at once (a threaded stub proves their calls overlapped).
 
 ## Environment Variables
 
