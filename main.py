@@ -226,9 +226,9 @@ os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 #
 # ⚠️ That was PATH CLI 2.1.226, but a turn actually runs the SDK's BUNDLED CLI
 # (`_find_cli` prefers `claude_agent_sdk/_bundled/claude` over `which claude`),
-# which for the current pin is 2.1.85. The bundled binary would not run on the
-# dev Mac, so this is UNVERIFIED on the version that ships -- re-check on a box
-# if long commands still get backgrounded.
+# which is pinned with the SDK in requirements.txt (DAT-486: 0.2.152 bundles 2.1.259) and checked by
+# the installer. Not yet re-verified on that version -- re-check on a box if long commands still get
+# backgrounded.
 os.environ.setdefault("BASH_MAX_TIMEOUT_MS", os.getenv("DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS", "1800000"))
 
 # The largest single message the SDK will accept off the CLI's stdout (DAT-204).
@@ -2745,7 +2745,9 @@ async def bom():
     liveness one — and /health is polled every minute by the upgrade cron, by
     accounts for dormancy, and by the SPA, so it is the wrong place to add
     anything that ever costs more than reading a variable."""
-    harness_info = harness.describe()
+    # In a worker thread: the first probe forks a ~300 MB binary (up to a minute on a cold volume),
+    # and run inline it would stall every turn streaming on this event loop meanwhile.
+    harness_info = await asyncio.to_thread(harness.describe)
     try:
         with open(BOM_PATH) as f:
             document = json.load(f)
