@@ -1125,14 +1125,6 @@ def _model_label(model: str) -> str:
     return (model or "").strip() or "unknown"
 
 
-def _turn_index(conversation_id: str) -> int:
-    """A stable per-conversation turn number (count of assistant messages),
-    used with the session id to form the idempotency key."""
-    rec = conversations.get(conversation_id) or {}
-    msgs = rec.get("messages") or []
-    return sum(1 for m in msgs if (m or {}).get("role") == "assistant")
-
-
 # Label flushes started from an interrupted turn's `finally`. Held only so the task is not collected
 # before it finishes; the callback drops it again and reads any exception so nothing is left
 # unretrieved.
@@ -1890,6 +1882,14 @@ async def stream_agent_response(
             options.resume = resume_id
             logger.info(f"Resuming session for conversation {conversation_id}")
 
+    # This turn's usage is measured against the session's running total AS IT WAS when the turn began
+    # (SUT-95 / DAT-306): two turns on one project resume from the same point, so each subtracts that
+    # point rather than whatever the other saved meanwhile. And it is keyed by its own id, never by a
+    # count of saved replies, which a turn that ends with no reply does not move.
+    usage_start = conversations.usage_baseline(conversation_id)
+    resumed_from = getattr(options, "resume", None) or None
+    turn_uid = uuid.uuid4().hex[:12]
+
     logger.info(f"[TRACE] === Starting Agent Query ===")
     logger.info(f"[TRACE] Model: {CLAUDE_MODEL}")
     logger.info(f"[TRACE] Algo: {algo_id}")
@@ -2395,14 +2395,20 @@ async def stream_agent_response(
                 # each call and tells the gateway; it does not apportion usage across activities,
                 # because the gateway meters every call exactly and now knows its activity, so the
                 # MEASURED breakdown belongs there (DAT-319).
-                base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
+                # ⚠️ Keyed by this turn's own id: the count of saved replies it used to use does not move
+                # on a turn that ends without one (an API error, a max-turns stop), so that turn shared
+                # the previous turn's key and was dropped as a duplicate.
+                base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{turn_uid}"
                 # ⚠️ The CLI's model_usage and total_cost_usd are CUMULATIVE for a resumed session
-                # (SUT-95 / DAT-306): reported verbatim, turn N re-reported turns 1..N. Take this
-                # turn's own share, against the running total last seen for the session.
+                # (SUT-95 / DAT-306). This turn's own share is measured against the running total
+                # snapshotted when the turn began; see conversations.turn_usage for when it is not.
                 cli_model_usage = result_metrics.get('model_usage')
-                model_usage, turn_cost = conversations.take_turn_usage(
-                    conversation_id, result_metrics.get('session_id'), cli_model_usage,
+                model_usage, turn_cost, usage_verdict = conversations.turn_usage(
+                    usage_start, result_metrics.get('session_id'), resumed_from, cli_model_usage,
                     result_metrics.get('cost_usd'))
+                if usage_verdict not in (conversations.COUNTED, conversations.FLAT):
+                    logger.warning("[usage] %s: this turn's usage is not reported (%s)",
+                                   conversation_id, usage_verdict)
                 updated_usage = None
                 # Whole-turn roll-up (across every model + the Haiku sidecars),
                 # tagged onto the final reply so the accounts Conversation view
@@ -2410,33 +2416,36 @@ async def stream_agent_response(
                 turn_usage = {k: 0 for k in _TURN_USAGE_FIELDS}
 
                 if isinstance(cli_model_usage, dict) and cli_model_usage:
-                    # Preferred path: this turn's own usage per model (summed across the turn's
-                    # agentic loop by the CLI; the session's earlier turns taken off above), every
-                    # token type incl. cache read/create, plus each model's own cost. One delta per
-                    # model, idempotency-keyed per model so a multi-model turn (e.g. Opus main loop
-                    # + an internal Haiku) lands in the right cells without double-counting on retry.
+                    # This turn's own usage per model (summed across the turn's agentic loop by the
+                    # CLI, the session's earlier turns taken off), every token type, plus each model's
+                    # own cost. tool_calls + turns are turn-level, so they go once, to the primary
+                    # model (or the first model if the configured one did not run this turn).
                     primary = _model_label(CLAUDE_MODEL)
                     attributed_extras = False
-                    for model_id, entry in model_usage.items():
+                    deltas = {}
+                    for model_id, entry in (model_usage or {}).items():
                         delta = _usage_delta_from_model_entry(entry if isinstance(entry, dict) else {})
-                        # tool_calls + turns are turn-level, not per-model -- add
-                        # them once, to the primary model (or the first model if
-                        # the configured one didn't run this turn).
                         if not attributed_extras and (model_id == primary or primary not in model_usage):
                             delta['tool_calls'] = int(tool_calls_this_turn or 0)
                             delta['turns'] = int(result_metrics.get('num_turns') or 0)
                             attributed_extras = True
-                        idem = f"{base_idem}:{model_id}"
+                        deltas[model_id] = delta
+                    # ONE write for the deltas AND the new running total, even when there is nothing to
+                    # report (a running total that could not be trusted is still the next turn's start).
+                    updated_usage = conversations.commit_turn_usage(
+                        conversation_id, result_metrics.get('session_id'), cli_model_usage,
+                        result_metrics.get('cost_usd'), deltas, base_idem)
+                    for model_id, delta in deltas.items():
                         _accumulate_turn_usage(turn_usage, delta)
-                        updated_usage = conversations.add_usage(conversation_id, model_id, delta, idem)
-                        await _report_usage_to_accounts(conversation_id, model_id, delta, idem, auth_token)
+                        await _report_usage_to_accounts(conversation_id, model_id, delta,
+                                                        f"{base_idem}:{model_id}", auth_token)
                     logger.info("[usage] %s: turn attributed across %d model(s): %s",
-                                conversation_id, len(model_usage), list(model_usage.keys()))
-                else:
-                    # Fallback (CLI emitted no modelUsage): the flat single-usage
-                    # read + total cost, attributed to the configured model. This
-                    # undercounts multi-step turns -- kept only so usage tracking
-                    # degrades gracefully rather than vanishing.
+                                conversation_id, len(deltas), list(deltas.keys()))
+                elif usage_verdict == conversations.FLAT:
+                    # Degraded path (the CLI emitted no modelUsage) on a session's FIRST turn, the only
+                    # case where the flat usage is known to be this turn's alone. It reflects only the
+                    # final model call, so it undercounts a multi-step turn; kept so tracking degrades
+                    # rather than vanishing.
                     delta = _usage_delta(dict(result_metrics, cost_usd=turn_cost), tool_calls_this_turn)
                     model_id = _model_label(CLAUDE_MODEL)
                     idem = f"{base_idem}:{model_id}"
