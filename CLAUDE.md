@@ -1189,9 +1189,11 @@ agent POSTs /gateway/label                   ─┘  → gateway releases the re
 - **The traps are named in the prompt** (`activity._PROMPT`): a backtest is not Validate, advice about
   going live is not Deploy, a bare acknowledgement takes the activity of what it wraps up.
   `tests/activity_classifier.py` checks them against a real model (a cent a run).
-- **Batches go on whichever comes first**: 25 calls, the oldest call passing 60 s, or the end of the
-  turn. The 60 s is also the cadence reported to the gateway, which sizes its hold from it. A
-  twelve-hour turn therefore still reports within a minute, and a Stop or crash loses at most the
+- **Batches go on whichever comes first**: 25 calls, the oldest call passing 30 s
+  (`DEFAULT_AGE_SECONDS`; 60 s before DAT-482), or the end of the turn. That age is also the cadence
+  reported to the gateway, which holds each record for 3x it (90 s). A labelled record goes to
+  accounts as soon as its label lands, so this cadence is how far the activity stepper trails the
+  work. A twelve-hour turn therefore still reports within half a minute, and a Stop or crash loses at most the
   unpushed batch (the `finally` in `stream_agent_response` tries even that).
 - ⚠️ **Two clocks, and a flush must respect both** (review of PR #60). The SDK hands over a call's
   content blocks as each finishes, but the gateway writes the call's record only when its upstream

@@ -75,7 +75,13 @@ UNLABELLED = "unlabelled"
 BATCH_CALLS = 25
 # ...or when the oldest unlabelled call is this old, whichever comes first. This is the trigger that
 # bounds latency on a slow turn, and it is what we report to the gateway as our cadence.
-DEFAULT_AGE_SECONDS = 60.0
+#
+# 30 s (SUT-180 / DAT-482, was 60): a labelled record is released to accounts as soon as its label
+# lands, so this is what decides how far the app's activity stepper trails the work. The gateway sizes
+# its hold at 3x what we report, so 90 s. The cost is the classifier, measured at 0.3% of a turn at
+# 60 s, so roughly another 0.3% here. Below about 15 s a batch is one or two calls (less context, more
+# calls) and the hold leaves little room for the retry paths, which is why this is not lower.
+DEFAULT_AGE_SECONDS = 30.0
 # Headroom under the gateway's hold: if it tells us it holds for H, we must push comfortably inside
 # H or our labels arrive after the record has already gone.
 #
@@ -476,7 +482,7 @@ class Collector:
                 # ⚠️ A TRANSPORT failure is not the same as a bad answer. A 429 or a timeout on the
                 # classify call forfeited that batch for good - the buffer was already drained here -
                 # even though the gateway holds those records for about three times the cadence and
-                # would still accept the labels a minute later. Put them back and let the next flush
+                # would still accept the labels well after this. Put them back and let the next flush
                 # try again. A WRONG answer is different: a call that shared a batch is re-asked on its
                 # own (in `_classify`), and one already asked alone is not asked again, since the same
                 # question invites the same wrongness.
@@ -635,7 +641,7 @@ class Collector:
             if status >= 400:
                 logger.warning("Gateway label push returned %s for %d call(s)", status, len(labels))
                 # 4xx other than 429 is our own fault and will not fix itself; retrying a malformed
-                # push every minute for the rest of the turn helps nobody.
+                # push on every flush for the rest of the turn helps nobody.
                 return status < 500 and status != 429
         except Exception as e:      # noqa: BLE001
             logger.warning("Gateway label push failed for %d call(s): %s", len(labels), e)

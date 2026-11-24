@@ -385,6 +385,27 @@ def test_the_module_is_not_shadowed_in_main():
           "the stream loop settles the labeller on message_stop")
 
 
+async def test_the_default_cadence_is_what_the_gateway_is_told():
+    """The stepper trails the work by about this cadence (SUT-180 / DAT-482), and the gateway sizes its
+    hold from the value REPORTED, so the default must be what a push carries."""
+    c = ReplyCollector(replies=[{}])         # the REAL _push, so the body is the one sent
+    bodies = []
+    send = c._send_labels
+
+    async def capture(body):
+        bodies.append(body)
+        return await send(body)
+
+    c._send_labels = capture
+    c.observe("msg_1", tools=["Bash"])
+    c.settle()
+    await c._flush()
+    reported = {b.get("push_interval_seconds") for b in bodies}
+    check(reported == {activity.DEFAULT_AGE_SECONDS}, f"each push reports the default cadence ({reported})")
+    check(activity.MIN_AGE_SECONDS <= activity.DEFAULT_AGE_SECONDS <= 30.0,
+          f"and it is 30 s or less, above the floor ({activity.DEFAULT_AGE_SECONDS})")
+
+
 async def test_the_age_deadline_cannot_decay_without_bound():
     """⚠️ Tightening from the CURRENT age on every push is a feedback loop: with a gateway multiplier
     of 2 the deadline shrinks by a third each time (60 -> 40 -> 26.7 -> ...) until there is one
@@ -647,6 +668,7 @@ async def main_async():
                test_a_sidecar_is_labelled_without_asking_a_model,
                test_the_classifiers_own_spend_is_reported_like_any_other_sidecar,
                test_evidence_is_capped_at_ingest,
+               test_the_default_cadence_is_what_the_gateway_is_told,
                test_the_age_deadline_cannot_decay_without_bound,
                test_a_long_thinking_block_does_not_starve_what_the_call_said,
                test_a_call_with_no_message_id_is_ignored,
