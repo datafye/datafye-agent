@@ -159,13 +159,13 @@ async def test_a_turn_without_model_usage_is_counted_once():
                           {"session": "s", "mu": {H: entry(30, 93, 33018, 17365, 0.0255)}, "cost": 0.0255}]
     for _ in range(3):
         await run(cid, "fallback")
-    every = [r[2].get("tokens_in") for r in reports(cid)]      # every model, the configured one included
+    every = [r[2].get("tokens_in") for r in reports(cid) if r[2].get("tokens_in")]   # every model
     check(every == [10, 20], f"the resumed fallback turn is reported once, by the next turn ({every})")
     cid = "proj-fallback-first"
     conversations.ensure(cid)
     SCRIPT["fallback-first"] = [{"session": "s1", "mu": None, "cost": 0.004}]
     await run(cid, "fallback-first")
-    flat = [r[2].get("tokens_in") for r in reports(cid)]     # filed under the configured model
+    flat = [r[2].get("tokens_in") for r in reports(cid) if r[2].get("tokens_in")]   # configured model
     check(flat == [999], f"a session's FIRST turn with no model_usage still reports its flat usage ({flat})")
 
 
@@ -234,8 +234,7 @@ async def test_the_deltas_and_the_running_total_are_one_write():
 
     conversations._write = counting
     try:
-        conversations.commit_turn_usage(cid, "s", T1, 0.02080125,
-                                        {H: {"tokens_in": 10, "tokens_out": 31}}, "s:abc")
+        conversations.commit_turn_usage(cid, "s", T1, {H: {"tokens_in": 10, "tokens_out": 31}}, "s:abc")
     finally:
         conversations._write = real
     check(len(writes) == 1, f"one write ({len(writes)})")
@@ -259,13 +258,107 @@ def test_an_import_drops_the_running_total():
           "an imported project starts without a running total")
 
 
+async def test_the_running_total_is_saved_before_the_side_calls():
+    """Round-3 review: it was saved only after the title, satisfaction and labelling calls, so a turn
+    that began in that gap snapshotted a total without this turn and billed it again."""
+    cid = "proj-timing"
+    conversations.ensure(cid)
+    seen = []
+
+    async def title(message, sink=None, **kw):
+        seen.append((conversations.get(cid) or {}).get("sdk_usage_baseline"))
+        return None
+
+    real, main.generate_title = main.generate_title, title
+    try:
+        SCRIPT["timing"] = [{"session": "s", "mu": T1, "cost": 0.02080125}]
+        await run(cid, "timing")
+    finally:
+        main.generate_title = real
+    check(bool(seen) and seen[0] and seen[0].get("model_usage") == T1,
+          "the running total is already saved when the side-calls start")
+
+
+def test_the_running_total_never_moves_backwards():
+    """Round-3 review: two turns at once finish in either order, and the later save used to win."""
+    cid = "proj-backwards"
+    conversations.ensure(cid)
+    conversations.set_sdk_session(cid, "s")
+    conversations.commit_turn_usage(cid, "s", T2, {}, "k1")
+    conversations.commit_turn_usage(cid, "s", T1, {}, "k2")
+    check(conversations.usage_baseline(cid)["model_usage"] == T2, "a smaller total does not replace a larger one")
+    conversations.commit_turn_usage(cid, "s-other", T1, {}, "k3")
+    check(conversations.usage_baseline(cid)["session_id"] == "s",
+          "nor does a total for a session the project does not hold")
+
+
+async def test_a_resumed_turn_with_no_session_id_is_not_rebilled():
+    cid = "proj-nosession"
+    conversations.ensure(cid)
+    SCRIPT["nosession"] = [{"session": "s", "mu": T1, "cost": 0.02080125},
+                           {"session": "", "mu": T2, "cost": 0.02315215}]
+    await run(cid, "nosession")
+    await run(cid, "nosession")
+    check(tokens_in(cid) == [10], f"a resumed result naming no session reports nothing ({tokens_in(cid)})")
+
+
+async def test_a_cli_that_never_sends_model_usage_still_reports_flat_usage():
+    """Round-3 review: every resumed turn was DEFERRED to a difference that never comes."""
+    cid = "proj-neverusage"
+    conversations.ensure(cid)
+    SCRIPT["neverusage"] = [{"session": "s", "mu": None, "cost": 0.004}, {"session": "s", "mu": None, "cost": 0.008}]
+    await run(cid, "neverusage")
+    await run(cid, "neverusage")
+    flat = [r[2] for r in reports(cid) if r[2].get("tokens_in")]
+    check([d["tokens_in"] for d in flat] == [999, 999], f"each turn reports its flat usage ({[d['tokens_in'] for d in flat]})")
+    check(flat[1].get("cost_micros") == 0, "and the cumulative cost is withheld on the resumed one")
+
+
+async def test_turn_counts_are_kept_when_no_tokens_are_reported():
+    """Round-3 review: tool_calls and turns are per invocation, so a turn whose token usage is not
+    reported (here: the first turn after an upgrade) still counts as a turn."""
+    cid = "proj-counts"
+    conversations.ensure(cid)
+    conversations.set_sdk_session(cid, "s-live")
+    SCRIPT["counts"] = [{"session": "s-live", "mu": T2, "cost": 0.02315215}]
+    await run(cid, "counts")
+    totals = conversations.usage_public(conversations.get(cid))["totals"]
+    check(totals.get("turns") == 1 and totals.get("tokens_in") == 0,
+          f"the turn is counted, its tokens are not ({totals.get('turns')}, {totals.get('tokens_in')})")
+
+
+def test_the_agent_parses_on_the_boxes_python():
+    """Round-3 review: a nested-quote f-string parsed on 3.12+ and was a SyntaxError on 3.11, the
+    Python the installer builds the agent's venv with, so the agent would not have started."""
+    import shutil
+    import subprocess
+    py = shutil.which("python3.11")
+    if not py:
+        print("SKIP python3.11 is not installed here; the agent must still parse on it")
+        return
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    bad = []
+    for name in sorted(os.listdir(here)):
+        if name.endswith(".py"):
+            r = subprocess.run([py, "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read())",
+                                os.path.join(here, name)], capture_output=True, text=True)
+            if r.returncode:
+                bad.append(name)
+    check(not bad, f"every module parses on Python 3.11 ({bad or 'all'})")
+
+
 if __name__ == "__main__":
     test_the_subtraction()
     test_an_import_drops_the_running_total()
+    test_the_running_total_never_moves_backwards()
+    test_the_agent_parses_on_the_boxes_python()
     for t in (test_two_resumed_turns, test_a_turn_with_no_reply_is_still_counted,
               test_a_turn_without_model_usage_is_counted_once, test_an_upgrade_does_not_rebill_a_live_session,
               test_a_new_session_on_resume_is_counted_in_full, test_a_total_that_went_down_is_not_rebilled,
-              test_two_turns_at_once_each_count_their_own, test_the_deltas_and_the_running_total_are_one_write):
+              test_two_turns_at_once_each_count_their_own, test_the_deltas_and_the_running_total_are_one_write,
+              test_the_running_total_is_saved_before_the_side_calls, test_a_resumed_turn_with_no_session_id_is_not_rebilled,
+              test_a_cli_that_never_sends_model_usage_still_reports_flat_usage,
+              test_turn_counts_are_kept_when_no_tokens_are_reported):
         print(f"--- {t.__name__} ---")
         asyncio.run(t())
     print(f"\n{len(FAILED)} failure(s)" if FAILED else "\nall checks pass")

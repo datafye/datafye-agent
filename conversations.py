@@ -975,41 +975,53 @@ def usage_baseline(conversation_id: Optional[str]) -> Optional[dict]:
 
 def turn_usage(start: Optional[dict], session_id: Optional[str], resumed_from: Optional[str],
                model_usage: Optional[dict], total_cost_usd=None):
-    """This turn's own `(model_usage, total_cost_usd, verdict)`.
+    """This turn's own `(model_usage, flat_cost, verdict)`.
 
     ``start`` is the running total snapshotted when the turn began; ``resumed_from`` the session id the
     turn asked to resume (None for a project's first turn). A turn that ends in a DIFFERENT session from
-    the one it resumed started a new running total, so its whole figure is its own.
+    the one it resumed started a new running total, so its whole figure is its own. ``flat_cost`` is
+    only ever set for FLAT, and only when it is known to be this turn's alone.
     """
-    new_session = not resumed_from or not session_id or session_id != resumed_from
-    same = bool(start) and bool(session_id) and start.get("session_id") == session_id
+    if resumed_from and not session_id:
+        # A resumed turn whose result names no session: there is no telling its share from the
+        # session's earlier turns. Treated as a new session, it would bill the whole session again.
+        return {}, None, NO_BASELINE
+    new_session = not resumed_from or session_id != resumed_from
+    same = bool(start) and start.get("session_id") == session_id
     if not (isinstance(model_usage, dict) and model_usage):
-        # The degraded path: the CLI sent no per-model figures. Only a new session's flat usage is
-        # known to be this turn's alone. On a resumed turn, reporting anything here would be counted
-        # again by the next turn's difference (the running total does not move without model_usage).
-        return None, (total_cost_usd if new_session else None), (FLAT if new_session else DEFERRED)
+        if new_session:
+            return None, total_cost_usd, FLAT          # a first turn's flat usage and cost are its own
+        if same and start.get("model_usage"):
+            # This session HAS reported model_usage, so the next turn's difference will include this
+            # turn. Reporting anything here as well would count it twice.
+            return None, None, DEFERRED
+        # A session that has never had model_usage (a CLI build that does not send it): the flat usage
+        # is per invocation, so it is this turn's; the cost is cumulative, so it is withheld.
+        return None, None, FLAT
     if new_session and not same:
-        return usage_since(None, model_usage), total_cost_usd, COUNTED
+        return usage_since(None, model_usage), None, COUNTED
     if not same:
         return {}, None, NO_BASELINE
     own = usage_since(start.get("model_usage"), model_usage)
     if own is None:
         return {}, None, WENT_DOWN
-    turn_cost = None
-    if total_cost_usd is not None:
-        turn_cost = _num(total_cost_usd) - _num(start.get("total_cost_usd"))
-        if turn_cost < 0:
-            turn_cost = None
-    return own, turn_cost, COUNTED
+    return own, None, COUNTED
 
 
 def commit_turn_usage(conversation_id: str, session_id: Optional[str], model_usage: Optional[dict],
-                      total_cost_usd, deltas: dict, idem_base: str) -> Optional[dict]:
+                      deltas: dict, idem_base: str, reset: bool = False) -> Optional[dict]:
     """Record a turn's per-model deltas AND move the session's running total, in ONE write.
 
     ⚠️ One write, because the two must not separate: a turn cancelled between them (a Stop, dormancy)
     would leave the running total moved past usage that was never recorded, and the next turn would
     subtract it away for good. Returns the updated usage view, or None if the project does not exist.
+
+    The running total only ever moves FORWARD within a session, and only for the session the project
+    actually holds: two turns at once can finish in either order, and the later save must not carry
+    the total backwards or onto a session the next turn will not resume. ``reset`` is the one
+    exception: the turn that FOUND the session's total had fallen (WENT_DOWN) sets it to the new,
+    lower figure, or every later turn of that session would be measured against a total it can never
+    reach again and report nothing.
     """
     record = _read(conversation_id)
     if record is None:
@@ -1018,11 +1030,12 @@ def commit_turn_usage(conversation_id: str, session_id: Optional[str], model_usa
     for model, delta in (deltas or {}).items():
         _apply_usage_delta(usage, model, delta, f"{idem_base}:{model}")
     if session_id and isinstance(model_usage, dict) and model_usage:
-        record["sdk_usage_baseline"] = {
-            "session_id": session_id,
-            "model_usage": model_usage,
-            "total_cost_usd": _num(total_cost_usd) if total_cost_usd is not None else None,
-        }
+        held = record.get("sdk_session_id")
+        saved = record.get("sdk_usage_baseline") or {}
+        behind = (saved.get("session_id") == session_id
+                  and usage_since(saved.get("model_usage"), model_usage) is None)
+        if (not held or held == session_id) and (reset or not behind):
+            record["sdk_usage_baseline"] = {"session_id": session_id, "model_usage": model_usage}
     record["usage"] = usage
     record["updated_at"] = _now_ms()
     _write(record)
