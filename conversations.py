@@ -454,22 +454,14 @@ def add_usage(conversation_id: str, model: str, delta: dict,
     if record is None:
         return None
     usage = record.get("usage") or _empty_usage()
-    if not _apply_usage_delta(usage, model, delta, idempotency_key):
-        return usage_public(record)
-    record["usage"] = usage
-    record["updated_at"] = _now_ms()
-    _write(record)
-    return usage_public(record)
-
-
-def _apply_usage_delta(usage: dict, model: str, delta: dict, idempotency_key: Optional[str]) -> bool:
-    """Add one model's delta into `usage` in place, at most once per key. False if already applied."""
     keys = usage.setdefault("applied_keys", [])
     if idempotency_key and idempotency_key in keys:
-        return False
+        return usage_public(record)
+
     model = model or "unknown"
     cells = _cells(usage)
-    cell = cells.get(model) or {"model": model}
+    cell_key = model
+    cell = cells.get(cell_key) or {"model": model}
     totals = usage.setdefault("totals", {f: 0 for f in _USAGE_FIELDS})
     now = _now_ms()
     for f in _USAGE_FIELDS:
@@ -477,13 +469,16 @@ def _apply_usage_delta(usage: dict, model: str, delta: dict, idempotency_key: Op
         cell[f] = int(cell.get(f, 0)) + d
         totals[f] = int(totals.get(f, 0)) + d
     cell["updated_at"] = now
-    cells[model] = cell
+    cells[cell_key] = cell
     usage["updated_at"] = now
     if idempotency_key:
         keys.append(idempotency_key)
         if len(keys) > _MAX_USAGE_KEYS:
             del keys[: len(keys) - _MAX_USAGE_KEYS]
-    return True
+    record["usage"] = usage
+    record["updated_at"] = now
+    _write(record)
+    return usage_public(record)
 
 
 def create(first_message: str = "") -> dict:
@@ -883,178 +878,3 @@ def set_sdk_session(conversation_id: str, session_id: str) -> None:
     if record.get("sdk_session_id") != session_id:
         record["sdk_session_id"] = session_id
         _write(record)
-
-
-# ── A turn's OWN usage (SUT-95 / DAT-306) ──────────────────────────────────────────────────────────
-# Each turn is a fresh SDK query() that RESUMES the project's session, and on a resumed session the
-# CLI's `model_usage` (and `total_cost_usd`) are CUMULATIVE for the whole session: turn N reports turns
-# 1..N. Reported verbatim, a project's usage grew with the length of the conversation instead of
-# tracking the bill. Measured on claude-agent-sdk 0.2.188 / CLI 2.1.331 (2026-11-24): turn 2's
-# model_usage was exactly turn 1 + turn 2, tokens and costUSD alike, with the session id unchanged.
-#
-# So the session's running total is kept with the project (`sdk_usage_baseline` in meta.json, which
-# survives a restart), a turn SNAPSHOTS it when it begins, and reports the difference when it ends.
-# Measuring against the snapshot rather than "whatever was saved last" is what keeps two turns on one
-# project right: both resume from the same point, so each must subtract that point.
-#
-# ⚠️ When the running total cannot be trusted, the turn reports NOTHING rather than the whole figure.
-# Reporting the whole figure is the bug this exists to stop, and it bills a session's entire history
-# again; reporting nothing loses one turn, which the metering gateway still has.
-
-# The fields the CLI accumulates. The others in an entry describe the MODEL, not the turn
-# (contextWindow, maxOutputTokens, canonicalModel, provider), and pass through unchanged.
-CUMULATIVE_USAGE_FIELDS = ("inputTokens", "outputTokens", "cacheReadInputTokens",
-                           "cacheCreationInputTokens", "webSearchRequests", "costUSD")
-# Every spelling the usage reader accepts for each, so a field is subtracted however an SDK spells it.
-_FIELD_ALIASES = {
-    "inputTokens": ("inputTokens", "input_tokens"),
-    "outputTokens": ("outputTokens", "output_tokens"),
-    "cacheReadInputTokens": ("cacheReadInputTokens", "cache_read_input_tokens"),
-    "cacheCreationInputTokens": ("cacheCreationInputTokens", "cache_creation_input_tokens"),
-    "webSearchRequests": ("webSearchRequests", "web_search_requests"),
-    "costUSD": ("costUSD", "cost_usd", "cost"),
-}
-_ALIAS_KEYS = {a for names in _FIELD_ALIASES.values() for a in names}
-
-# What became of a turn's usage. Only COUNTED and FLAT report anything.
-COUNTED = "counted"            # this turn's own usage, measured against the snapshot
-FLAT = "flat"                  # no model_usage from the CLI on a session's first turn: flat usage
-NO_BASELINE = "no_baseline"    # a resumed session with no running total on record (an upgrade, an import)
-WENT_DOWN = "went_down"        # the running total of the SAME session fell, so it cannot be trusted
-DEFERRED = "deferred"          # no model_usage on a resumed turn: the next turn's difference carries it
-
-
-def _num(value) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _canonical(entry: dict) -> dict:
-    """An entry with its accumulating fields under their camelCase names, whatever it used."""
-    out = {k: v for k, v in entry.items() if k not in _ALIAS_KEYS}
-    for field, names in _FIELD_ALIASES.items():
-        present = [n for n in names if n in entry]
-        if present:
-            out[field] = entry[present[0]]
-    return out
-
-
-def usage_since(baseline: Optional[dict], cumulative: dict) -> Optional[dict]:
-    """The usage between two running totals of one session, per model; None if a total went DOWN.
-
-    No baseline means nothing was counted yet, so the whole figure is new. A model that did not run in
-    between (no accumulating field moved) is left out rather than reported as a row of zeros.
-    """
-    cumulative = {m: _canonical(e) for m, e in (cumulative or {}).items() if isinstance(e, dict)}
-    base = {m: _canonical(e) for m, e in (baseline or {}).items() if isinstance(e, dict)}
-    if any(m not in cumulative for m in base) or any(
-            _num(entry.get(f)) < _num((base.get(m) or {}).get(f))
-            for m, entry in cumulative.items() for f in CUMULATIVE_USAGE_FIELDS):
-        return None
-    out = {}
-    for model, entry in cumulative.items():
-        prev = base.get(model) or {}
-        turn = dict(entry)
-        for f in CUMULATIVE_USAGE_FIELDS:
-            if f in entry:
-                d = _num(entry.get(f)) - _num(prev.get(f))
-                turn[f] = d if f == "costUSD" else int(round(d))
-        if any(_num(turn.get(f)) for f in CUMULATIVE_USAGE_FIELDS):
-            out[model] = turn
-    return out
-
-
-def usage_baseline(conversation_id: Optional[str]) -> Optional[dict]:
-    """The session's running total as it stands now. A turn takes this when it BEGINS."""
-    record = _read(conversation_id) if conversation_id else None
-    saved = (record or {}).get("sdk_usage_baseline")
-    return dict(saved) if isinstance(saved, dict) else None
-
-
-def turn_usage(start: Optional[dict], session_id: Optional[str], resumed_from: Optional[str],
-               model_usage: Optional[dict], total_cost_usd=None):
-    """This turn's own `(model_usage, flat_cost, verdict)`.
-
-    ``start`` is the running total snapshotted when the turn began; ``resumed_from`` the session id the
-    turn asked to resume (None for a project's first turn). A turn that ends in a DIFFERENT session from
-    the one it resumed started a new running total, so its whole figure is its own. ``flat_cost`` is
-    only ever set for FLAT, and only when it is known to be this turn's alone.
-    """
-    if resumed_from and not session_id:
-        # A resumed turn whose result names no session: there is no telling its share from the
-        # session's earlier turns. Treated as a new session, it would bill the whole session again.
-        return {}, None, NO_BASELINE
-    new_session = not resumed_from or session_id != resumed_from
-    same = bool(start) and start.get("session_id") == session_id
-    if not (isinstance(model_usage, dict) and model_usage):
-        if new_session:
-            return None, total_cost_usd, FLAT          # a first turn's flat usage and cost are its own
-        if same and start.get("model_usage"):
-            # This session HAS reported model_usage, so the next turn's difference will include this
-            # turn. Reporting anything here as well would count it twice.
-            return None, None, DEFERRED
-        # A session that has never had model_usage (a CLI build that does not send it): the flat usage
-        # is per invocation, so it is this turn's; the cost is cumulative, so it is withheld.
-        return None, None, FLAT
-    if new_session and not same:
-        return usage_since(None, model_usage), None, COUNTED
-    if not same:
-        return {}, None, NO_BASELINE
-    own = usage_since(start.get("model_usage"), model_usage)
-    if own is None:
-        return {}, None, WENT_DOWN
-    return own, None, COUNTED
-
-
-def _plus(total: dict, own: dict) -> dict:
-    """A running total with one turn's own usage added, per model."""
-    out = {m: _canonical(e) for m, e in (total or {}).items() if isinstance(e, dict)}
-    for model, entry in (own or {}).items():
-        into = dict(out.get(model) or {})
-        for k, v in entry.items():
-            if k not in CUMULATIVE_USAGE_FIELDS:
-                into.setdefault(k, v)
-        for f in CUMULATIVE_USAGE_FIELDS:
-            if f in entry:
-                into[f] = _num(into.get(f)) + _num(entry.get(f))
-        out[model] = into
-    return out
-
-
-def commit_turn_usage(conversation_id: str, session_id: Optional[str], model_usage: Optional[dict],
-                      deltas: dict, idem_base: str, reset: bool = False,
-                      start: Optional[dict] = None, own: Optional[dict] = None) -> Optional[dict]:
-    """Record a turn's per-model deltas AND move the session's running total, in ONE write.
-
-    ⚠️ One write, because the two must not separate: a turn cancelled between them (a Stop, dormancy)
-    would leave the running total moved past usage that was never recorded, and the next turn would
-    subtract it away for good. Returns the updated usage view, or None if the project does not exist.
-
-    The running total is only ever saved for the session the project actually holds. If ANOTHER turn
-    moved it while this one ran (two turns at once, ``start`` no longer what is saved), this turn's
-    own usage is ADDED to what is saved rather than replacing it: however the CLI then combines the
-    two branches of the session, the next turn is measured against a total that already counts both,
-    so it can only report its own usage or less, never another turn's again. ``reset`` is for the turn
-    that FOUND the total had fallen (WENT_DOWN): it saves the new, lower figure, or every later turn of
-    the session would be measured against a total it can never reach again.
-    """
-    record = _read(conversation_id)
-    if record is None:
-        return None
-    usage = record.get("usage") or _empty_usage()
-    for model, delta in (deltas or {}).items():
-        _apply_usage_delta(usage, model, delta, f"{idem_base}:{model}")
-    if session_id and isinstance(model_usage, dict) and model_usage:
-        held = record.get("sdk_session_id")
-        saved = record.get("sdk_usage_baseline") or {}
-        if not held or held == session_id:
-            moved_meanwhile = (not reset and saved.get("session_id") == session_id
-                               and saved != (start or {}))
-            total = _plus(saved.get("model_usage"), own) if moved_meanwhile else model_usage
-            record["sdk_usage_baseline"] = {"session_id": session_id, "model_usage": total}
-    record["usage"] = usage
-    record["updated_at"] = _now_ms()
-    _write(record)
-    return usage_public(record)
