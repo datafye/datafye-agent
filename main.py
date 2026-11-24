@@ -679,7 +679,7 @@ async def _ensure_deployment_token(auth_token: Optional[str]) -> None:
     if existing and _deployment_token_expiry(existing) - time.time() > _DEPLOYMENT_TOKEN_MARGIN_S:
         return
 
-    url = f"{accounts_url}/datafye-accounts-api/v1/accounts/{user}/deployment-token"
+    url = f"{accounts_url}{cloud_deployments.API}/accounts/{user}/deployment-token"
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
             resp = await http.post(url, headers={"Authorization": f"Bearer {auth_token}"})
@@ -1199,7 +1199,7 @@ async def _report_usage_to_accounts(conversation_id: str, model: str,
     # registry) are accepted; an unregistered id yields a 404 that this best-effort
     # call just logs. (Was gated to "proj-" only, which wrongly dropped usage for
     # reconciled projects.)
-    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+    url = (f"{auth.ACCOUNTS_URL}{cloud_deployments.API}/accounts/"
            f"{AGENT_USERNAME}/projects/{conversation_id}/usage")
     # ⚠️ The activity is NOT computed here, deliberately. The agent reports usage PER MODEL PER TURN
     # and nothing finer (DAT-319): it labels each CALL's activity and pushes that to the metering
@@ -1237,7 +1237,7 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
         return
     # Report for any registered project (proj- OR a reconciled browser-local id);
     # accounts 404s an unregistered id and this best-effort call just logs it.
-    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+    url = (f"{auth.ACCOUNTS_URL}{cloud_deployments.API}/accounts/"
            f"{AGENT_USERNAME}/projects/{conversation_id}/satisfaction")
     body = {"rank": int(rank), "reasons": reasons or "", "source": source}
     try:
@@ -1271,7 +1271,7 @@ async def _report_descriptor_to_accounts(conversation_id: str, descriptor_text: 
         return
     if not descriptor_text or not descriptor_text.strip():
         return
-    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+    url = (f"{auth.ACCOUNTS_URL}{cloud_deployments.API}/accounts/"
            f"{AGENT_USERNAME}/projects/{conversation_id}")
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -1310,7 +1310,7 @@ async def _report_foundry_intent_to_accounts(intended: str, source: str,
     if intended not in ("running", "stopped"):
         return False
 
-    url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+    url = (f"{auth.ACCOUNTS_URL}{cloud_deployments.API}/accounts/"
            f"{AGENT_USERNAME}/sandbox/foundry-intent")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1352,7 +1352,7 @@ def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[st
         context = (args.get("context") or "").strip()
         if not message:
             return {"content": [{"type": "text", "text": "No feedback text was provided, so nothing was logged."}]}
-        url = (f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/"
+        url = (f"{auth.ACCOUNTS_URL}{cloud_deployments.API}/accounts/"
                f"{AGENT_USERNAME}/feedback")
         body = {"category": category, "message": message}
         if context:
@@ -1455,11 +1455,31 @@ def _build_deployment_mcp(auth_token: Optional[str], conversation_id: Optional[s
             {"name": str, "version": str},
         )
         async def deploy_environment(args):
+            # The box has ONE foundry, shared by every project on it, so what is running may belong to
+            # another project. Deploy only what THIS project recorded (the agent reports a project's
+            # descriptor whenever its environment changes), and only if that is what is running.
             state = await _fetch_deployment_state()
-            descriptor = (state or {}).get("descriptor_text", "")
-            name = (args.get("name") or "").strip() or cloud_deployments.default_name(AGENT_USERNAME, conversation_id)
-            return _text(await cloud_deployments.create(base, auth_token, name, descriptor, conversation_id,
-                                                        (args.get("version") or "").strip() or None))
+            running = (state or {}).get("descriptor_text", "")
+            recorded, why = (None, "this conversation has no project") if not conversation_id else \
+                await cloud_deployments.project_descriptor(base, auth_token, AGENT_USERNAME, conversation_id)
+            if not running.strip():
+                result = {"text": "There is no local environment running to deploy. Build this project's "
+                                  "environment locally first. Nothing was created."}
+            elif not recorded:
+                result = {"text": "This project has no environment of its own on record"
+                                  + (f" ({why})" if why else "") + ", so the environment running on this box may "
+                                  "belong to another project. Set up this project's environment here first (that "
+                                  "records it), then deploy. Nothing was created."}
+            elif not cloud_deployments.same_environment(running, recorded):
+                result = {"text": "The environment running on this box is not the one this project recorded: it "
+                                  "was changed since, or belongs to another project. Bring this project's "
+                                  "environment back (or record the change by applying it in this project), then "
+                                  "deploy. Nothing was created."}
+            else:
+                name = (args.get("name") or "").strip() or cloud_deployments.default_name(AGENT_USERNAME, conversation_id)
+                result = await cloud_deployments.create(base, auth_token, name, running, conversation_id,
+                                                        (args.get("version") or "").strip() or None)
+            return _text(result)
 
         @tool(
             "deployment_progress",
@@ -1486,15 +1506,17 @@ def _build_deployment_mcp(auth_token: Optional[str], conversation_id: Optional[s
             "deployment_operation",
             "Run an operation on one of the user's cloud deployments: 'stop', 'start', 'upgrade' (to "
             "`version`, or the latest complete release when empty; with `system` set, only that one "
-            "system) or 'deprovision' (removes everything it runs on; confirm with the user first). Only "
-            "after the user has asked for it. Follow the returned job with deployment_progress.",
-            {"deployment_id": str, "operation": str, "version": str, "system": str},
+            "system) or 'deprovision' (removes everything it runs on: it needs `confirm_name`, the "
+            "deployment's name as the user confirmed it, and is refused without it). Only after the user "
+            "has asked for it. Follow the returned job with deployment_progress.",
+            {"deployment_id": str, "operation": str, "version": str, "system": str, "confirm_name": str},
         )
         async def deployment_operation(args):
             return _text(await cloud_deployments.run(base, auth_token, args.get("deployment_id") or "",
                                                      (args.get("operation") or "").strip().lower(),
                                                      (args.get("version") or "").strip() or None,
-                                                     (args.get("system") or "").strip() or None))
+                                                     (args.get("system") or "").strip() or None,
+                                                     (args.get("confirm_name") or "").strip() or None))
 
         server = create_sdk_mcp_server("deployments", "1.0.0",
                                        tools=[deploy_environment, deployment_progress, list_deployments,
