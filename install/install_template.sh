@@ -134,10 +134,10 @@ Options:
                         rewritten to the canonical AGENT_REPO so auto-upgrade
                         keeps working.
   --mcp-server <s>      Which Datafye API MCP server the agent uses (DAT-439):
-                          java - the deployment's own /mcp on the REST API (default)
                           npm  - the separate datafye-mcp-api container on :3200
-                        Persists across upgrades, so this is the switch back if
-                        the Java server misbehaves.
+                          java - the deployment's own /mcp on the REST API
+                        Persists across upgrades. Omit it to follow the default
+                        the installed release ships (npm today, DAT-487).
   --force               Reinstall even if same version (useful for SNAPSHOT)
   --ami-cleanup         Clean up for AMI snapshot (clear keys, logs, history)
   --port <port>         Agent port (default: 18780)
@@ -295,10 +295,12 @@ if [ "$IS_UPGRADE" = true ] && [ -f "${ENV_FILE}" ]; then
 fi
 
 # ── Validate the MCP server choice ───────────────────────────────
-# A box with no recorded choice (a fresh install, or one installed before the
-# switch existed) gets the Java server.
-MCP_SERVER="${MCP_SERVER:-java}"
-if [ "$MCP_SERVER" != "java" ] && [ "$MCP_SERVER" != "npm" ]; then
+# ⚠️ An unset choice stays UNSET in agent.env (DAT-487). Filling in the default
+# here would write it into agent.env, which every later upgrade carries forward,
+# so a box would keep this release's default forever and a later release that
+# changes it would never reach the box. Empty means "the agent's default"
+# (main.py), and only an operator's explicit --mcp-server is ever persisted.
+if [ -n "$MCP_SERVER" ] && [ "$MCP_SERVER" != "java" ] && [ "$MCP_SERVER" != "npm" ]; then
     error "Invalid --mcp-server: $MCP_SERVER. Must be 'java' or 'npm'."
     exit 1
 fi

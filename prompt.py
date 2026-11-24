@@ -90,9 +90,9 @@ def build_system_prompt(
 ) -> str:
     """Build the complete system prompt for the agent."""
 
-    # the MCP server the agent is actually configured for (DAT-439): the deployment's own
-    # /mcp on the REST port by default, or the separate npm container when switched back
-    api_mcp_url = api_mcp_url or "http://local-foundry-dev-api.datafye.local:7776/mcp"
+    # the MCP server the agent is actually configured for (DAT-439): the separate npm container
+    # by default (DAT-487), or the deployment's own /mcp on the REST port when chosen
+    api_mcp_url = api_mcp_url or "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp"
     mcp_on_rest_port = ":3200/" not in api_mcp_url
 
     # Report the ceiling that is ACTUALLY in force rather than the number we shipped
