@@ -152,19 +152,24 @@ DATAFYE_DEPLOYMENT_API_URL = os.getenv(
 )
 
 # Datafye API MCP server (DAT-439). Two exist while the Java one proves itself:
-#   java  the REST service's own /mcp, served by every deployment, whose tools
-#         are generated from the API's OpenAPI spec (the default)
 #   npm   the hand-written datafye-mcp-api server, the separate container the
-#         CLI still runs beside a local deployment on :3200
-# Switching back is one setting: DATAFYE_AGENT_API_MCP_SERVER=npm in agent.env
-# (or the installer's --mcp-server npm, which persists across upgrades), then a
-# restart. DATAFYE_AGENT_API_MCP_URL, when set, overrides both, for a box
-# pointed at some other server entirely.
+#         CLI runs beside a local deployment on :3200 (the default)
+#   java  the REST service's own /mcp, whose tools are generated from the API's
+#         OpenAPI spec; served only by deployments from 2.0.64 on
+# The default stays npm until every deployment serves /mcp and the Java server is
+# checked against npm (DAT-487): an agent upgrades itself within minutes, a
+# deployment only when re-provisioned, and on an older deployment the Java
+# default would leave the agent with no Datafye tools at all.
+# Choosing is one setting: DATAFYE_AGENT_API_MCP_SERVER=java in agent.env (or the
+# installer's --mcp-server java, which persists across upgrades), then a restart.
+# Left unset, a box follows whatever default its release ships.
+# DATAFYE_AGENT_API_MCP_URL, when set, overrides both, for a box pointed at some
+# other server entirely.
 _API_MCP_SERVER_URLS = {
     "java": DATAFYE_DEPLOYMENT_API_URL.rstrip("/") + "/mcp",
     "npm": "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp",
 }
-DATAFYE_API_MCP_SERVER = (os.getenv("DATAFYE_AGENT_API_MCP_SERVER") or "java").strip().lower()
+DATAFYE_API_MCP_SERVER = (os.getenv("DATAFYE_AGENT_API_MCP_SERVER") or "npm").strip().lower()
 if DATAFYE_API_MCP_SERVER not in _API_MCP_SERVER_URLS:
     raise SystemExit(
         f"DATAFYE_AGENT_API_MCP_SERVER={DATAFYE_API_MCP_SERVER!r} is not valid: "
@@ -227,9 +232,9 @@ os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 #
 # ⚠️ That was PATH CLI 2.1.226, but a turn actually runs the SDK's BUNDLED CLI
 # (`_find_cli` prefers `claude_agent_sdk/_bundled/claude` over `which claude`),
-# which for the current pin is 2.1.85. The bundled binary would not run on the
-# dev Mac, so this is UNVERIFIED on the version that ships -- re-check on a box
-# if long commands still get backgrounded.
+# which is pinned with the SDK in requirements.txt (DAT-486: 0.2.152 bundles 2.1.259) and checked by
+# the installer. Not yet re-verified on that version -- re-check on a box if long commands still get
+# backgrounded.
 os.environ.setdefault("BASH_MAX_TIMEOUT_MS", os.getenv("DATAFYE_AGENT_BASH_MAX_TIMEOUT_MS", "1800000"))
 
 # The largest single message the SDK will accept off the CLI's stdout (DAT-204).
@@ -1038,45 +1043,6 @@ def _usage_get(u, key):
     return getattr(u, key, None)
 
 
-def _account_turn_usage(conversation_id: str, result_metrics: dict, usage_start, resumed_from,
-                        tool_calls: int, idem_base: str):
-    """Record this turn's own usage in the project the moment its result arrives (SUT-95 / DAT-306).
-
-    Returns ``(reports, updated_usage)``: ``reports`` is the ``(model, delta, idempotency key)`` list
-    still to send to accounts. See `conversations.turn_usage` for how the turn's own share is found.
-
-    ⚠️ Called when the ResultMessage arrives, NOT after the title, satisfaction and labelling calls
-    that follow it: a turn that began in that gap would snapshot a running total that does not include
-    this turn yet, and bill it a second time.
-    """
-    session_id = result_metrics.get("session_id")
-    cli_model_usage = result_metrics.get("model_usage")
-    own, flat_cost, verdict = conversations.turn_usage(
-        usage_start, session_id, resumed_from, cli_model_usage, result_metrics.get("cost_usd"))
-    if verdict not in (conversations.COUNTED, conversations.FLAT):
-        logger.warning("[usage] %s: this turn's token usage is not reported (%s)", conversation_id, verdict)
-    primary = _model_label(CLAUDE_MODEL)
-    deltas = {}
-    if verdict == conversations.FLAT:
-        # The CLI sent no per-model figures. The flat usage reflects only the final model call, so
-        # it undercounts a multi-step turn; kept so tracking degrades rather than vanishing.
-        deltas[primary] = _usage_delta(dict(result_metrics, cost_usd=flat_cost), 0)
-    else:
-        for model_id, entry in (own or {}).items():
-            deltas[model_id] = _usage_delta_from_model_entry(entry if isinstance(entry, dict) else {})
-    # tool_calls and turns are per INVOCATION, never cumulative, so they are recorded whatever the
-    # verdict, once, on the primary model (or the first model if the configured one did not run).
-    target = primary if (primary in deltas or not deltas) else next(iter(deltas))
-    cell = deltas.setdefault(target, _usage_delta_from_model_entry({}))
-    cell["tool_calls"] = int(tool_calls or 0)
-    cell["turns"] = int(result_metrics.get("num_turns") or 0)
-    updated = conversations.commit_turn_usage(conversation_id, session_id, cli_model_usage, deltas, idem_base,
-                                              reset=(verdict == conversations.WENT_DOWN),
-                                              start=usage_start, own=own)
-    logger.info("[usage] %s: %s across %d model(s): %s", conversation_id, verdict, len(deltas), list(deltas))
-    return [(m, d, idem_base + ":" + m) for m, d in deltas.items()], updated
-
-
 def _usage_delta(metrics: dict, tool_calls: int) -> dict:
     """Build the turn's usage delta from the stashed ResultMessage metrics."""
     u = metrics.get("usage")
@@ -1163,6 +1129,14 @@ def _model_label(model: str) -> str:
     """The model id to attribute usage to (the configured DATAFYE_AGENT_MODEL —
     an alias like 'opus' or a full id); the frontend prettifies it."""
     return (model or "").strip() or "unknown"
+
+
+def _turn_index(conversation_id: str) -> int:
+    """A stable per-conversation turn number (count of assistant messages),
+    used with the session id to form the idempotency key."""
+    rec = conversations.get(conversation_id) or {}
+    msgs = rec.get("messages") or []
+    return sum(1 for m in msgs if (m or {}).get("role") == "assistant")
 
 
 # Label flushes started from an interrupted turn's `finally`. Held only so the task is not collected
@@ -2021,14 +1995,6 @@ async def stream_agent_response(
             options.resume = resume_id
             logger.info(f"Resuming session for conversation {conversation_id}")
 
-    # This turn's usage is measured against the session's running total AS IT WAS when the turn began
-    # (SUT-95 / DAT-306): two turns on one project resume from the same point, so each subtracts that
-    # point rather than whatever the other saved meanwhile. And it is keyed by its own id, never by a
-    # count of saved replies, which a turn that ends with no reply does not move.
-    usage_start = conversations.usage_baseline(conversation_id)
-    resumed_from = getattr(options, "resume", None) or None
-    turn_uid = uuid.uuid4().hex[:12]
-
     logger.info(f"[TRACE] === Starting Agent Query ===")
     logger.info(f"[TRACE] Model: {CLAUDE_MODEL}")
     logger.info(f"[TRACE] Algo: {algo_id}")
@@ -2052,10 +2018,6 @@ async def stream_agent_response(
     # roll-up (they run outside the SDK session, so they are absent from ResultMessage.model_usage),
     # and because the activity classifier writes its own spend into it.
     sidecar_usage: list = []
-    # This turn's usage, recorded in the project when its result arrives and reported to accounts after
-    # the side-calls (SUT-95 / DAT-306). Declared out here so the report block can always read them.
-    turn_reports: list = []
-    usage_at_result = None
     # What KIND of work each model call does, classified per call and pushed to the metering gateway
     # during the turn (DAT-319). Created per turn; a box not behind a gateway has no records to label,
     # so it stays switched off.
@@ -2459,14 +2421,6 @@ async def stream_agent_response(
                     'model_usage': getattr(msg, 'model_usage', None),
                     'num_turns': getattr(msg, 'num_turns', None),
                 }
-                if conversation_id:
-                    # Usage tracking never breaks a turn: the user already has the reply.
-                    try:
-                        turn_reports, usage_at_result = _account_turn_usage(
-                            conversation_id, result_metrics, usage_start, resumed_from, tool_calls_this_turn,
-                            str(result_metrics.get("session_id") or "nosess") + ":" + turn_uid)
-                    except Exception as e:      # noqa: BLE001
-                        logger.warning("[usage] %s: could not record this turn's usage: %s", conversation_id, e)
 
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
 
@@ -2546,17 +2500,48 @@ async def stream_agent_response(
                 # each call and tells the gateway; it does not apportion usage across activities,
                 # because the gateway meters every call exactly and now knows its activity, so the
                 # MEASURED breakdown belongs there (DAT-319).
-                # Keyed by this turn's own id, never by a count of saved replies (which a turn that ends
-                # without one does not move). The sidecars below use it too.
-                base_idem = str(result_metrics.get("session_id") or "nosess") + ":" + turn_uid
-                updated_usage = usage_at_result
+                base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
+                model_usage = result_metrics.get('model_usage')
+                updated_usage = None
                 # Whole-turn roll-up (across every model + the Haiku sidecars),
                 # tagged onto the final reply so the accounts Conversation view
                 # can show tokens/cost per turn = all work done + the reply.
                 turn_usage = {k: 0 for k in _TURN_USAGE_FIELDS}
-                # Recorded in the project when the result arrived (_account_turn_usage); reported now.
-                for model_id, delta, idem in turn_reports:
+
+                if isinstance(model_usage, dict) and model_usage:
+                    # Preferred path: per-model, whole-turn-CUMULATIVE usage --
+                    # every token type (incl. cache read/create) summed across
+                    # the whole agentic loop, plus each model's own cost. One
+                    # delta per model, idempotency-keyed per model so a
+                    # multi-model turn (e.g. Opus main loop + an internal Haiku)
+                    # lands in the right cells without double-counting on retry.
+                    primary = _model_label(CLAUDE_MODEL)
+                    attributed_extras = False
+                    for model_id, entry in model_usage.items():
+                        delta = _usage_delta_from_model_entry(entry if isinstance(entry, dict) else {})
+                        # tool_calls + turns are turn-level, not per-model -- add
+                        # them once, to the primary model (or the first model if
+                        # the configured one didn't run this turn).
+                        if not attributed_extras and (model_id == primary or primary not in model_usage):
+                            delta['tool_calls'] = int(tool_calls_this_turn or 0)
+                            delta['turns'] = int(result_metrics.get('num_turns') or 0)
+                            attributed_extras = True
+                        idem = f"{base_idem}:{model_id}"
+                        _accumulate_turn_usage(turn_usage, delta)
+                        updated_usage = conversations.add_usage(conversation_id, model_id, delta, idem)
+                        await _report_usage_to_accounts(conversation_id, model_id, delta, idem, auth_token)
+                    logger.info("[usage] %s: turn attributed across %d model(s): %s",
+                                conversation_id, len(model_usage), list(model_usage.keys()))
+                else:
+                    # Fallback (CLI emitted no modelUsage): the flat single-usage
+                    # read + total cost, attributed to the configured model. This
+                    # undercounts multi-step turns -- kept only so usage tracking
+                    # degrades gracefully rather than vanishing.
+                    delta = _usage_delta(result_metrics, tool_calls_this_turn)
+                    model_id = _model_label(CLAUDE_MODEL)
+                    idem = f"{base_idem}:{model_id}"
                     _accumulate_turn_usage(turn_usage, delta)
+                    updated_usage = conversations.add_usage(conversation_id, model_id, delta, idem)
                     await _report_usage_to_accounts(conversation_id, model_id, delta, idem, auth_token)
 
                 # Fold in the Haiku sidecars (title, satisfaction, environment intent and
@@ -2865,7 +2850,9 @@ async def bom():
     liveness one — and /health is polled every minute by the upgrade cron, by
     accounts for dormancy, and by the SPA, so it is the wrong place to add
     anything that ever costs more than reading a variable."""
-    harness_info = harness.describe()
+    # In a worker thread: the first probe forks a ~300 MB binary (up to a minute on a cold volume),
+    # and run inline it would stall every turn streaming on this event loop meanwhile.
+    harness_info = await asyncio.to_thread(harness.describe)
     try:
         with open(BOM_PATH) as f:
             document = json.load(f)

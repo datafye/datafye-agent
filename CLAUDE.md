@@ -622,8 +622,9 @@ arriving by another route.
 
 ⚠️ **The agent's harness is the SDK's BUNDLED CLI, not the one the installer puts on
 PATH.** `_find_cli` checks `claude_agent_sdk/_bundled/claude` **first** and only falls
-back to `shutil.which("claude")`. So the harness version tracks
-`claude-agent-sdk` in `requirements.txt` (`>=0.2.128,<0.3`), and the installer's
+back to `shutil.which("claude")`. So the harness version is fixed by the EXACT
+`claude-agent-sdk` pin in `requirements.txt` (DAT-486: `==0.2.152`, bundling 2.1.259; the
+installer fails if the box got anything else), and the installer's
 `/home/datafye/.local/bin/claude` is not what runs a turn. Anything that depends on
 harness behaviour must be verified against the *bundled* binary.
 
@@ -673,10 +674,12 @@ you are looking at a dev venv rather than production.
   only as the SDK's fallback for a future version that ships without a bundle: cheap
   insurance, kept deliberately, with its **~300 MB of duplicate** noted for DAT-178 so
   the trade-off is a decision rather than a discovery.
-- **The pin is now unblocked and NOT yet done.** `requirements.txt` still allows
-  `>=0.2.128,<0.3`; the exact pin to write is `claude-agent-sdk==0.2.136`, the version
-  production actually resolved. Writing a number before it was measurable would have
-  repeated the mistake the block exists to prevent.
+- **The pin is DONE (DAT-486):** `claude-agent-sdk==0.2.152`, the version every box was
+  measured on (2026-11-24, all bundling Claude Code 2.1.259). The installer verifies the
+  installed SDK equals the pin, that its bundled CLI exists and reports the version the SDK
+  declares (`_cli_version`), and holds the PATH fallback to that same version; an existing box
+  moves to the pin on its next agent upgrade. `tests/sdk_pin.py` covers it. Changing the
+  version is the SDK upgrade (DAT-306), never a drive-by edit.
 
 ### `/health` now says which agent build the box is running
 
@@ -1163,19 +1166,6 @@ push lands.
 | `chart_data` | Chart data push (for frontend) |
 | `error` | Error occurred |
 | `done` | Stream complete |
-
-⚠️ **On a resumed session `model_usage` and `total_cost_usd` are SESSION-cumulative, not per turn** (DAT-306 / SUT-95). Every turn is a fresh `query()` that resumes the project's session, and the CLI reports the running total for the whole session: turn N reports turns 1..N. Measured on claude-agent-sdk 0.2.188 / CLI 2.1.331, 2026-11-24 (`num_turns` and the flat `usage` are per invocation). So the running total is kept per project (`sdk_usage_baseline` in `meta.json`, survives a restart), a turn **snapshots it when it begins** (`conversations.usage_baseline`) and reports the difference when it ends (`conversations.turn_usage`). The snapshot, not "whatever was saved last", is what keeps two turns on one project right: both resume from the same point. The rules:
-- A turn that ends in a different session from the one it resumed (or a project's first turn) is a new running total, reported in full.
-- ⚠️ When the running total cannot be trusted, the turn reports **nothing**, never the whole figure (that is the bug, and it bills a session's entire history again; nothing loses one turn, which the gateway still has): a resumed session with no running total on record (the first turn after an agent upgrade, or after an import, which drops it), or a total that FELL within the same session. Both are logged.
-- No `model_usage`: a session's first turn reports the flat `usage` and cost; a resumed turn of a session that HAS had `model_usage` is deferred to the next turn's difference; a session that never has (a CLI build without it) reports the flat `usage` every turn, cost withheld (it is cumulative).
-- A resumed turn whose result names no session reports nothing (it cannot be told apart from the session's earlier turns).
-- The idempotency key is a per-turn id, never a count of saved replies: a turn that ends without a reply used to share the previous turn's key and be dropped as a duplicate.
-- `_account_turn_usage` records it **the moment the ResultMessage arrives**, before the title, satisfaction and labelling calls, so a turn that begins meanwhile snapshots a total that already includes this one. `conversations.commit_turn_usage` writes the deltas AND the new running total in ONE write (a cancel cannot separate them); the accounts reports go after the side-calls, best-effort.
-- The running total is only saved for the session the project holds. If another turn moved it while this one ran (two turns at once), this turn's own usage is ADDED to the saved total instead of replacing it, so however the CLI combines the two branches the next turn reports its own usage or less, never the other turn's again. The turn that found the total had FALLEN resets it, so later turns are not measured against a figure they can never reach.
-- Recording usage is guarded like the rest of usage tracking: a failure costs that turn's usage, never the user's turn.
-- `tool_calls` and `turns` are per invocation, so they are recorded on every turn, including one whose tokens are not reported.
-- ⚠️ The agent must parse on **Python 3.11** (the installer's venv): a nested-quote f-string parses on 3.12+ only, and broke this once. `tests/turn_usage.py` checks every module with `python3.11` when it is installed.
-- `tests/turn_usage.py` drives each of these through `stream_agent_response` (two turns at once included), with the real CLI figures; each check is mutation-tested.
 
 ## Cloud deployments on the user's behalf (DAT-305)
 

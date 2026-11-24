@@ -22,11 +22,13 @@ correction to that ticket, and CLAUDE.md, and all three were wrong. The number
 had been read off the LOCAL dev venv, which resolves a different SDK from
 production. One SSH session to a real box settled it: 2.1.228.
 
-The lesson worth keeping is general. `requirements.txt` pins a RANGE
-(`claude-agent-sdk>=0.2.128,<0.3`), so the bundled CLI is whatever resolution
+The lesson worth keeping is general. `requirements.txt` used to pin a RANGE
+(`claude-agent-sdk>=0.2.128,<0.3`), so the bundled CLI was whatever resolution
 picked on the day a box was built. A version derived from a range is a guess
 about what resolution will do, not a fact -- and a fact nobody can read without
-SSH is one people will guess about instead.
+SSH is one people will guess about instead. Since DAT-486 the SDK is pinned
+exactly and the installer checks the bundled CLI; this block is how the fleet
+shows it.
 
 ⚠️ THE HARNESS IS THE SDK'S BUNDLED CLI, NOT THE ONE ON PATH. `_find_cli`
 checks `claude_agent_sdk/_bundled/claude` FIRST and only falls back to
