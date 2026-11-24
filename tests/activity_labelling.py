@@ -386,8 +386,11 @@ def test_the_module_is_not_shadowed_in_main():
 
 
 async def test_the_default_cadence_is_what_the_gateway_is_told():
-    """The stepper trails the work by about this cadence (SUT-180 / DAT-482), and the gateway sizes its
-    hold from the value REPORTED, so the default must be what a push carries."""
+    """Two numbers, deliberately different (SUT-180 / DAT-482). The FLUSH age is what the activity
+    stepper trails the work by, so it is short. The REPORTED cadence is what the gateway holds each
+    record for 3x, and it has to cover the slow path, where a failed classify or push puts its calls
+    back and restarts the batch clock. Reporting the short flush age gave a 90 s hold that a single
+    timeout overran, filing those calls `unclassified` for good."""
     c = ReplyCollector(replies=[{}])         # the REAL _push, so the body is the one sent
     bodies = []
     send = c._send_labels
@@ -401,9 +404,23 @@ async def test_the_default_cadence_is_what_the_gateway_is_told():
     c.settle()
     await c._flush()
     reported = {b.get("push_interval_seconds") for b in bodies}
-    check(reported == {activity.DEFAULT_AGE_SECONDS}, f"each push reports the default cadence ({reported})")
+    check(reported == {activity.REPORTED_CADENCE_SECONDS},
+          f"each push reports the hold budget, not the flush age ({reported})")
     check(activity.MIN_AGE_SECONDS <= activity.DEFAULT_AGE_SECONDS <= 30.0,
-          f"and it is 30 s or less, above the floor ({activity.DEFAULT_AGE_SECONDS})")
+          f"the flush age is 30 s or less, above the floor ({activity.DEFAULT_AGE_SECONDS})")
+    # The gateway holds for its multiplier (3 on both deployments) x what we report. The worst single
+    # failure: wait a flush, classify times out, the clock restarts, wait a flush again, then classify
+    # and push each take up to their timeouts.
+    flush = activity.DEFAULT_AGE_SECONDS + activity.TICK_SECONDS
+    worst = (2 * flush + 2 * activity.CLASSIFY_TIMEOUT_SECONDS + activity.PUSH_TIMEOUT_SECONDS)
+    hold = 3 * activity.REPORTED_CADENCE_SECONDS
+    check(hold >= worst, f"the hold ({hold:.0f} s) covers one failed flush and its retry ({worst:.0f} s)")
+    # And the hold does not drag the flush back up: tightening from the gateway's reply settles on the
+    # flush age, not on a third of the hold.
+    tightened = max(activity.MIN_AGE_SECONDS,
+                    min(activity.DEFAULT_AGE_SECONDS, hold / activity.HOLD_SAFETY_DIVISOR))
+    check(tightened == activity.DEFAULT_AGE_SECONDS,
+          f"a {hold:.0f} s hold still flushes every {activity.DEFAULT_AGE_SECONDS:.0f} s (got {tightened})")
 
 
 async def test_the_age_deadline_cannot_decay_without_bound():
