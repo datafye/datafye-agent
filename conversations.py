@@ -1008,20 +1008,37 @@ def turn_usage(start: Optional[dict], session_id: Optional[str], resumed_from: O
     return own, None, COUNTED
 
 
+def _plus(total: dict, own: dict) -> dict:
+    """A running total with one turn's own usage added, per model."""
+    out = {m: _canonical(e) for m, e in (total or {}).items() if isinstance(e, dict)}
+    for model, entry in (own or {}).items():
+        into = dict(out.get(model) or {})
+        for k, v in entry.items():
+            if k not in CUMULATIVE_USAGE_FIELDS:
+                into.setdefault(k, v)
+        for f in CUMULATIVE_USAGE_FIELDS:
+            if f in entry:
+                into[f] = _num(into.get(f)) + _num(entry.get(f))
+        out[model] = into
+    return out
+
+
 def commit_turn_usage(conversation_id: str, session_id: Optional[str], model_usage: Optional[dict],
-                      deltas: dict, idem_base: str, reset: bool = False) -> Optional[dict]:
+                      deltas: dict, idem_base: str, reset: bool = False,
+                      start: Optional[dict] = None, own: Optional[dict] = None) -> Optional[dict]:
     """Record a turn's per-model deltas AND move the session's running total, in ONE write.
 
     ⚠️ One write, because the two must not separate: a turn cancelled between them (a Stop, dormancy)
     would leave the running total moved past usage that was never recorded, and the next turn would
     subtract it away for good. Returns the updated usage view, or None if the project does not exist.
 
-    The running total only ever moves FORWARD within a session, and only for the session the project
-    actually holds: two turns at once can finish in either order, and the later save must not carry
-    the total backwards or onto a session the next turn will not resume. ``reset`` is the one
-    exception: the turn that FOUND the session's total had fallen (WENT_DOWN) sets it to the new,
-    lower figure, or every later turn of that session would be measured against a total it can never
-    reach again and report nothing.
+    The running total is only ever saved for the session the project actually holds. If ANOTHER turn
+    moved it while this one ran (two turns at once, ``start`` no longer what is saved), this turn's
+    own usage is ADDED to what is saved rather than replacing it: however the CLI then combines the
+    two branches of the session, the next turn is measured against a total that already counts both,
+    so it can only report its own usage or less, never another turn's again. ``reset`` is for the turn
+    that FOUND the total had fallen (WENT_DOWN): it saves the new, lower figure, or every later turn of
+    the session would be measured against a total it can never reach again.
     """
     record = _read(conversation_id)
     if record is None:
@@ -1032,10 +1049,11 @@ def commit_turn_usage(conversation_id: str, session_id: Optional[str], model_usa
     if session_id and isinstance(model_usage, dict) and model_usage:
         held = record.get("sdk_session_id")
         saved = record.get("sdk_usage_baseline") or {}
-        behind = (saved.get("session_id") == session_id
-                  and usage_since(saved.get("model_usage"), model_usage) is None)
-        if (not held or held == session_id) and (reset or not behind):
-            record["sdk_usage_baseline"] = {"session_id": session_id, "model_usage": model_usage}
+        if not held or held == session_id:
+            moved_meanwhile = (not reset and saved.get("session_id") == session_id
+                               and saved != (start or {}))
+            total = _plus(saved.get("model_usage"), own) if moved_meanwhile else model_usage
+            record["sdk_usage_baseline"] = {"session_id": session_id, "model_usage": total}
     record["usage"] = usage
     record["updated_at"] = _now_ms()
     _write(record)

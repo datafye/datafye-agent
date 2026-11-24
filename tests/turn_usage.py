@@ -347,6 +347,64 @@ def test_the_agent_parses_on_the_boxes_python():
     check(not bad, f"every module parses on Python 3.11 ({bad or 'all'})")
 
 
+async def test_two_turns_whose_totals_cross_are_never_billed_again():
+    """Final pass: two turns at once whose totals each lead in a DIFFERENT field. Keeping either total
+    let the next turn bill part of the other again. Each turn's own usage is now added to the saved
+    total, so the next turn reports its own usage or less, however the CLI combines the two branches."""
+    a = {"in": 100, "out": 5}
+    b = {"in": 300, "out": 1}
+    c = {"in": 7, "out": 2}
+
+    def total(*parts):
+        e = T1[H]
+        return {H: entry(e["inputTokens"] + sum(x["in"] for x in parts),
+                         e["outputTokens"] + sum(x["out"] for x in parts),
+                         e["cacheReadInputTokens"], e["cacheCreationInputTokens"],
+                         e["costUSD"] + sum(x["in"] + x["out"] for x in parts) * 1e-6)}
+
+    for label, next_total in (("the CLI sums both branches", total(a, b, c)),
+                              ("the CLI continues from the last branch", total(b, c))):
+        cid = "proj-cross-" + ("sum" if "sums" in label else "last")
+        conversations.ensure(cid)
+        SCRIPT[cid + "0"] = [{"session": "s", "mu": T1, "cost": 0.02}]
+        await run(cid, cid + "0")
+        SCRIPT[cid + "a"] = [{"session": "s", "mu": total(a), "cost": 0.03, "delay": 0.05}]
+        SCRIPT[cid + "b"] = [{"session": "s", "mu": total(b), "cost": 0.03, "delay": 0.1}]
+        await asyncio.gather(run(cid, cid + "a"), run(cid, cid + "b"))
+        SCRIPT[cid + "c"] = [{"session": "s", "mu": next_total, "cost": 0.04}]
+        await run(cid, cid + "c")
+        third = [r[2] for r in reports(cid) if r[1] == H][3:]
+        got_in = sum(d.get("tokens_in", 0) for d in third)
+        got_out = sum(d.get("tokens_out", 0) for d in third)
+        if "sums" in label:
+            check((got_in, got_out) == (c["in"], c["out"]),
+                  f"{label}: the next turn reports exactly its own usage ({got_in}, {got_out})")
+        check(got_in <= c["in"] and got_out <= c["out"],
+              f"{label}: the next turn reports at most its own usage (in {got_in} <= {c['in']}, out {got_out} <= {c['out']})")
+
+
+async def test_a_failure_recording_usage_does_not_break_the_turn():
+    """Final pass: recording moved into the message loop, outside the guard that kept usage tracking
+    from ever breaking a turn. A failure there must cost the usage, never the user's turn."""
+    cid = "proj-guard"
+    conversations.ensure(cid)
+    events = []
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    real, conversations.commit_turn_usage = conversations.commit_turn_usage, boom
+    try:
+        SCRIPT["guard"] = [{"session": "s", "mu": T1, "cost": 0.02}]
+        async for ev in main.stream_agent_response("guard", cid, None, "jwt"):
+            events.append(ev)
+    finally:
+        conversations.commit_turn_usage = real
+    text = "".join(str(e) for e in events)
+    check('"type": "done"' in text and '"type": "error"' not in text,
+          "the turn still completes, with no error event")
+
+
 if __name__ == "__main__":
     test_the_subtraction()
     test_an_import_drops_the_running_total()
@@ -358,7 +416,9 @@ if __name__ == "__main__":
               test_two_turns_at_once_each_count_their_own, test_the_deltas_and_the_running_total_are_one_write,
               test_the_running_total_is_saved_before_the_side_calls, test_a_resumed_turn_with_no_session_id_is_not_rebilled,
               test_a_cli_that_never_sends_model_usage_still_reports_flat_usage,
-              test_turn_counts_are_kept_when_no_tokens_are_reported):
+              test_turn_counts_are_kept_when_no_tokens_are_reported,
+              test_two_turns_whose_totals_cross_are_never_billed_again,
+              test_a_failure_recording_usage_does_not_break_the_turn):
         print(f"--- {t.__name__} ---")
         asyncio.run(t())
     print(f"\n{len(FAILED)} failure(s)" if FAILED else "\nall checks pass")

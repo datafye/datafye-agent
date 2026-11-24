@@ -1070,7 +1070,8 @@ def _account_turn_usage(conversation_id: str, result_metrics: dict, usage_start,
     cell["tool_calls"] = int(tool_calls or 0)
     cell["turns"] = int(result_metrics.get("num_turns") or 0)
     updated = conversations.commit_turn_usage(conversation_id, session_id, cli_model_usage, deltas, idem_base,
-                                              reset=(verdict == conversations.WENT_DOWN))
+                                              reset=(verdict == conversations.WENT_DOWN),
+                                              start=usage_start, own=own)
     logger.info("[usage] %s: %s across %d model(s): %s", conversation_id, verdict, len(deltas), list(deltas))
     return [(m, d, idem_base + ":" + m) for m, d in deltas.items()], updated
 
@@ -2359,9 +2360,13 @@ async def stream_agent_response(
                     'num_turns': getattr(msg, 'num_turns', None),
                 }
                 if conversation_id:
-                    turn_reports, usage_at_result = _account_turn_usage(
-                        conversation_id, result_metrics, usage_start, resumed_from, tool_calls_this_turn,
-                        str(result_metrics.get("session_id") or "nosess") + ":" + turn_uid)
+                    # Usage tracking never breaks a turn: the user already has the reply.
+                    try:
+                        turn_reports, usage_at_result = _account_turn_usage(
+                            conversation_id, result_metrics, usage_start, resumed_from, tool_calls_this_turn,
+                            str(result_metrics.get("session_id") or "nosess") + ":" + turn_uid)
+                    except Exception as e:      # noqa: BLE001
+                        logger.warning("[usage] %s: could not record this turn's usage: %s", conversation_id, e)
 
         logger.info(f"[TRACE] Done. Messages processed: {msg_count}")
 
