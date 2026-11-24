@@ -2396,25 +2396,20 @@ async def stream_agent_response(
                 # because the gateway meters every call exactly and now knows its activity, so the
                 # MEASURED breakdown belongs there (DAT-319).
                 base_idem = f"{result_metrics.get('session_id') or 'nosess'}:{_turn_index(conversation_id)}"
-                # ⚠️ The CLI's model_usage and total_cost_usd are CUMULATIVE for a resumed session
-                # (SUT-95 / DAT-306): reported verbatim, turn N re-reported turns 1..N. Take this
-                # turn's own share, against the running total last seen for the session.
-                cli_model_usage = result_metrics.get('model_usage')
-                model_usage, turn_cost = conversations.take_turn_usage(
-                    conversation_id, result_metrics.get('session_id'), cli_model_usage,
-                    result_metrics.get('cost_usd'))
+                model_usage = result_metrics.get('model_usage')
                 updated_usage = None
                 # Whole-turn roll-up (across every model + the Haiku sidecars),
                 # tagged onto the final reply so the accounts Conversation view
                 # can show tokens/cost per turn = all work done + the reply.
                 turn_usage = {k: 0 for k in _TURN_USAGE_FIELDS}
 
-                if isinstance(cli_model_usage, dict) and cli_model_usage:
-                    # Preferred path: this turn's own usage per model (summed across the turn's
-                    # agentic loop by the CLI; the session's earlier turns taken off above), every
-                    # token type incl. cache read/create, plus each model's own cost. One delta per
-                    # model, idempotency-keyed per model so a multi-model turn (e.g. Opus main loop
-                    # + an internal Haiku) lands in the right cells without double-counting on retry.
+                if isinstance(model_usage, dict) and model_usage:
+                    # Preferred path: per-model, whole-turn-CUMULATIVE usage --
+                    # every token type (incl. cache read/create) summed across
+                    # the whole agentic loop, plus each model's own cost. One
+                    # delta per model, idempotency-keyed per model so a
+                    # multi-model turn (e.g. Opus main loop + an internal Haiku)
+                    # lands in the right cells without double-counting on retry.
                     primary = _model_label(CLAUDE_MODEL)
                     attributed_extras = False
                     for model_id, entry in model_usage.items():
@@ -2437,7 +2432,7 @@ async def stream_agent_response(
                     # read + total cost, attributed to the configured model. This
                     # undercounts multi-step turns -- kept only so usage tracking
                     # degrades gracefully rather than vanishing.
-                    delta = _usage_delta(dict(result_metrics, cost_usd=turn_cost), tool_calls_this_turn)
+                    delta = _usage_delta(result_metrics, tool_calls_this_turn)
                     model_id = _model_label(CLAUDE_MODEL)
                     idem = f"{base_idem}:{model_id}"
                     _accumulate_turn_usage(turn_usage, delta)

@@ -1163,8 +1163,6 @@ push lands.
 | `error` | Error occurred |
 | `done` | Stream complete |
 
-⚠️ **On a resumed session `model_usage` and `total_cost_usd` are SESSION-cumulative, not per turn** (DAT-306 / SUT-95). Every turn is a fresh `query()` that resumes the project's session, and the CLI reports the running total for the whole session: turn N reports turns 1..N. Measured on claude-agent-sdk 0.2.188 / CLI 2.1.331, 2026-11-24 (`num_turns` and the flat `usage` are per invocation). So `conversations.take_turn_usage` keeps the last running total seen per session in the project's `meta.json` (`sdk_usage_baseline`, so it survives a restart) and the turn reports the DIFFERENCE, per model. A different session id, or a figure that went down, is a new running total and is reported in full; a model that did not run this turn is left out. The baseline is saved BEFORE reporting, so a failed report under-counts its turn rather than double-counting it on the next one. One-time edge: a project mid-conversation when the agent is upgraded has no baseline yet, so its first turn after the upgrade still reports the whole running total. `tests/turn_usage.py` drives two resumed turns through `stream_agent_response` with the real CLI figures and asserts the second excludes the first.
-
 ## Activity per call (DAT-319)
 
 There is **no project lifecycle** any more. A project used to carry an inferred `intent`, a
