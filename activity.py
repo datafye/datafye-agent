@@ -74,8 +74,26 @@ UNLABELLED = "unlabelled"
 # a busy turn should produce a handful of classification calls rather than one a minute.
 BATCH_CALLS = 25
 # ...or when the oldest unlabelled call is this old, whichever comes first. This is the trigger that
-# bounds latency on a slow turn, and it is what we report to the gateway as our cadence.
-DEFAULT_AGE_SECONDS = 60.0
+# bounds latency on a slow turn.
+#
+# 30 s (SUT-180 / DAT-482, was 60): a labelled record is released to accounts as soon as its label
+# lands, so this is what decides how far the app's activity stepper trails the work. The cost is the
+# classifier, measured at 0.3% of a turn at 60 s, so roughly another 0.3% here. Below about 15 s a
+# batch is one or two calls: less context per question and more questions.
+DEFAULT_AGE_SECONDS = 30.0
+# What we REPORT to the gateway as our cadence, which it holds each record for 3x. Deliberately NOT the
+# flush age above.
+#
+# ⚠️ The hold is not latency: a labelled record is released the moment its label lands, so a long hold
+# costs a labelled call nothing. What the hold must cover is the slow path. A failed classify or push
+# puts its calls back and restarts the batch clock, so a retry waits a whole flush age again on top of
+# the timeouts below, which do not shrink with the cadence. Reporting the 30 s flush age gave a 90 s
+# hold, and one timeout then landed the retried labels at about 90-110 s: after the hold, so those
+# calls were filed `unclassified` for good. A 60 s report keeps the 180 s hold that covers it.
+REPORTED_CADENCE_SECONDS = 60.0
+# The two network calls the slow path waits on, named so the hold budget can be checked against them.
+CLASSIFY_TIMEOUT_SECONDS = 20.0
+PUSH_TIMEOUT_SECONDS = 10.0
 # Headroom under the gateway's hold: if it tells us it holds for H, we must push comfortably inside
 # H or our labels arrive after the record has already gone.
 #
@@ -259,6 +277,12 @@ class Collector:
         # Calls asked about again on their own, and how many of those came back with a label.
         self.single_retries = 0
         self.recovered = 0
+
+    @property
+    def reported_cadence(self) -> float:
+        """The cadence the gateway sizes its hold from: never below `REPORTED_CADENCE_SECONDS`, so a
+        retry fits in the hold however fast we flush."""
+        return max(self._configured_age, REPORTED_CADENCE_SECONDS)
 
     @property
     def classifying(self) -> bool:
@@ -475,8 +499,8 @@ class Collector:
                 self._transport_failed = True
                 # ⚠️ A TRANSPORT failure is not the same as a bad answer. A 429 or a timeout on the
                 # classify call forfeited that batch for good - the buffer was already drained here -
-                # even though the gateway holds those records for about three times the cadence and
-                # would still accept the labels a minute later. Put them back and let the next flush
+                # even though the gateway holds those records for three times the REPORTED cadence
+                # (`REPORTED_CADENCE_SECONDS`), which is sized so that a retry still lands inside it. Put them back and let the next flush
                 # try again. A WRONG answer is different: a call that shared a batch is re-asked on its
                 # own (in `_classify`), and one already asked alone is not asked again, since the same
                 # question invites the same wrongness.
@@ -574,7 +598,7 @@ class Collector:
         numbered = "\n".join(
             "%d. %s" % (i + 1, _evidence(call)) for i, (_mid, call) in enumerate(batch))
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=CLASSIFY_TIMEOUT_SECONDS) as client:
                 resp = await client.post(
                     f"{self._base}/v1/messages",
                     # ⚠️ The ids go only where THIS call goes. Its URL was fixed when the turn
@@ -615,7 +639,7 @@ class Collector:
     async def _send_labels(self, body: dict):
         """The HTTP half of a push: ``(status, parsed body)``. Separate so the reply handling in
         `_push`, where the retry rules live, can be tested without a gateway."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=PUSH_TIMEOUT_SECONDS) as client:
             resp = await client.post(
                 f"{self._gateway}/gateway/label", json=body,
                 headers={"x-api-key": self._token, "content-type": "application/json"})
@@ -628,14 +652,14 @@ class Collector:
         # ever makes pushes more frequent. Reporting the tightened value instead closes a feedback
         # loop - the gateway sizes its hold from what we report, we tighten from its hold - and the
         # deadline then shrinks on every push until there is one classification call per model call.
-        body = {"push_interval_seconds": self._configured_age,
+        body = {"push_interval_seconds": self.reported_cadence,
                 "calls": [{"message_id": mid, "activity": act} for mid, act in labels]}
         try:
             status, out = await self._send_labels(body)
             if status >= 400:
                 logger.warning("Gateway label push returned %s for %d call(s)", status, len(labels))
                 # 4xx other than 429 is our own fault and will not fix itself; retrying a malformed
-                # push every minute for the rest of the turn helps nobody.
+                # push on every flush for the rest of the turn helps nobody.
                 return status < 500 and status != 429
         except Exception as e:      # noqa: BLE001
             logger.warning("Gateway label push failed for %d call(s): %s", len(labels), e)

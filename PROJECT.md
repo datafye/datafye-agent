@@ -1970,7 +1970,7 @@ The mechanics live in `activity.py`, and they are deliberately boring:
 
 - Each model call's thinking, text and **tool names** (never tool inputs, which would put user data
   through a classifier) are buffered by `message_id`, the same id the metering gateway records.
-- Every 25 calls, or whenever the oldest one is 60 seconds old, one cheap Haiku call labels the
+- Every 25 calls, or whenever the oldest one is 30 seconds old (60 before DAT-482), one cheap Haiku call labels the
   whole batch, and the labels go to the gateway's `POST /gateway/label`. The gateway holds each
   usage record until its label arrives (DAT-317), so the record it finally delivers to accounts says
   what the call was for.
