@@ -209,6 +209,10 @@ async def watch(base: str, token: str, deployment_id: str, job_id: str, offset: 
                                 elif name == "error":
                                     refused = data.get("error")
                                     done = True
+                                elif name == "reconnect":
+                                    # accounts ended a long stream with the job still running
+                                    next_offset = int(data.get("next_offset", next_offset))
+                                    reading = False
                             lines = []
     except httpx.HTTPError as e:
         refused = f"the progress stream broke ({e.__class__.__name__}); the job itself continues on accounts"

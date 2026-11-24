@@ -165,6 +165,12 @@ async def main():
     check("carries on regardless" in r["text"] and "offset=50" in r["text"], r["text"])
     check(4 <= took < 8, f"returned at its limit, not when the stream closed ({took:.1f}s)")
 
+    print("== watch: a stream accounts ends at its limit is resumed, not reported ended ==")
+    Accounts.events = [(0, sse("status", {"status": "Running"})), (0, sse("log", {"text": "x\n"}, 61)),
+                       (0, sse("reconnect", {"next_offset": 61}, 61))]
+    r = await cd.watch(base, token, "dep-7", "job-12", 59, 30)
+    check(not r["done"] and r["next_offset"] == 61 and "offset=61" in r["text"], r["text"])
+
     print("== watch: losing access, and a job that cannot be found ==")
     Accounts.events = [(0, sse("status", {"status": "Running"})),
                        (0, sse("error", {"error": "This job can no longer be watched"}))]
