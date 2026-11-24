@@ -397,4 +397,10 @@ def _retarget_record(meta_path: Path, conversation_id: str) -> None:
         raise ArchiveError(f"archive's meta.json is not readable: {e}")
     record["id"] = conversation_id
     record["imported_at"] = _now_ms()
+    # ⚠️ The session's running total (SUT-95 / DAT-306) belongs to the box the archive came from, as of
+    # when it was taken. Kept, an import onto the same box rolls it back while the session's own total
+    # keeps going, and the next turn bills everything since the export a second time. Dropped, that
+    # turn is a resumed session with no running total on record, which is counted as nothing and
+    # starts a fresh one.
+    record.pop("sdk_usage_baseline", None)
     meta_path.write_text(json.dumps(record, indent=2))
