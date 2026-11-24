@@ -2186,6 +2186,28 @@ The data volume itself is **32 GB**, and unlike the root that one genuinely was 
 
 Finally, the agent had to be told. The prompt's resource guard used to say "check `df -h`". On a one-volume box that was unambiguous; on a two-volume box it shows both filesystems and the interesting one is not `/`. So the guard now says `df -h $(docker info --format '{{.DockerRootDir}}')` — ask Docker where its data is and measure *that*. Reading the wrong line costs you a refused fetch that would have fit, or a started fetch that cannot finish.
 
+## Sending your environment to the cloud, as you (DAT-305)
+
+Your foundry lives on your sandbox, and your sandbox goes to sleep when you stop chatting. That's fine
+for a backtest. It's no good for paper trading you want running over the weekend. So Yukti can now
+deploy the project's environment to Datafye's cloud: four small tools that talk to the accounts
+deployment API.
+
+The interesting design choice is *whose* request it is. The agent already holds the user's own session,
+forwarded on every turn for usage and feedback reports, so it uses that and mints nothing of its own.
+That one decision answers three questions for free. The deployment belongs to the user, not to "the
+agent". Whether they may deploy is accounts' call (an admin grants it per account) and the agent doesn't
+need to know the rule. And when accounts says no, the model can relay the reason in accounts' own words,
+because that's what comes back. **Borrow the caller's authority rather than inventing your own, and a
+lot of policy stops being your code.**
+
+A provision takes 20 to 30 minutes, longer than anyone wants a tool call to block. So
+`deployment_progress` takes a bounded look at the job's event stream (two minutes by default) and
+reports what happened in that window, with an offset to pick up from. The job runs on accounts whether
+the agent watches or not. A turn can end halfway through a deploy and nothing is lost: next time,
+`list_deployments` shows where it got to. **When the work outlives the conversation, the conversation
+should only ever be a window onto it.**
+
 ## Receive-Only Integration with `datafye-accounts`
 
 The agent is a **receive-only worker** in the Datafye sandbox plane. The shape of its role: it **receives** credentials and JWTs, it **does** work, it never **asks** accounts for anything. Accounts is the only writer in the relationship. This section captures how that integration is wired.

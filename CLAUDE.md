@@ -86,6 +86,7 @@ datafye-agent/
 ├── auth.py          # JWT validation against accounts' JWKS (with clock-skew leeway)
 ├── credentials.py   # Encrypted on-disk credentials store
 ├── broker.py        # ConnectTrade broker integration
+├── cloud_deployments.py # DAT-305: deploy the project's environment to Datafye's cloud through accounts, with the user's own session
 ├── conversations.py # Per-user project store — one FOLDER per project (meta.json + CLAUDE.md + PROJECT.md + memory/ + .claude/skills/)
 ├── memory.py        # Cross-session memory: global store + the memory-protocol block injected into the prompt
 ├── project_archive.py # DAT-293 export/import: one project, or the user's cross-project memory, as a versioned zip. Mostly REFUSALS — an archive is untrusted input
@@ -1165,6 +1166,51 @@ push lands.
 | `chart_data` | Chart data push (for frontend) |
 | `error` | Error occurred |
 | `done` | Stream complete |
+
+## Cloud deployments on the user's behalf (DAT-305)
+
+The local foundry stops when the box sleeps. A user who wants their environment kept up (paper trading
+round the clock) can have it deployed to Datafye's cloud, through four in-process tools on the
+`deployments` MCP server (`_build_deployment_mcp`), offered only with a forwarded identity:
+
+| Tool | Does |
+|---|---|
+| `deploy_environment(name?, version?)` | `POST /deployments` with the descriptor of THIS project's local foundry (`_fetch_deployment_state`), `project_id` = the conversation id; the default name is `<username>-<project tail>` (the username is shortened, never the tail) |
+| `deployment_progress(deployment_id, job_id, offset, seconds)` | follows the job's server-sent event stream (`GET .../jobs/{job}/events`) for up to `seconds` (max 600) and returns status, ended or not, and the log's tail |
+| `list_deployments()` | the user's deployments and whether they may create one |
+| `deployment_operation(deployment_id, operation, version?, system?, confirm_name?)` | stop, start, upgrade (optionally one system), deprovision (needs `confirm_name`) |
+
+- ⚠️ **The user's OWN session JWT, never an agent token** (the DAT-305 decision): the deployment is owned by
+  the user, and accounts decides whether they may deploy at all (an admin's per-account grant, decided
+  2026-11-24; spending also needs the owner's grant). A refusal reaches the model in accounts' words and
+  the prompt tells it to relay it, not retry or route around it.
+- **What is deployed is the ENVIRONMENT**, never the user's app (DAT-475) and never live: accounts
+  refuses a `live` descriptor at every launch, whatever this sends.
+- ⚠️ **The box has ONE foundry, shared by every project on it**, so what is running may be another
+  project's. `deploy_environment` deploys only when the running descriptor equals (as parsed YAML) the one
+  accounts recorded for THIS project (`GET /accounts/{u}/projects/{id}`, `deployment_descriptor`, which the
+  agent reports whenever a project's environment changes), and refuses a project that never recorded one
+  (review of #75: it would have shipped another project's environment under this one's name).
+- ⚠️ **Deprovision is guarded in the tool, not only the prompt**: it needs `confirm_name`, checked against
+  the deployment's name read from accounts before anything is sent.
+- ⚠️ **Ids from the model are checked (`dep-<n>`, `job-<n>`) before they become URL path segments**: they
+  are sent with the user's session, and a crafted id (`../accounts/...`) would reach another route as them.
+- **Nothing here raises.** A transport failure or an unreadable answer becomes text, and a create or an
+  operation whose request may have arrived says so and points at `list_deployments` rather than inviting
+  a blind retry (which could create a second deployment). A 401 is reported as the session having expired,
+  not as a refusal (the next message carries a fresh session). A stream that breaks after a status says it
+  broke and what it last saw; a window with no status says the status is unknown, never "queued".
+- **A deploy takes 20-30 minutes and runs on accounts**, so `deployment_progress` is a bounded look, not a
+  wait for the end: the model relays a sentence and can call again with the returned offset, and a turn
+  that ends mid-deploy loses nothing (`list_deployments` finds it later). A stream accounts ends at its
+  3-hour limit says `reconnect`, which is reported as still running, never as ended.
+- The prompt section **CLOUD DEPLOYMENTS** says when to offer it and that it needs the user's explicit
+  go-ahead; deprovision is confirmed by name.
+- `cloud_deployments.py` is plain async functions of (base, token, ...), each returning text written for
+  the model. `tests/cloud_deployments.py` drives them against a stub accounts serving real HTTP and a
+  real event stream, and the deploy tool's project check through its real handler
+  (`python3 tests/cloud_deployments.py`, with the venv's Python); mutation-checked (one equivalent
+  mutant: the watch deadline is enforced twice).
 
 ## Activity per call (DAT-319)
 
