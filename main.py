@@ -151,19 +151,24 @@ DATAFYE_DEPLOYMENT_API_URL = os.getenv(
 )
 
 # Datafye API MCP server (DAT-439). Two exist while the Java one proves itself:
-#   java  the REST service's own /mcp, served by every deployment, whose tools
-#         are generated from the API's OpenAPI spec (the default)
 #   npm   the hand-written datafye-mcp-api server, the separate container the
-#         CLI still runs beside a local deployment on :3200
-# Switching back is one setting: DATAFYE_AGENT_API_MCP_SERVER=npm in agent.env
-# (or the installer's --mcp-server npm, which persists across upgrades), then a
-# restart. DATAFYE_AGENT_API_MCP_URL, when set, overrides both, for a box
-# pointed at some other server entirely.
+#         CLI runs beside a local deployment on :3200 (the default)
+#   java  the REST service's own /mcp, whose tools are generated from the API's
+#         OpenAPI spec; served only by deployments from 2.0.64 on
+# The default stays npm until every deployment serves /mcp and the Java server is
+# checked against npm (DAT-487): an agent upgrades itself within minutes, a
+# deployment only when re-provisioned, and on an older deployment the Java
+# default would leave the agent with no Datafye tools at all.
+# Choosing is one setting: DATAFYE_AGENT_API_MCP_SERVER=java in agent.env (or the
+# installer's --mcp-server java, which persists across upgrades), then a restart.
+# Left unset, a box follows whatever default its release ships.
+# DATAFYE_AGENT_API_MCP_URL, when set, overrides both, for a box pointed at some
+# other server entirely.
 _API_MCP_SERVER_URLS = {
     "java": DATAFYE_DEPLOYMENT_API_URL.rstrip("/") + "/mcp",
     "npm": "http://local-foundry-dev-mcp-api.datafye.local:3200/mcp",
 }
-DATAFYE_API_MCP_SERVER = (os.getenv("DATAFYE_AGENT_API_MCP_SERVER") or "java").strip().lower()
+DATAFYE_API_MCP_SERVER = (os.getenv("DATAFYE_AGENT_API_MCP_SERVER") or "npm").strip().lower()
 if DATAFYE_API_MCP_SERVER not in _API_MCP_SERVER_URLS:
     raise SystemExit(
         f"DATAFYE_AGENT_API_MCP_SERVER={DATAFYE_API_MCP_SERVER!r} is not valid: "
