@@ -69,6 +69,7 @@ from prompt import build_system_prompt
 import activity as activity_labels
 import auth
 import broker
+import cloud_deployments
 import conversations
 import project_archive
 import credentials as credentials_module
@@ -1430,6 +1431,77 @@ def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[st
                                  tools=[submit_feedback, submit_satisfaction, set_environment_intent])
 
 
+def _build_deployment_mcp(auth_token: Optional[str], conversation_id: Optional[str]):
+    """In-process tools that deploy the project's environment to Datafye's cloud through accounts
+    (DAT-305), with the user's OWN forwarded session: the deployment is theirs, and whether they may
+    deploy is accounts' decision (an admin's per-account grant), relayed to the model as accounts words
+    it. Returns None when there is no forwarded identity (a self-hosted run), so the tools are not
+    offered. The HTTP and the event stream live in `cloud_deployments`, where they are tested."""
+    server = None
+    if auth_token and AGENT_USERNAME and getattr(auth, "ACCOUNTS_URL", None):
+        base = auth.ACCOUNTS_URL
+
+        def _text(result: dict) -> dict:
+            return {"content": [{"type": "text", "text": result["text"]}]}
+
+        @tool(
+            "deploy_environment",
+            "Deploy this project's environment to Datafye's cloud: the descriptor of the project's LOCAL "
+            "foundry, provisioned as a cloud deployment the user owns. Call it ONLY after the user has "
+            "explicitly said to deploy, having been told it runs in Datafye's cloud for as long as it is "
+            "up. `name` is optional (2-32 lowercase letters, digits, hyphens; a default is derived). "
+            "`version` is optional (the latest complete Datafye release when empty). Live trading is "
+            "never deployed. Returns the deployment and job ids; follow the job with deployment_progress.",
+            {"name": str, "version": str},
+        )
+        async def deploy_environment(args):
+            state = await _fetch_deployment_state()
+            descriptor = (state or {}).get("descriptor_text", "")
+            name = (args.get("name") or "").strip() or cloud_deployments.default_name(AGENT_USERNAME, conversation_id)
+            return _text(await cloud_deployments.create(base, auth_token, name, descriptor, conversation_id,
+                                                        (args.get("version") or "").strip() or None))
+
+        @tool(
+            "deployment_progress",
+            "Follow a cloud deployment job for up to `seconds` (default 120, at most 600) and report what "
+            "happened: its status, whether it has ended, and the new log lines. Call again with the "
+            "returned offset to continue. The job runs on its own whether or not you watch it.",
+            {"deployment_id": str, "job_id": str, "offset": int, "seconds": int},
+        )
+        async def deployment_progress(args):
+            return _text(await cloud_deployments.watch(base, auth_token, args.get("deployment_id") or "",
+                                                       args.get("job_id") or "", args.get("offset") or 0,
+                                                       args.get("seconds") or 120))
+
+        @tool(
+            "list_deployments",
+            "List the user's cloud deployments: name, state, Datafye version, API URL, a running job, and "
+            "what can be done to each; and whether the user may create one.",
+            {},
+        )
+        async def list_deployments(args):
+            return _text(await cloud_deployments.list_deployments(base, auth_token))
+
+        @tool(
+            "deployment_operation",
+            "Run an operation on one of the user's cloud deployments: 'stop', 'start', 'upgrade' (to "
+            "`version`, or the latest complete release when empty; with `system` set, only that one "
+            "system) or 'deprovision' (removes everything it runs on; confirm with the user first). Only "
+            "after the user has asked for it. Follow the returned job with deployment_progress.",
+            {"deployment_id": str, "operation": str, "version": str, "system": str},
+        )
+        async def deployment_operation(args):
+            return _text(await cloud_deployments.run(base, auth_token, args.get("deployment_id") or "",
+                                                     (args.get("operation") or "").strip().lower(),
+                                                     (args.get("version") or "").strip() or None,
+                                                     (args.get("system") or "").strip() or None))
+
+        server = create_sdk_mcp_server("deployments", "1.0.0",
+                                       tools=[deploy_environment, deployment_progress, list_deployments,
+                                              deployment_operation])
+    return server
+
+
 def _current_turn_key(conversation_id: Optional[str]) -> str:
     """The interlock key for "an intent was already recorded in this turn".
 
@@ -1831,6 +1903,12 @@ async def stream_agent_response(
         mcp_servers["feedback"] = reporting_server
         allowed_tools.append("mcp__feedback__submit_feedback")
         allowed_tools.append("mcp__feedback__submit_satisfaction")
+    # Cloud deployments on the user's behalf (DAT-305), on the same condition.
+    deployment_server = _build_deployment_mcp(auth_token, conversation_id)
+    if deployment_server is not None:
+        mcp_servers["deployments"] = deployment_server
+        allowed_tools.extend(["mcp__deployments__deploy_environment", "mcp__deployments__deployment_progress",
+                              "mcp__deployments__list_deployments", "mcp__deployments__deployment_operation"])
     system_prompt = build_system_prompt(
         docs_dir=DOCS_DIR,
         cli_path=CLI_PATH,
