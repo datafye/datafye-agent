@@ -723,42 +723,6 @@ else
     info "[${STEP}/${TOTAL_STEPS}] Fresh install (no existing service)"
 fi
 
-# ── Step: Install Claude Code CLI ────────────────────────────────
-# claude.ai/install.sh always lays files under the invoking user's
-# ~/.local (binary + supporting state), and the binary resolves its
-# install root at runtime — so a root install + /usr/local/bin symlink
-# would not work. Install as the datafye user (the runtime user) so
-# claude lands at /home/datafye/.local/{bin,share}/claude.
-#
-# ⚠️ THIS IS NOT THE HARNESS. A turn runs the CLI bundled inside the SDK
-# (claude_agent_sdk/_bundled/claude), because SubprocessCLITransport._find_cli
-# checks there FIRST and only then falls back to `which claude`. Nothing in the
-# agent invokes this binary; it exists solely as that fallback, for a future SDK
-# that ships without a bundled one. Kept deliberately (DAT-215) rather than
-# removed: it is cheap insurance against the agent having no harness at all.
-#
-# ⚠️ It is also ~300 MB of duplicate on a single root volume, and on the box
-# that was measured it was byte-for-byte the same VERSION as the bundled one
-# (both 2.1.228) — a coincidence that made it easy to believe this was the
-# harness. If DAT-178 (disk) gets tight, this is the first thing to reconsider,
-# but do it as a decision about the fallback, not as a cleanup.
-#
-# `/v1/bom` reports both, and which one is in use, so nobody has to SSH in and
-# guess again.
-CLAUDE_BIN="/home/datafye/.local/bin/claude"
-next_step
-info "[${STEP}/${TOTAL_STEPS}] Installing Claude Code CLI (as datafye user)..."
-if [ -x "${CLAUDE_BIN}" ]; then
-    ok "Claude Code CLI already installed: ${CLAUDE_BIN}"
-else
-    sudo -u datafye -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-    if [ ! -x "${CLAUDE_BIN}" ]; then
-        error "Claude CLI not found at ${CLAUDE_BIN} after install"
-        exit 1
-    fi
-    ok "Claude Code CLI: ${CLAUDE_BIN}"
-fi
-
 # ── Step: Install / validate Datafye CLI ─────────────────────────
 prune_old_cli_versions() {
     local versions_dir="${CLI_BASE}/versions"
@@ -986,6 +950,67 @@ if [ ! -d "${VENV_DIR}" ]; then
 fi
 "${VENV_DIR}/bin/pip" install --upgrade pip -q
 "${VENV_DIR}/bin/pip" install -r "${AGENT_CODE_DIR}/requirements.txt" -q
+ok "Python dependencies installed"
+
+# ── Step: The pinned Claude Agent SDK and the Claude Code it runs (DAT-486) ──
+# A turn runs the Claude Code BUNDLED inside the SDK (claude_agent_sdk/_bundled/claude): the SDK's
+# _find_cli checks there FIRST and only falls back to `which claude`. So the exact SDK pin in
+# requirements.txt is what decides the harness, and this step proves the box got exactly that,
+# instead of trusting resolution. A requirement change moves an existing box too: an exact pin that
+# the installed version does not satisfy makes `pip install -r` install the pinned one.
+#
+# The expected Claude Code version is read FROM the pinned SDK (its _cli_version), never written down
+# a second time here, so there is no second number to drift.
+next_step
+info "[${STEP}/${TOTAL_STEPS}] Verifying the pinned Claude Agent SDK and its Claude Code..."
+SDK_PIN=$(sed -n 's/^claude-agent-sdk==\([0-9][0-9.]*\).*/\1/p' "${AGENT_CODE_DIR}/requirements.txt" | head -1)
+if [ -z "${SDK_PIN}" ]; then
+    error "requirements.txt does not pin claude-agent-sdk to an exact version (==X.Y.Z)"
+    exit 1
+fi
+read -r SDK_INSTALLED HARNESS_PATH CLAUDE_CODE_VERSION <<< "$("${VENV_DIR}/bin/python" - <<'PY'
+import pathlib
+import claude_agent_sdk as sdk
+bundled = pathlib.Path(sdk.__file__).parent / "_bundled" / "claude"
+try:
+    from claude_agent_sdk._cli_version import __cli_version__ as cli
+except Exception:
+    cli = "-"
+print(sdk.__version__, bundled if bundled.is_file() else "-", cli or "-")
+PY
+)"
+if [ "${SDK_INSTALLED}" != "${SDK_PIN}" ]; then
+    error "claude-agent-sdk ${SDK_INSTALLED} is installed, but requirements.txt pins ${SDK_PIN}"
+    exit 1
+fi
+if [ "${HARNESS_PATH}" = "-" ] || [ "${CLAUDE_CODE_VERSION}" = "-" ]; then
+    error "claude-agent-sdk ${SDK_PIN} has no bundled Claude Code; the harness would be whatever is on PATH"
+    exit 1
+fi
+# The first run of the ~300 MB binary faults it in from a cold volume, hence the generous timeout.
+HARNESS_REPORTS=$(timeout 180 "${HARNESS_PATH}" --version 2>/dev/null | awk '{print $1}' || true)
+if [ "${HARNESS_REPORTS}" != "${CLAUDE_CODE_VERSION}" ]; then
+    error "the SDK's bundled Claude Code reports '${HARNESS_REPORTS}', expected ${CLAUDE_CODE_VERSION}"
+    exit 1
+fi
+ok "Claude Agent SDK ${SDK_INSTALLED}, running its bundled Claude Code ${CLAUDE_CODE_VERSION}"
+
+# The `claude` on PATH is NOT the harness: it is a fallback for an SDK that ships without a bundled
+# CLI, and nothing invokes it while the bundled one exists. It is held to the SAME version so the box
+# never carries two different Claude Codes (it used to drift: 2.1.260 on PATH beside a bundled
+# 2.1.259). claude.ai/install.sh always lays files under the invoking user's ~/.local and refuses to
+# run as root, so it runs as the runtime user. A failure here is a warning, not fatal: the fallback is
+# unused and an install must not fail over it.
+CLAUDE_BIN="/home/datafye/.local/bin/claude"
+PATH_CLAUDE=$(sudo -u datafye -H timeout 120 "${CLAUDE_BIN}" --version 2>/dev/null | awk '{print $1}' || true)
+if [ "${PATH_CLAUDE}" = "${CLAUDE_CODE_VERSION}" ]; then
+    ok "Fallback Claude Code on PATH: ${CLAUDE_CODE_VERSION}"
+elif sudo -u datafye -H bash -c "curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}" >/dev/null 2>&1 \
+        && [ "$(sudo -u datafye -H timeout 120 "${CLAUDE_BIN}" --version 2>/dev/null | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]; then
+    ok "Fallback Claude Code on PATH: ${PATH_CLAUDE:-none} -> ${CLAUDE_CODE_VERSION}"
+else
+    warn "Could not set the fallback Claude Code on PATH to ${CLAUDE_CODE_VERSION} (still ${PATH_CLAUDE:-none}); the harness is the bundled one, so turns are unaffected"
+fi
 
 # ── Quant stack for PROJECT code (DAT-186) ───────────────────────
 # Installed into the SYSTEM interpreter, not the agent's venv above. Each
@@ -1021,7 +1046,6 @@ else
     warn "Could not install the quant stack; project venvs will still build, but"
     warn "pandas/numpy will be missing until this is re-run. Agent is unaffected."
 fi
-ok "Python dependencies installed"
 
 # ── Step: Configure /etc/hosts for Datafye local environment ─────
 next_step

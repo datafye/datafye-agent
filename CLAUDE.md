@@ -621,8 +621,9 @@ arriving by another route.
 
 ⚠️ **The agent's harness is the SDK's BUNDLED CLI, not the one the installer puts on
 PATH.** `_find_cli` checks `claude_agent_sdk/_bundled/claude` **first** and only falls
-back to `shutil.which("claude")`. So the harness version tracks
-`claude-agent-sdk` in `requirements.txt` (`>=0.2.128,<0.3`), and the installer's
+back to `shutil.which("claude")`. So the harness version is fixed by the EXACT
+`claude-agent-sdk` pin in `requirements.txt` (DAT-486: `==0.2.152`, bundling 2.1.259; the
+installer fails if the box got anything else), and the installer's
 `/home/datafye/.local/bin/claude` is not what runs a turn. Anything that depends on
 harness behaviour must be verified against the *bundled* binary.
 
@@ -672,10 +673,12 @@ you are looking at a dev venv rather than production.
   only as the SDK's fallback for a future version that ships without a bundle: cheap
   insurance, kept deliberately, with its **~300 MB of duplicate** noted for DAT-178 so
   the trade-off is a decision rather than a discovery.
-- **The pin is now unblocked and NOT yet done.** `requirements.txt` still allows
-  `>=0.2.128,<0.3`; the exact pin to write is `claude-agent-sdk==0.2.136`, the version
-  production actually resolved. Writing a number before it was measurable would have
-  repeated the mistake the block exists to prevent.
+- **The pin is DONE (DAT-486):** `claude-agent-sdk==0.2.152`, the version every box was
+  measured on (2026-11-24, all bundling Claude Code 2.1.259). The installer verifies the
+  installed SDK equals the pin, that its bundled CLI exists and reports the version the SDK
+  declares (`_cli_version`), and holds the PATH fallback to that same version; an existing box
+  moves to the pin on its next agent upgrade. `tests/sdk_pin.py` covers it. Changing the
+  version is the SDK upgrade (DAT-306), never a drive-by edit.
 
 ### `/health` now says which agent build the box is running
 
