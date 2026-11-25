@@ -1800,6 +1800,23 @@ written part of itself.
   nothing. And the obvious streaming fix — collect chunks, `b"".join` at the end — holds both
   copies at once: a body at the 512 MB cap peaked near 1 GB of RSS. The ceiling bounded the upload
   and not the memory it cost, which is the same miss one layer down.
+- **Every refusal reports the OUTCOME it actually had, not one status per route (DAT-326).**
+  `project_archive.py` carries a four-class taxonomy and the status lives on the **class**:
+  `ArchiveError` (400, the base), `ArchiveNotFound` (404), `ArchiveConflict` (409),
+  `ArchiveTooLarge` (413). Both routes then collapse to one handler —
+  `except project_archive.ArchiveError as e: raise HTTPException(status_code=e.status, detail=str(e))`
+  — so a refusal added later reports itself correctly **without anyone touching a route**. Before
+  this each route flattened everything to a single code: the export answered **404** for all of
+  them, so a project over the export ceiling came back as a project that does not exist, and
+  import's "already exists" was a **400**, indistinguishable from a corrupt archive even though it
+  is the one refusal a caller resolves by itself (retry with `?overwrite=true`).
+  ⚠️ **Choose the class where the condition is known; never pass a status at the raise site.** A
+  bare `raise ArchiveError` compiles and is a perfectly valid 400 — exactly how "too large" came to
+  mean "not found". So `tests/project_archive.py` parses the module with `ast` and walks every
+  `raise Archive*` site: wording that reads as a size, a collision or an absence must not be the
+  base class, and a site that *is* the base class has to be named in an explicit `GENERIC`
+  allow-list of deliberate 400s. A new refusal with new wording fails the suite until somebody
+  decides which it is.
 
 ⚠️ **On the API test suite** (`tests/project_archive_api.py`, which runs a real agent process): it
 asserts that a **subject** mismatch is refused, not an audience one — this agent runs
