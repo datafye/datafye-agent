@@ -625,7 +625,7 @@ class Collector:
         # the accounts roll-up and the per-turn figure rather than being the one metered call in the
         # turn that nothing counts.
         if self._usage_sink is not None and data.get("usage"):
-            self._usage_sink.append({"model": self._model, "usage": data["usage"],
+            self._usage_sink.append({"model": self._model, "usage": data["usage"], "answered_by": data.get("model"),
                                      "message_id": data.get("id")})
         text = "".join(p.get("text", "") for p in data.get("content", [])
                        if p.get("type") == "text")
