@@ -67,6 +67,7 @@ from prompt import build_system_prompt
 # when a turn reaches the first use, as AttributeError on a 'function' (found the hard way in
 # the Sutra agent, SUT-114).
 import activity as activity_labels
+import pricing
 import auth
 import broker
 import cloud_deployments
@@ -832,7 +833,7 @@ async def generate_title(first_message: str, usage_sink: Optional[list] = None,
             # gateway. Without it the agent's own cheap calls would be the biggest
             # contributor to `unclassified`, and that word has to keep meaning
             # "labelling is broken" (DAT-319).
-            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"],
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"], "answered_by": data.get("model"),
                                "message_id": data.get("id")})
         parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
@@ -931,7 +932,7 @@ async def classify_environment_intent(transcript: str,
             # gateway. Without it the agent's own cheap calls would be the biggest
             # contributor to `unclassified`, and that word has to keep meaning
             # "labelling is broken" (DAT-319).
-            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"],
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"], "answered_by": data.get("model"),
                                "message_id": data.get("id")})
         parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
@@ -1011,7 +1012,7 @@ async def analyze_satisfaction(transcript: str, usage_sink: Optional[list] = Non
             # gateway. Without it the agent's own cheap calls would be the biggest
             # contributor to `unclassified`, and that word has to keep meaning
             # "labelling is broken" (DAT-319).
-            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"],
+            usage_sink.append({"model": TITLE_MODEL, "usage": data["usage"], "answered_by": data.get("model"),
                                "message_id": data.get("id")})
         parts = data.get("content", [])
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
@@ -2544,14 +2545,18 @@ async def stream_agent_response(
                     updated_usage = conversations.add_usage(conversation_id, model_id, delta, idem)
                     await _report_usage_to_accounts(conversation_id, model_id, delta, idem, auth_token)
 
-                # Fold in the Haiku sidecars (title, satisfaction, environment intent and
-                # the activity classifier).
-                # They bill separately from the SDK session, so they're not in
-                # model_usage. Tokens are captured; cost is 0 (the direct API
-                # response carries no cost) -- negligible, derived later if wanted.
+                # Fold in the agent's own side-calls (title, satisfaction, environment intent and
+                # the activity classifier). They bill separately from the SDK session, so they're not
+                # in model_usage, and their response carries no cost: each is priced here from the
+                # gateway's own table, by the model that ANSWERED, so the project's reported cost
+                # includes them (DAT-485). An unpriced model keeps cost 0 with a warning
+                # (pricing.cost_micros logs it).
                 for i, sc in enumerate(sidecar_usage):
                     sc_model = _model_label(sc.get('model') or TITLE_MODEL)
                     sc_delta = _usage_delta_from_model_entry(sc.get('usage') or {})
+                    sc_cost = pricing.cost_micros(sc.get('answered_by') or sc.get('model'), sc.get('usage'))
+                    if sc_cost is not None:
+                        sc_delta['cost_micros'] = sc_cost
                     sc_idem = f"{base_idem}:sidecar:{i}:{sc_model}"
                     _accumulate_turn_usage(turn_usage, sc_delta)
                     updated_usage = conversations.add_usage(conversation_id, sc_model, sc_delta, sc_idem)
