@@ -61,8 +61,10 @@ def _held(data: Any) -> Optional[str]:
     if isinstance(data, dict) and data.get("status") == "held":
         where = data.get("approve_url") or "the Datafye Cloud Console"
         text = (f"Not done yet: this {data.get('class') or 'held'} call waits for the account owner's approval in the console "
-                f"({where}). It runs once they approve it there, and expires if they do not. Do not repeat it: tell the "
-                "user it is waiting for their approval, then check list_deployments once they have decided.")
+                f"({where}; held call {data.get('action_id') or 'unknown'}). It runs once they approve it there, and expires "
+                "if they do not. Do not repeat it: tell the user it is waiting for their approval, and once they say they "
+                "have decided, call list_deployments to see whether it ran (an approved operation appears as the "
+                "deployment's active job).")
     return text
 
 
@@ -74,7 +76,10 @@ def _refusal(resp: httpx.Response) -> str:
         reason = body.get("message") or body.get("error") or resp.text
     except ValueError:
         reason = resp.text
-    if resp.status_code == 401:
+    if auth.is_identity_refusal(resp):
+        reason = ("accounts did not accept this agent's own identity, so nothing was done. The agent is asking accounts "
+                  "for a fresh one, which takes about a minute: do not retry before then, and tell the user")
+    elif resp.status_code == 401:
         reason = ("the user's session has expired or been revoked, so accounts would not answer. This is not a "
                   "refusal of the deployment: the next message the user sends carries a fresh session")
     return f"accounts refused it (HTTP {resp.status_code}): {reason}"
@@ -159,8 +164,8 @@ async def create(base: str, token: str, name: str, descriptor: str, project_id: 
         elif data is None:
             result = {"ok": False, "text": "accounts accepted the deployment but its answer could not be read; call "
                                            "list_deployments to find it before trying again."}
-        elif _held(data):
-            result = {"ok": False, "held": True, "text": _held(data)}
+        elif held := _held(data):
+            result = {"ok": False, "held": True, "text": held}
         else:
             dep = (data.get("deployment") or {}).get("id")
             job = (data.get("job") or {}).get("id")
@@ -206,8 +211,8 @@ async def run(base: str, token: str, deployment_id: str, operation: str, version
                                            "queued; call list_deployments to see before trying again."}
         elif resp.status_code // 100 != 2:
             result = {"ok": False, "text": f"The {operation} was not started: {_refusal(resp)}"}
-        elif _held(data):
-            result = {"ok": False, "held": True, "text": _held(data)}
+        elif held := _held(data):
+            result = {"ok": False, "held": True, "text": held}
         else:
             job = ((data or {}).get("job") or {}).get("id")
             result = {"ok": True, "job_id": job,

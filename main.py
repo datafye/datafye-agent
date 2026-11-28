@@ -436,6 +436,9 @@ class HealthResponse(BaseModel):
     """Response model for health endpoint."""
     status: str
     bootstrapped: bool              # False until the accounts bootstrap push lands
+    # accounts refused the agent identity this agent sends beside the user's session: accounts' poll re-pushes the
+    # bootstrap, which carries a fresh one (holds slice 3). Absent on an older agent, which reads as false.
+    agent_identity_refused: bool = False
     configured: bool                # an Anthropic key is set (any non-"missing" status)
     anthropic_key_status: str       # missing | ok | invalid | unvalidated
     workspace: str
@@ -2792,8 +2795,9 @@ async def health():
     creds = credentials  # None until bootstrapped
     return HealthResponse(
         status="healthy",
-        # a refused agent identity reads as not bootstrapped, so accounts re-pushes one (DAT-498 slice 3)
-        bootstrapped=_bootstrapped and not auth.identity_refused(),
+        bootstrapped=_bootstrapped,
+        # accounts refused this agent's identity: its poll re-pushes the bootstrap, which carries a fresh one
+        agent_identity_refused=auth.identity_refused(),
         configured=(anthropic_key_status != "missing"),
         anthropic_key_status=anthropic_key_status,
         agent_version=AGENT_VERSION,

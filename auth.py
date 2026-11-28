@@ -93,33 +93,56 @@ _AGENT_IDENTITY: str | None = None
 
 
 _IDENTITY_REFUSED = False
+# How many times in a row a re-pushed identity was refused again. Past the cap the agent stops asking: accounts is then
+# issuing identities it cannot verify (a key mismatch), and asking every poll would only re-push a bootstrap a minute.
+_REFUSALS_IN_A_ROW = 0
+MAX_IDENTITY_REFUSALS = 3
 
 
 def set_agent_identity(identity) -> None:
-    """Called by main.py's /bootstrap handler with the token's `agent_identity` claim (absent on an older accounts)."""
+    """Called by main.py's /bootstrap handler with the token's `agent_identity` claim (absent on an older accounts).
+    A refusal is cleared only by a DIFFERENT identity: the same one again is still the one accounts refused."""
     global _AGENT_IDENTITY, _IDENTITY_REFUSED
-    _AGENT_IDENTITY = identity if isinstance(identity, str) and identity else None
-    _IDENTITY_REFUSED = False
+    new = identity if isinstance(identity, str) and identity else None
+    if new != _AGENT_IDENTITY:
+        _IDENTITY_REFUSED = False
+    _AGENT_IDENTITY = new
+
+
+def is_identity_refusal(resp) -> bool:
+    """Whether this reply is accounts refusing the agent's identity: 401 with `{"error": "AgentIdentityRefused"}`, read
+    from the parsed field, never a substring of the body (a message that merely mentions it is not one)."""
+    try:
+        body = resp.json() if resp is not None and resp.status_code == 401 else None
+        refused = isinstance(body, dict) and body.get("error") == "AgentIdentityRefused"
+    except Exception:
+        refused = False
+    return refused
 
 
 def observe_accounts_reply(resp) -> None:
-    """Called after every call to accounts. A 401 `AgentIdentityRefused` means accounts no longer accepts this agent's
-    identity (re-keyed, or an older one): the agent then reports itself NOT bootstrapped on /health, and accounts' poll
-    re-pushes the bootstrap, which carries a fresh identity. ⚠️ The identity is NOT dropped meanwhile: calls without it
-    would reach accounts as the user's own, never held, which is exactly what the refusal stops."""
-    global _IDENTITY_REFUSED
-    try:
-        refused = resp is not None and resp.status_code == 401 and "AgentIdentityRefused" in (resp.text or "")
-    except Exception:
-        refused = False
-    if refused and not _IDENTITY_REFUSED:
-        logger.warning("accounts refused this agent's identity; reporting not bootstrapped until accounts re-pushes one")
-    _IDENTITY_REFUSED = _IDENTITY_REFUSED or refused
+    """Called after every call to accounts. On a refused identity (re-keyed, or a stale one) the agent reports
+    `agent_identity_refused` on /health, and accounts' poll re-pushes the bootstrap, which carries a fresh identity.
+    ⚠️ The identity is NOT dropped meanwhile: calls without it would reach accounts as the user's own, never held, which
+    is exactly what the refusal stops. ⚠️ And `bootstrapped` stays true: the agent IS bootstrapped and chat works, so
+    saying otherwise would tell the workspace the box is starting."""
+    global _IDENTITY_REFUSED, _REFUSALS_IN_A_ROW
+    if is_identity_refusal(resp) and not _IDENTITY_REFUSED:
+        _IDENTITY_REFUSED = True
+        _REFUSALS_IN_A_ROW += 1
+        if _REFUSALS_IN_A_ROW > MAX_IDENTITY_REFUSALS:
+            logger.error("accounts has refused this agent's identity %s times in a row, each a fresh one: accounts is "
+                         "issuing identities it cannot verify. No longer asking for another; calls to accounts fail "
+                         "until it is fixed", _REFUSALS_IN_A_ROW)
+        else:
+            logger.warning("accounts refused this agent's identity; asking for a fresh one on /health")
+    elif resp is not None and getattr(resp, "status_code", 0) // 100 == 2:
+        _REFUSALS_IN_A_ROW = 0
 
 
 def identity_refused() -> bool:
-    """Whether accounts refused this agent's identity since the last bootstrap (see observe_accounts_reply)."""
-    return _IDENTITY_REFUSED
+    """What /health reports as `agent_identity_refused`: refused since the identity last changed, and not past the cap."""
+    return _IDENTITY_REFUSED and _REFUSALS_IN_A_ROW <= MAX_IDENTITY_REFUSALS
 
 
 def accounts_headers(token: str, extra: dict | None = None) -> dict:

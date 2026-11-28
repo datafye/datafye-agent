@@ -166,17 +166,30 @@ async def main():
     Accounts.create_body = {"deployment": {"id": "dep-7"}, "job": {"id": "job-12"}}
     Accounts.jobs_status, Accounts.jobs_body = 202, held
     r = await cd.run(base, token, "dep-7", "stop")
-    check(not r["ok"] and r.get("held") and "Do not repeat it" in r["text"] and "job" not in r.get("job_id", "") , r["text"])
+    check(not r["ok"] and r.get("held") and "Do not repeat it" in r["text"] and "pa-3" in r["text"] and "job_id" not in r, r["text"])
     # a refused identity is never dropped (its calls would become the user's own): the agent reports itself not
     # bootstrapped instead, so accounts re-pushes one
     Accounts.jobs_status, Accounts.jobs_body = 401, {"error": "AgentIdentityRefused", "message": "not this agent's"}
-    await cd.run(base, token, "dep-7", "stop")
+    r = await cd.run(base, token, "dep-7", "stop")
     check(auth.identity_refused(), "accounts refusing the identity is noticed")
+    check("own identity" in r["text"] and "fresh session" not in r["text"], f"and worded as the identity, not the session: {r['text']}")
     Accounts.requests = []
     await cd.run(base, token, "dep-7", "stop")
     check(Accounts.requests[-1]["agent"] == "agent-identity-xyz", "and the identity is still sent, never dropped")
+    auth.set_agent_identity("agent-identity-xyz")
+    check(auth.identity_refused(), "the SAME identity again is still the refused one")
     auth.set_agent_identity("agent-identity-fresh")
     check(not auth.identity_refused(), "a fresh bootstrap clears it")
+    # past the cap the agent stops asking: accounts is issuing identities it cannot verify
+    for n in range(auth.MAX_IDENTITY_REFUSALS + 1):
+        auth.set_agent_identity(f"agent-identity-{n}")
+        await cd.run(base, token, "dep-7", "stop")
+    check(not auth.identity_refused(), "after repeated refusals of fresh identities it stops asking, never loops")
+    auth._REFUSALS_IN_A_ROW = 0
+    Accounts.jobs_status, Accounts.jobs_body = 401, {"error": "Unauthorized", "message": "mentions AgentIdentityRefused in passing"}
+    auth.set_agent_identity("agent-identity-other")
+    await cd.run(base, token, "dep-7", "stop")
+    check(not auth.identity_refused(), "only the error FIELD counts, never a mention in the message")
     Accounts.jobs_status, Accounts.jobs_body = 401, {"error": "Unauthorized", "message": "session ended"}
     await cd.run(base, token, "dep-7", "stop")
     check(not auth.identity_refused(), "a session that ended is not a refused identity")
@@ -296,9 +309,11 @@ async def main():
     # /health says not bootstrapped while accounts refuses the identity, so accounts re-pushes one (DAT-498 slice 3)
     agent._bootstrapped = True
     auth.set_agent_identity("id-1")
-    check((await agent.health()).bootstrapped is True, "bootstrapped, identity accepted")
+    check((await agent.health()).agent_identity_refused is False, "identity accepted")
     auth._IDENTITY_REFUSED = True
-    check((await agent.health()).bootstrapped is False, "an identity accounts refused reads as not bootstrapped")
+    h = await agent.health()
+    check(h.bootstrapped is True and h.agent_identity_refused is True,
+          "a refused identity is reported on its own; bootstrapped stays true (chat still works)")
     auth.set_agent_identity(None)
     agent._bootstrapped = False
     running = {"descriptor_text": "mode: backtest\n"}

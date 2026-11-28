@@ -1226,12 +1226,20 @@ agent like an MCP connection's, for the owner's approval in the console, once th
   through it, so no call reaches accounts as the user's own. With no claim (an older accounts) no header is sent.
 - **A held call answers 202, like a queued job, and has NOT run.** `cloud_deployments._held` recognises
   `{"status":"held"}` on create and on an operation, and tells the model it waits for the owner's approval in the
-  console, with the link, and not to repeat it. Read as a job, it would be followed with `deployment_progress` forever.
-- ⚠️ **A refused identity is never dropped.** A 401 `AgentIdentityRefused` (accounts re-keyed, or the identity is not
-  this agent's) is noticed by `auth.observe_accounts_reply` after every accounts call, and `/health` then reports
-  `bootstrapped: false`, so accounts' poll re-pushes the bootstrap with a fresh identity. Dropping it instead would
+  console, with the link, and not to repeat it. Read as a job, it would be followed with `deployment_progress` forever. It carries the
+  held call's id, and tells the model to check `list_deployments` once the user says they have decided.
+- ⚠️ **A refused identity is never dropped.** A 401 whose `error` FIELD is `AgentIdentityRefused` (accounts re-keyed,
+  or the identity is not this agent's; `auth.is_identity_refusal`, never a substring of the body) is noticed by
+  `auth.observe_accounts_reply` after every accounts call, and `/health` reports **`agent_identity_refused: true`**;
+  accounts' poll then re-pushes ONLY the bootstrap token, which carries a fresh identity. Dropping it instead would
   send the next calls as the user's own, never held, which is what the refusal exists to stop. A session that merely
-  ended (`Unauthorized`) is not a refusal.
+  ended (`Unauthorized`) is not a refusal, and the model is told the two apart.
+  - ⚠️ **`bootstrapped` stays true.** The agent IS bootstrapped and chat works; reporting false would tell the workspace
+    the box is starting (review of #81).
+  - ⚠️ **A refusal clears only on a DIFFERENT identity**, and after `MAX_IDENTITY_REFUSALS` (3) fresh identities refused
+    in a row the agent stops asking (logged at ERROR): accounts is then issuing identities it cannot verify, and asking
+    every poll would only loop. Its calls to accounts keep failing closed until that is fixed. A successful call resets
+    the count.
 - **What accounts holds**: destructive calls by default (deprovision, ...); the owner can set the agent to `none` on
   the approvals page. Never writes, so the reporters' routine calls are never held. Only the owner decides, and never
   through this agent: accounts refuses a decision that carries the agent's identity.
