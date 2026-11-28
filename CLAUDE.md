@@ -1212,6 +1212,35 @@ round the clock) can have it deployed to Datafye's cloud, through four in-proces
   (`python3 tests/cloud_deployments.py`, with the venv's Python); mutation-checked (one equivalent
   mutant: the watch deadline is enforced twice).
 
+### The agent's own identity, so accounts can hold its destructive calls (DAT-498 slice 3)
+
+Every call this agent makes to accounts goes with the user's own session, which accounts never holds. So a model
+acting through these tools could deprovision a deployment with nobody asked. Accounts now holds a call made THROUGH the
+agent like an MCP connection's, for the owner's approval in the console, once the agent says it is the agent.
+
+- **The bootstrap token carries `agent_identity`**, an opaque string accounts signed for this user's Yukti.
+  `/bootstrap` hands it to `auth.set_agent_identity`; it is held in memory only (every bootstrap re-sends it).
+- **`auth.accounts_headers(token, extra)` builds the headers for EVERY call to accounts**: the session, plus
+  `X-Agent-Identity` when there is one. All eight call sites (the deployment tools, the event stream, the usage,
+  satisfaction, descriptor, intent and feedback reporters, the deployment-token mint, the ConnectTrade write-back) go
+  through it, so no call reaches accounts as the user's own. With no claim (an older accounts) no header is sent.
+- **A held call answers 202, like a queued job, and has NOT run.** `cloud_deployments._held` recognises
+  `{"status":"held"}` on create and on an operation, and tells the model it waits for the owner's approval in the
+  console, with the link, and not to repeat it. Read as a job, it would be followed with `deployment_progress` forever.
+- ⚠️ **A refused identity is never dropped.** A 401 `AgentIdentityRefused` (accounts re-keyed, or the identity is not
+  this agent's) is noticed by `auth.observe_accounts_reply` after every accounts call, and `/health` then reports
+  `bootstrapped: false`, so accounts' poll re-pushes the bootstrap with a fresh identity. Dropping it instead would
+  send the next calls as the user's own, never held, which is what the refusal exists to stop. A session that merely
+  ended (`Unauthorized`) is not a refusal.
+- **What accounts holds**: destructive calls by default (deprovision, ...); the owner can set the agent to `none` on
+  the approvals page. Never writes, so the reporters' routine calls are never held. Only the owner decides, and never
+  through this agent: accounts refuses a decision that carries the agent's identity.
+- ⚠️ **It labels the calls this agent's code makes**, which is the only way its model reaches accounts: the session is
+  held in this process and is not in a tool's environment. The `DATAFYE_DEPLOYMENT_TOKEN` a tool can see has the
+  `credentials` scope, which cannot reach the deployment routes. A tool ever handed an accounts credential of its own
+  would need the label carried inside that credential, a later slice.
+- Tests: `tests/cloud_deployments.py` (the header, the held answers, the refusal and `/health`), mutation-checked.
+
 ## Activity per call (DAT-319)
 
 There is **no project lifecycle** any more. A project used to carry an inferred `intent`, a

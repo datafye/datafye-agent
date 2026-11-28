@@ -84,6 +84,54 @@ def username() -> str | None:
     return _AGENT_USERNAME
 
 
+# The agent's own identity (DAT-498 slice 3), from the bootstrap token's `agent_identity` claim. Sent back to accounts
+# beside the user's session on every call, so accounts tells a call made THROUGH this agent from one the user made
+# themselves, and holds its destructive calls for the owner's approval in the console. Opaque here: accounts signs and
+# checks it; it grants nothing. None until bootstrap, or when accounts is too old to issue one (then no header is sent).
+AGENT_IDENTITY_HEADER = "X-Agent-Identity"
+_AGENT_IDENTITY: str | None = None
+
+
+_IDENTITY_REFUSED = False
+
+
+def set_agent_identity(identity) -> None:
+    """Called by main.py's /bootstrap handler with the token's `agent_identity` claim (absent on an older accounts)."""
+    global _AGENT_IDENTITY, _IDENTITY_REFUSED
+    _AGENT_IDENTITY = identity if isinstance(identity, str) and identity else None
+    _IDENTITY_REFUSED = False
+
+
+def observe_accounts_reply(resp) -> None:
+    """Called after every call to accounts. A 401 `AgentIdentityRefused` means accounts no longer accepts this agent's
+    identity (re-keyed, or an older one): the agent then reports itself NOT bootstrapped on /health, and accounts' poll
+    re-pushes the bootstrap, which carries a fresh identity. ⚠️ The identity is NOT dropped meanwhile: calls without it
+    would reach accounts as the user's own, never held, which is exactly what the refusal stops."""
+    global _IDENTITY_REFUSED
+    try:
+        refused = resp is not None and resp.status_code == 401 and "AgentIdentityRefused" in (resp.text or "")
+    except Exception:
+        refused = False
+    if refused and not _IDENTITY_REFUSED:
+        logger.warning("accounts refused this agent's identity; reporting not bootstrapped until accounts re-pushes one")
+    _IDENTITY_REFUSED = _IDENTITY_REFUSED or refused
+
+
+def identity_refused() -> bool:
+    """Whether accounts refused this agent's identity since the last bootstrap (see observe_accounts_reply)."""
+    return _IDENTITY_REFUSED
+
+
+def accounts_headers(token: str, extra: dict | None = None) -> dict:
+    """The headers for one call to accounts with the user's session: the session, and this agent's identity when it has
+    one. EVERY call to accounts goes through here, so none of them reaches accounts as the user's own."""
+    headers = {"Authorization": f"Bearer {token}"}
+    if _AGENT_IDENTITY:
+        headers[AGENT_IDENTITY_HEADER] = _AGENT_IDENTITY
+    headers.update(extra or {})
+    return headers
+
+
 def verify_bootstrap_token(token: str) -> dict:
     """Verify an accounts-signed agent-bootstrap token and return its claims.
 

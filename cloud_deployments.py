@@ -22,6 +22,8 @@ from typing import Any, Optional
 import httpx
 import yaml
 
+import auth
+
 #: The accounts REST base. main.py's reporters use it too, so there is one copy of it.
 API = "/datafye-accounts-api/v1"
 #: Longest the model may ask `watch` to wait in one call. A turn can carry several calls.
@@ -48,6 +50,20 @@ def default_name(username: str, project_id: Optional[str]) -> str:
         user = "u" + user
     user = user[:32 - 1 - len(tail)].rstrip("-")
     return f"{user}-{tail}"
+
+
+def _held(data: Any) -> Optional[str]:
+    """What to tell the model when accounts HELD the call for the owner's approval (DAT-498 slice 3), or None.
+
+    ⚠️ A held call answers 202, like a queued job, and has NOT run: read as a job it would be followed with
+    deployment_progress forever. It runs only once the account's owner approves it in the console."""
+    text = None
+    if isinstance(data, dict) and data.get("status") == "held":
+        where = data.get("approve_url") or "the Datafye Cloud Console"
+        text = (f"Not done yet: this {data.get('class') or 'held'} call waits for the account owner's approval in the console "
+                f"({where}). It runs once they approve it there, and expires if they do not. Do not repeat it: tell the "
+                "user it is waiting for their approval, then check list_deployments once they have decided.")
+    return text
 
 
 def _refusal(resp: httpx.Response) -> str:
@@ -80,7 +96,8 @@ async def _send(method: str, url: str, token: str, body: Optional[dict],
     client = client or httpx.AsyncClient(timeout=30.0)
     resp, data, failure = None, None, None
     try:
-        resp = await client.request(method, url, json=body, headers={"Authorization": f"Bearer {token}"})
+        resp = await client.request(method, url, json=body, headers=auth.accounts_headers(token))
+        auth.observe_accounts_reply(resp)
         try:
             data = resp.json() if resp.content else {}
         except ValueError:
@@ -142,6 +159,8 @@ async def create(base: str, token: str, name: str, descriptor: str, project_id: 
         elif data is None:
             result = {"ok": False, "text": "accounts accepted the deployment but its answer could not be read; call "
                                            "list_deployments to find it before trying again."}
+        elif _held(data):
+            result = {"ok": False, "held": True, "text": _held(data)}
         else:
             dep = (data.get("deployment") or {}).get("id")
             job = (data.get("job") or {}).get("id")
@@ -187,6 +206,8 @@ async def run(base: str, token: str, deployment_id: str, operation: str, version
                                            "queued; call list_deployments to see before trying again."}
         elif resp.status_code // 100 != 2:
             result = {"ok": False, "text": f"The {operation} was not started: {_refusal(resp)}"}
+        elif _held(data):
+            result = {"ok": False, "held": True, "text": _held(data)}
         else:
             job = ((data or {}).get("job") or {}).get("id")
             result = {"ok": True, "job_id": job,
@@ -263,9 +284,10 @@ async def watch(base: str, token: str, deployment_id: str, job_id: str, offset: 
         try:
             async with client.stream("GET", f"{base}{API}/deployments/{deployment_id}/jobs/{job_id}/events",
                                      params={"offset": next_offset},
-                                     headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"}) as resp:
+                                     headers=auth.accounts_headers(token, {"Accept": "text/event-stream"})) as resp:
                 if resp.status_code // 100 != 2:
                     await resp.aread()
+                    auth.observe_accounts_reply(resp)
                     refused = _refusal(resp)
                 else:
                     loop = asyncio.get_running_loop()

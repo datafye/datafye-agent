@@ -46,6 +46,8 @@ class Accounts:
     hold_open = 0.0      # keep the stream open this long after the last event
     break_after = False  # drop the connection mid-stream instead of closing it cleanly
     recorded = "mode: backtest\n"
+    jobs_status = 409    # what POST .../jobs answers
+    jobs_body = {"error": "DeploymentBusy", "message": "Deployment 'x' is running job job-3"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,7 +56,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _record(self, body=None):
         Accounts.requests.append({"method": self.command, "path": self.path,
-                                  "auth": self.headers.get("Authorization"), "body": body})
+                                  "auth": self.headers.get("Authorization"), "body": body,
+                                  "agent": self.headers.get("X-Agent-Identity")})
 
     def _json(self, status, body):
         data = json.dumps(body).encode()
@@ -71,7 +74,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(Accounts.create_status, Accounts.create_body if Accounts.create_status < 300 else
                        {"error": "NotPermitted", "message": "This account cannot create cloud deployments: an admin grants them"})
         else:
-            self._json(409, {"error": "DeploymentBusy", "message": "Deployment 'x' is running job job-3"})
+            self._json(Accounts.jobs_status, Accounts.jobs_body)
 
     def do_GET(self):
         self._record()
@@ -143,6 +146,43 @@ async def main():
     r = await cd.create(base, token, "u7-abc", "mode: backtest\n", "proj-1", None)
     check(not r["ok"] and "an admin grants them" in r["text"] and "Nothing was changed" in r["text"], r["text"])
     Accounts.create_status = 202
+
+    print("== the agent's own identity rides beside the session, and a HELD call is never a queued job (DAT-498) ==")
+    import auth  # noqa: E402
+    Accounts.requests = []
+    await cd.create(base, token, "u7-abc", "mode: backtest\n", "proj-1", None)
+    check(Accounts.requests[0]["agent"] is None, "no identity before bootstrap supplies one: no header")
+    auth.set_agent_identity("agent-identity-xyz")
+    Accounts.requests = []
+    await cd.create(base, token, "u7-abc", "mode: backtest\n", "proj-1", None)
+    check(Accounts.requests[0]["agent"] == "agent-identity-xyz" and Accounts.requests[0]["auth"] == "Bearer user-session-jwt",
+          "with one: the identity beside the user's own session")
+    held = {"status": "held", "action_id": "pa-3", "class": "destructive", "approve_url": "https://accounts.test/approvals?action=pa-3",
+            "message": "waits"}
+    Accounts.create_body = held
+    r = await cd.create(base, token, "u7-abc", "mode: backtest\n", "proj-1", None)
+    check(not r["ok"] and r.get("held") and "owner's approval" in r["text"] and "approvals?action=pa-3" in r["text"]
+          and "deployment_progress" not in r["text"], r["text"])
+    Accounts.create_body = {"deployment": {"id": "dep-7"}, "job": {"id": "job-12"}}
+    Accounts.jobs_status, Accounts.jobs_body = 202, held
+    r = await cd.run(base, token, "dep-7", "stop")
+    check(not r["ok"] and r.get("held") and "Do not repeat it" in r["text"] and "job" not in r.get("job_id", "") , r["text"])
+    # a refused identity is never dropped (its calls would become the user's own): the agent reports itself not
+    # bootstrapped instead, so accounts re-pushes one
+    Accounts.jobs_status, Accounts.jobs_body = 401, {"error": "AgentIdentityRefused", "message": "not this agent's"}
+    await cd.run(base, token, "dep-7", "stop")
+    check(auth.identity_refused(), "accounts refusing the identity is noticed")
+    Accounts.requests = []
+    await cd.run(base, token, "dep-7", "stop")
+    check(Accounts.requests[-1]["agent"] == "agent-identity-xyz", "and the identity is still sent, never dropped")
+    auth.set_agent_identity("agent-identity-fresh")
+    check(not auth.identity_refused(), "a fresh bootstrap clears it")
+    Accounts.jobs_status, Accounts.jobs_body = 401, {"error": "Unauthorized", "message": "session ended"}
+    await cd.run(base, token, "dep-7", "stop")
+    check(not auth.identity_refused(), "a session that ended is not a refused identity")
+    Accounts.jobs_status = 409
+    Accounts.jobs_body = {"error": "DeploymentBusy", "message": "Deployment 'x' is running job job-3"}
+    auth.set_agent_identity(None)
     Accounts.requests = []
     r1 = await cd.create(base, token, "Bad Name", "mode: backtest\n", None, None)
     r2 = await cd.create(base, token, "u7-abc", "  ", None, None)
@@ -253,6 +293,14 @@ async def main():
     import auth  # noqa: E402
     auth.ACCOUNTS_URL = base
     agent.AGENT_USERNAME = "u7"
+    # /health says not bootstrapped while accounts refuses the identity, so accounts re-pushes one (DAT-498 slice 3)
+    agent._bootstrapped = True
+    auth.set_agent_identity("id-1")
+    check((await agent.health()).bootstrapped is True, "bootstrapped, identity accepted")
+    auth._IDENTITY_REFUSED = True
+    check((await agent.health()).bootstrapped is False, "an identity accounts refused reads as not bootstrapped")
+    auth.set_agent_identity(None)
+    agent._bootstrapped = False
     running = {"descriptor_text": "mode: backtest\n"}
 
     async def fake_state():

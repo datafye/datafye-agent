@@ -199,13 +199,14 @@ async def _write_back_user_creds(user_id: str, user_secret: str,
     if not auth_token or not user:
         return
     base = f"{auth.ACCOUNTS_URL}/datafye-accounts-api/v1/accounts/{user}/credentials"
-    headers = {"Authorization": f"Bearer {auth_token}", "Content-Type": "application/json"}
+    headers = auth.accounts_headers(auth_token, {"Content-Type": "application/json"})
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
             for provider, value in (("connecttrade_user_id", user_id),
                                     ("connecttrade_user_secret", user_secret)):
                 resp = await http.put(f"{base}/{provider}", headers=headers,
                                       json={"value": value})
+                auth.observe_accounts_reply(resp)
                 if resp.status_code >= 400:
                     logger.warning("ConnectTrade user-cred write-back to accounts "
                                    "returned %s for %s", resp.status_code, provider)
