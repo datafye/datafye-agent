@@ -165,7 +165,21 @@ def describe() -> dict[str, Any]:
                              else time.monotonic() + _FAILURE_BACKOFF_SECONDS)
         finally:
             _LOCK.release()
-    info = _CACHE if _CACHE is not None else _unknown("probe in progress")
+    # A COPY: every caller shares the cached answer, so a caller that edited the dict it got back
+    # would change it for every later request. The placeholder while the very first probe runs
+    # still carries the SDK version, which costs an import rather than a fork.
+    info = dict(_CACHE) if _CACHE is not None else _in_progress()
+    return info
+
+
+def _in_progress() -> dict[str, Any]:
+    """The answer while the first probe is still running: transient, not a failure."""
+    info = _unknown("probe in progress")
+    try:
+        import claude_agent_sdk
+        info["sdk_version"] = getattr(claude_agent_sdk, "__version__", None)
+    except Exception:
+        pass
     return info
 
 
