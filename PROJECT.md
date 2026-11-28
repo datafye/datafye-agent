@@ -1312,6 +1312,18 @@ wrong answer in for the life of the process. This probe is *most* likely to fail
 first call: cold binary, cold page cache, a box still settling after boot. Retrying costs
 one subprocess on a page nobody polls.
 
+**...and then "retry until it works" turned out to be its own bug (DAT-501).** "A page nobody
+polls" is true of a healthy fleet, not of an attacker: `/v1/bom` is unauthenticated, and on a box
+whose CLI can *never* answer (no AVX, a broken binary, no CLI at all) nothing was ever cached and
+there was no lock, so every request forked the 300 MB binary and fifty concurrent requests forked
+fifty. The rule that fixed one failure mode had quietly reopened the one the cache was invented to
+close. Now only one probe runs at a time (a request that finds one running gets the last answer
+rather than waiting), a failure is kept for 60 s, and a success for the process's life. The lesson
+is the general one about caches in front of expensive work: **decide what happens on failure AND
+under concurrency, not just on success**; a cache that only remembers good news is a retry loop
+anyone can drive. Caught by code review of the Rumi Support Agent's port of this module (RUMI-527),
+which is a nice argument for reviewing a port as carefully as an original.
+
 And the number itself: the bundled CLI is **2.1.228**, running under SDK **0.2.136**. The
 figure that had been written into a ticket, a correction to that ticket, and `CLAUDE.md`
 was 2.1.85, read off a local dev venv carrying SDK 0.1.51. **A version derived from a pin

@@ -661,10 +661,16 @@ you are looking at a dev venv rather than production.
   second. **That is what makes it easy to under-size: every measurement you take by hand
   is warm, because taking it is what warms it.** Nothing waits on this probe, so a
   generous bound costs nothing.
-- ⚠️ **Cache success ONLY.** Caching a failure pins the wrong answer for the life of the
-  process, and this probe is most likely to fail on its *first* call (cold binary, cold
-  page cache, a box still settling after boot). The first cut cached unconditionally and
-  did exactly that.
+- ⚠️ **A success is kept for the process's life; a FAILURE for 60 s, and only ONE probe runs at a
+  time (DAT-501).** Caching a failure forever pins the wrong answer (this probe is most likely to
+  fail on its *first* call: cold binary, cold page cache, a box still settling after boot; the
+  first cut cached unconditionally and did exactly that). But caching *only* success, with no lock,
+  was the denial of service the cache exists to prevent: on a box whose CLI can never answer (no
+  AVX, a broken binary, no CLI) every unauthenticated `/v1/bom` forked the ~300 MB binary, and
+  concurrent requests each forked their own. Now a request that finds a probe running gets the last
+  answer or `probe in progress` without waiting, a failed probe backs off 60 s, and "no CLI at all"
+  says so in `cli_version_error` instead of a bare null. Found in review of the Rumi Support Agent's
+  port (RUMI-527); `tests/sdk_pin.py` covers the lock and the back-off.
 - **The bundled path is derived from the installed package** the same way the SDK derives
   it, so it follows the venv and cannot drift. **Mirrored rather than imported**:
   `_find_bundled_cli` is a method on `SubprocessCLITransport` under `_internal`, and

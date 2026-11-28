@@ -43,6 +43,8 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +56,11 @@ logger = logging.getLogger(__name__)
 # free denial-of-service. The answer cannot change without the service
 # restarting anyway -- an upgrade replaces the venv and restarts it.
 _CACHE: dict[str, Any] | None = None
+# time.monotonic() before which no new probe starts: +inf once a probe has
+# succeeded, now + _FAILURE_BACKOFF_SECONDS after one fails. See describe().
+_RETRY_AT = 0.0
+_FAILURE_BACKOFF_SECONDS = 60
+_LOCK = threading.Lock()
 
 # 60s, not 10. The bundled CLI is a ~308 MB Bun binary, and its FIRST exec on a
 # box has to fault the whole thing in from a cold EBS volume before Bun even
@@ -116,25 +123,69 @@ def _version_of(cli_path: str) -> tuple[str | None, str | None]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _unknown(error: str | None) -> dict[str, Any]:
+    """The answer with every field undetermined."""
+    return {
+        "cli_version": None,
+        "cli_version_error": error,
+        "cli_path": None,
+        "cli_source": None,
+        "sdk_version": None,
+        "path_cli_version": None,
+    }
+
+
 def describe() -> dict[str, Any]:
     """The harness this agent runs turns with, for /v1/bom.
 
     Never raises: this is reporting, and an agent that cannot say which CLI it
     has is still a working agent. Every field is nullable and a caller must
     treat null as "could not determine", NOT as "absent".
-    """
-    global _CACHE
-    if _CACHE is not None:
-        return _CACHE
 
-    info: dict[str, Any] = {
-        "cli_version": None,
-        "cli_version_error": None,
-        "cli_path": None,
-        "cli_source": None,
-        "sdk_version": None,
-        "path_cli_version": None,
-    }
+    ⚠️ AT MOST ONE PROBE AT A TIME, AND A FAILURE BACKS OFF (DAT-501, ported from RUMI-527).
+    /v1/bom is public, so "probe until it works once" alone was the very
+    denial-of-service the cache exists to prevent: on a box whose CLI cannot
+    run at all (no AVX, a broken binary, no CLI), nothing was ever cached and
+    every request forked the ~300 MB binary, concurrently, each in its own
+    executor thread. Now a request that finds a probe already running does not
+    wait or start another: it gets the last answer (or "probe in progress").
+    A success is kept for the life of the process; a failure is kept for
+    _FAILURE_BACKOFF_SECONDS, which still lets a cold first boot recover a
+    minute later instead of pinning the null in.
+    """
+    global _CACHE, _RETRY_AT
+    if time.monotonic() >= _RETRY_AT and _LOCK.acquire(blocking=False):
+        try:
+            # Re-check under the lock: another thread may have finished a probe
+            # between the unlocked read and winning the lock.
+            if time.monotonic() >= _RETRY_AT:
+                probed = _probe()
+                _CACHE = probed
+                _RETRY_AT = (float("inf") if probed["cli_version"]
+                             else time.monotonic() + _FAILURE_BACKOFF_SECONDS)
+        finally:
+            _LOCK.release()
+    # A COPY: every caller shares the cached answer, so a caller that edited the dict it got back
+    # would change it for every later request. The placeholder while the very first probe runs
+    # still carries the SDK version, which costs an import rather than a fork.
+    info = dict(_CACHE) if _CACHE is not None else _in_progress()
+    return info
+
+
+def _in_progress() -> dict[str, Any]:
+    """The answer while the first probe is still running: transient, not a failure."""
+    info = _unknown("probe in progress")
+    try:
+        import claude_agent_sdk
+        info["sdk_version"] = getattr(claude_agent_sdk, "__version__", None)
+    except Exception:
+        pass
+    return info
+
+
+def _probe() -> dict[str, Any]:
+    """One probe of the SDK, the bundled CLI and the PATH CLI. Never raises."""
+    info = _unknown(None)
     try:
         try:
             import claude_agent_sdk
@@ -150,6 +201,8 @@ def describe() -> dict[str, Any]:
             info["cli_path"], info["cli_source"] = bundled, "bundled"
         elif path_cli:
             info["cli_path"], info["cli_source"] = path_cli, "path"
+        else:
+            info["cli_version_error"] = "no bundled Claude Code and no claude on PATH"
 
         if info["cli_path"]:
             info["cli_version"], info["cli_version_error"] = _version_of(info["cli_path"])
@@ -164,14 +217,4 @@ def describe() -> dict[str, Any]:
             info["path_cli_version"], _ = _version_of(path_cli)
     except Exception:
         logger.warning("could not determine the harness version", exc_info=True)
-
-    # ⚠️ CACHE SUCCESS ONLY. Caching a failure keeps the wrong answer for the
-    # life of the process, and this probe is MOST likely to fail on its first
-    # call -- cold binary, cold page cache, a box still settling after boot.
-    # The first cut cached unconditionally and did exactly that on the first
-    # real box: `cli_version: null` pinned in, while running the same binary by
-    # hand a minute later took under a second. Retrying costs one subprocess on
-    # a page that is polled rarely, and only until it works once.
-    if info["cli_version"]:
-        _CACHE = info
     return info
