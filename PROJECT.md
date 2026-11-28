@@ -1791,6 +1791,9 @@ DAT-225, DAT-226, DAT-203, and DAT-234. Three of those carry a wrinkle worth sta
   `requirements.txt` says `>=0.2.128,<0.3` to this day, so what a box resolves is still a
   guess about what resolution will do. The exact pin to write is
   `claude-agent-sdk==0.2.136`, the version production actually resolved.
+  *Update:* written, and then some. `requirements.txt` now pins `claude-agent-sdk==0.2.152`
+  and the installer refuses a box that does not match; see
+  [The Fleet That Was Right by Luck](#the-fleet-that-was-right-by-luck-dat-486-dat-485-dat-487).
 
 ### Bootstrap: How the Agent Learns Who It Is
 
@@ -2066,6 +2069,65 @@ with a `TypeError`. That crash killed the run before the remaining checks (and t
 and the "all checks pass" being read was from an earlier run. The suite's exit code was 1 the whole
 time. A green summary only means something if the thing printing it got to the end; `echo $?` is the
 one line that cannot lie about that.
+
+### The Fleet That Was Right by Luck (DAT-486, DAT-485, DAT-487)
+
+The goal was plain bookkeeping: every cost the workspace shows for a turn should trace back to something the metering gateway measured. It ended up being a lesson about which program is really running on a box, which is the question [The Probe That Reproduced the Bug](#the-probe-that-reproduced-the-bug-it-was-written-to-fix-dat-215) started asking and never quite finished.
+
+**The pin that was a coin toss made once.** The SDK runs the Claude Code it bundles
+(`claude_agent_sdk/_bundled/claude`) ahead of anything on PATH, so the SDK version *is* the
+harness: `claude-agent-sdk==0.2.152` means Claude Code 2.1.259. For months the requirement was a
+range, `>=0.2.128,<0.3`, the installer only installed what was missing, and `pip install -r` never
+upgrades a requirement that is already satisfied. So every box froze at whatever was newest the day
+it was first built and stayed there through every upgrade. Picture a fleet of cars that each got
+whatever engine was in stock that week, with nobody ever opening a hood again.
+
+It worked, and that is the uncomfortable part. Claude Code **2.1.277 and later** report a resumed
+session's `model_usage` and `total_cost_usd` as a running total for the whole session rather than
+for the turn. Every box predated that, so every box reported per turn: **correct by luck.** The next
+fresh bake could have started double-counting with nothing to say so.
+
+Now the installer **fails closed**. It will not finish unless the installed SDK equals the pin *and*
+the bundled CLI reports the version the SDK says it bundles (its `_cli_version`, read from the SDK
+instead of being written down a second time). The PATH copy is pinned too, warn-only, since nothing
+runs it. `/v1/bom` already carried the `harness` block, which is how anyone can now check.
+
+**The fix that was reverted.** Along the way a local probe, on a laptop with a newer CLI, showed
+cumulative usage on a resumed turn, and a fix that turned running totals back into per-turn deltas
+was written and merged (#72, #73). Every deployed box was on the older harness and already reported
+per turn, so on production it would have subtracted numbers that were never cumulative. It was
+reverted (#74) before it shipped. This is the DAT-215 lesson again, one level up: that one was a
+version read off the wrong venv; this was a *behaviour* read off the wrong binary. **Verify the
+runtime version on a production box before you assert how production behaves.**
+
+**The calls that cost nothing (DAT-485).** The agent makes a few model calls of its own, straight to
+`/v1/messages`: the title, the satisfaction read, the activity classifier, and the environment-intent
+safety net. They were reported at **$0**. Small, but a cost report with a known hole teaches people to
+distrust all of it. `pricing.py` now prices them the way the gateway does: a **copy** of the gateway's
+price table, the gateway's own arithmetic, and the price of the model that **answered**
+(`answered_by`) rather than the one that was asked for. Copies drift, so a parity test checks the
+agent against a gateway checkout. On the Sutra side of the same work, the agent's report and the
+gateway's agreed to within two micro-dollars ($8.927538 against $8.927536).
+
+**Every call wears its project's badge (DAT-314, DAT-312).** Each call carries `x-gateway-project-id`
+and the session, so the gateway files cost under the project that spent it. The proof that counts
+was two projects running at once on one box (on the Sutra twin, 136 calls), every call landing under
+its own project.
+
+**The hold is not the latency.** The labeller flushes every 30 seconds but **reports** a 60-second
+cadence, and the gateway holds each record for three times what it is told. Reporting the honest 30
+gave a 90-second hold, and one classifier call that timed out and retried ran straight past it, so
+those calls were filed `unclassified` for good. The flush age decides how fast a label lands; the hold
+is only the net for a label that is late. **Don't tighten a safety net because the normal path got
+faster**: the slow path it catches did not.
+
+**A default you write down is a default you can never change (DAT-487).** The agent now uses the npm
+MCP server when nothing says otherwise. The tempting installer change was to write `npm` into
+`agent.env` when no `--mcp-server` was given. But every later upgrade carries `agent.env` forward, so
+that box would keep *this* release's default forever, and a later release that changes the default
+would never reach it. The installer persists only an **explicit** `--mcp-server`; empty means "the
+agent's current default". It is the same trap as the SDK range above wearing different clothes: a
+value captured once at install time and then mistaken for a decision.
 
 ## Broker Integration
 
