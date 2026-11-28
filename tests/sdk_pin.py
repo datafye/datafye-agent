@@ -87,6 +87,58 @@ def test_the_installer_step_passes_only_the_pinned_sdk_and_its_bundled_cli():
     check(code != 0 and "expected 2.1.259" in err, f"a bundled CLI that is not the SDK's own fails the install ({err})")
 
 
+def test_the_installer_says_why_a_probe_failed():
+    # The venv python stub exits non-zero with a traceback, as a broken SDK install would.
+    code, err = _run_step("claude-agent-sdk==0.2.152", "ImportError: no module'; exit 1; echo '", "2.1.259")
+    check(code != 0 and "could not inspect claude-agent-sdk" in err and "ImportError" in err,
+          f"a failed SDK import fails with its own error, not a version mismatch ({err})")
+
+
+def test_a_failed_probe_is_not_repeated_on_every_request():
+    import threading
+    import time
+    import harness
+    calls = []
+    gate = threading.Event()
+    real_probe = harness._probe
+
+    def slow_failing_probe():
+        calls.append(1)
+        gate.wait(2)
+        return harness._unknown("exit 1: cannot run")
+
+    harness._probe = slow_failing_probe
+    harness._CACHE, harness._RETRY_AT = None, 0.0
+    try:
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(harness.describe())) for _ in range(20)]
+        for t in threads:
+            t.start()
+        time.sleep(0.2)
+        gate.set()
+        for t in threads:
+            t.join()
+        check(len(calls) == 1, f"20 concurrent requests run ONE probe ({len(calls)})")
+        check(any(r["cli_version_error"] == "probe in progress" for r in results),
+              "a request that finds a probe running gets 'probe in progress' instead of waiting")
+        for _ in range(20):
+            harness.describe()
+        check(len(calls) == 1, f"a failed probe is not re-run inside the back-off ({len(calls)} probes)")
+        harness._RETRY_AT = 0.0
+        harness.describe()
+        check(len(calls) == 2, f"after the back-off a failed probe is retried ({len(calls)} probes)")
+        harness._probe = lambda: (calls.append(1), {**harness._unknown(None), "cli_version": "2.1.259"})[1]
+        harness._RETRY_AT = 0.0
+        harness.describe()
+        for _ in range(5):
+            harness.describe()
+        check(len(calls) == 3 and harness._RETRY_AT == float("inf"),
+              f"a success is kept for the life of the process ({len(calls)} probes)")
+    finally:
+        harness._probe = real_probe
+        harness._CACHE, harness._RETRY_AT = None, 0.0
+
+
 def test_bom_reports_the_harness():
     os.environ.setdefault("DATAFYE_AGENT_STATE_DIR", tempfile.mkdtemp())
     import harness
@@ -105,6 +157,8 @@ if __name__ == "__main__":
     test_the_sdk_is_pinned_exactly()
     test_claude_code_is_never_installed_unversioned()
     test_the_installer_step_passes_only_the_pinned_sdk_and_its_bundled_cli()
+    test_the_installer_says_why_a_probe_failed()
+    test_a_failed_probe_is_not_repeated_on_every_request()
     test_bom_reports_the_harness()
     print(f"\n{len(FAILED)} failure(s)" if FAILED else "\nall checks pass")
     sys.exit(1 if FAILED else 0)

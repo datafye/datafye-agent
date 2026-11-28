@@ -970,7 +970,10 @@ if [ -z "${SDK_PIN}" ]; then
     error "requirements.txt does not pin claude-agent-sdk to an exact version (==X.Y.Z)"
     exit 1
 fi
-read -r SDK_INSTALLED HARNESS_PATH CLAUDE_CODE_VERSION <<< "$("${VENV_DIR}/bin/python" - <<'PY'
+# Probe the SDK as its own command so a failed import fails HERE, with its traceback, rather than
+# surfacing as a version mismatch against an empty "installed" version (`read` from a here-string
+# succeeds whatever the command inside it did).
+SDK_PROBE=$("${VENV_DIR}/bin/python" - 2>&1 <<'PY'
 import pathlib
 import claude_agent_sdk as sdk
 bundled = pathlib.Path(sdk.__file__).parent / "_bundled" / "claude"
@@ -980,7 +983,8 @@ except Exception:
     cli = "-"
 print(sdk.__version__, bundled if bundled.is_file() else "-", cli or "-")
 PY
-)"
+) || { error "could not inspect claude-agent-sdk in ${VENV_DIR}: ${SDK_PROBE}"; exit 1; }
+read -r SDK_INSTALLED HARNESS_PATH CLAUDE_CODE_VERSION <<< "$(printf '%s\n' "${SDK_PROBE}" | tail -1)"
 if [ "${SDK_INSTALLED}" != "${SDK_PIN}" ]; then
     error "claude-agent-sdk ${SDK_INSTALLED} is installed, but requirements.txt pins ${SDK_PIN}"
     exit 1
@@ -990,28 +994,39 @@ if [ "${HARNESS_PATH}" = "-" ] || [ "${CLAUDE_CODE_VERSION}" = "-" ]; then
     exit 1
 fi
 # The first run of the ~300 MB binary faults it in from a cold volume, hence the generous timeout.
-HARNESS_REPORTS=$(timeout 180 "${HARNESS_PATH}" --version 2>/dev/null | awk '{print $1}' || true)
-if [ "${HARNESS_REPORTS}" != "${CLAUDE_CODE_VERSION}" ]; then
-    error "the SDK's bundled Claude Code reports '${HARNESS_REPORTS}', expected ${CLAUDE_CODE_VERSION}"
+# Keep the exit status and the output: "reports ''" alone cannot tell a timeout (124) from a binary
+# that cannot run on this CPU (the bundled CLI is a Bun build that needs AVX).
+HARNESS_RC=0
+HARNESS_OUT=$(timeout 180 "${HARNESS_PATH}" --version 2>&1) || HARNESS_RC=$?
+HARNESS_REPORTS=$(printf '%s\n' "${HARNESS_OUT}" | head -1 | awk '{print $1}')
+if [ "${HARNESS_RC}" -ne 0 ] || [ "${HARNESS_REPORTS}" != "${CLAUDE_CODE_VERSION}" ]; then
+    HARNESS_WHY="exit ${HARNESS_RC}"
+    [ "${HARNESS_RC}" -eq 124 ] && HARNESS_WHY="timed out after 180s"
+    error "the SDK's bundled Claude Code reports '${HARNESS_REPORTS}', expected ${CLAUDE_CODE_VERSION} (${HARNESS_WHY}: ${HARNESS_OUT:0:300})"
     exit 1
 fi
 ok "Claude Agent SDK ${SDK_INSTALLED}, running its bundled Claude Code ${CLAUDE_CODE_VERSION}"
 
 # The `claude` on PATH is NOT the harness: it is a fallback for an SDK that ships without a bundled
 # CLI, and nothing invokes it while the bundled one exists. It is held to the SAME version so the box
-# never carries two different Claude Codes (it used to drift: 2.1.260 on PATH beside a bundled
-# 2.1.259). claude.ai/install.sh always lays files under the invoking user's ~/.local and refuses to
-# run as root, so it runs as the runtime user. A failure here is a warning, not fatal: the fallback is
-# unused and an install must not fail over it.
+# never carries two different Claude Codes (it drifted on Sutra: 2.1.260 on PATH beside a bundled
+# 2.1.259). It is only downloaded when it differs, so a box already in line makes no network call.
+# claude.ai/install.sh always lays files under the invoking user's ~/.local and refuses to run as
+# root, so it runs as the runtime user. A failure here is a warning, not fatal: the fallback is unused
+# and an install must not fail over it. The warning carries install.sh's own last words, so an
+# operator can see WHY without SSH.
 CLAUDE_BIN="/home/datafye/.local/bin/claude"
 PATH_CLAUDE=$(sudo -u datafye -H timeout 120 "${CLAUDE_BIN}" --version 2>/dev/null | awk '{print $1}' || true)
 if [ "${PATH_CLAUDE}" = "${CLAUDE_CODE_VERSION}" ]; then
     ok "Fallback Claude Code on PATH: ${CLAUDE_CODE_VERSION}"
-elif sudo -u datafye -H bash -c "curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}" >/dev/null 2>&1 \
-        && [ "$(sudo -u datafye -H timeout 120 "${CLAUDE_BIN}" --version 2>/dev/null | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}" ]; then
-    ok "Fallback Claude Code on PATH: ${PATH_CLAUDE:-none} -> ${CLAUDE_CODE_VERSION}"
 else
-    warn "Could not set the fallback Claude Code on PATH to ${CLAUDE_CODE_VERSION} (still ${PATH_CLAUDE:-none}); the harness is the bundled one, so turns are unaffected"
+    PATH_INSTALL_OUT=$(sudo -u datafye -H bash -c "curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}" 2>&1 || true)
+    PATH_CLAUDE_NOW=$(sudo -u datafye -H timeout 120 "${CLAUDE_BIN}" --version 2>/dev/null | awk '{print $1}' || true)
+    if [ "${PATH_CLAUDE_NOW}" = "${CLAUDE_CODE_VERSION}" ]; then
+        ok "Fallback Claude Code on PATH: ${PATH_CLAUDE:-none} -> ${CLAUDE_CODE_VERSION}"
+    else
+        warn "Could not set the fallback Claude Code on PATH to ${CLAUDE_CODE_VERSION} (still ${PATH_CLAUDE_NOW:-none}); the harness is the bundled one, so turns are unaffected. install.sh said: $(printf '%s\n' "${PATH_INSTALL_OUT}" | tail -3 | tr '\n' ' ')"
+    fi
 fi
 
 # ── Quant stack for PROJECT code (DAT-186) ───────────────────────
