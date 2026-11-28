@@ -688,7 +688,8 @@ async def _ensure_deployment_token(auth_token: Optional[str]) -> None:
     url = f"{accounts_url}{cloud_deployments.API}/accounts/{user}/deployment-token"
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
-            resp = await http.post(url, headers={"Authorization": f"Bearer {auth_token}"})
+            resp = await http.post(url, headers=auth.accounts_headers(auth_token))
+            auth.observe_accounts_reply(resp)
         if resp.status_code >= 400:
             logger.warning("Could not mint a deployment token (HTTP %s); a deployment with a "
                            "broker or Precision Alpha cannot be provisioned until this works",
@@ -1194,7 +1195,8 @@ async def _report_usage_to_accounts(conversation_id: str, model: str,
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(url, json=body,
-                                     headers={"Authorization": f"Bearer {auth_token}"})
+                                     headers=auth.accounts_headers(auth_token))
+            auth.observe_accounts_reply(resp)
             if resp.status_code >= 400:
                 logger.warning("Usage report to accounts returned %s for %s",
                                resp.status_code, conversation_id)
@@ -1218,7 +1220,8 @@ async def _report_satisfaction_to_accounts(conversation_id: str, rank: int, reas
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(url, json=body,
-                                     headers={"Authorization": f"Bearer {auth_token}"})
+                                     headers=auth.accounts_headers(auth_token))
+            auth.observe_accounts_reply(resp)
             if resp.status_code >= 400:
                 logger.warning("Satisfaction report returned %s for %s",
                                resp.status_code, conversation_id)
@@ -1251,7 +1254,8 @@ async def _report_descriptor_to_accounts(conversation_id: str, descriptor_text: 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.patch(url, json={"deployment_descriptor": descriptor_text},
-                                      headers={"Authorization": f"Bearer {auth_token}"})
+                                      headers=auth.accounts_headers(auth_token))
+            auth.observe_accounts_reply(resp)
             if resp.status_code >= 400:
                 logger.warning("Descriptor report returned %s for %s",
                                resp.status_code, conversation_id)
@@ -1290,7 +1294,8 @@ async def _report_foundry_intent_to_accounts(intended: str, source: str,
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(url, json={"intended": intended, "source": source},
-                                     headers={"Authorization": f"Bearer {auth_token}"})
+                                     headers=auth.accounts_headers(auth_token))
+            auth.observe_accounts_reply(resp)
         if resp.status_code // 100 == 2:
             logger.info("Foundry intent recorded with accounts: %s (%s)", intended, source)
             return True
@@ -1335,7 +1340,8 @@ def _build_reporting_mcp(auth_token: Optional[str], conversation_id: Optional[st
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(url, json=body,
-                                         headers={"Authorization": f"Bearer {auth_token}"})
+                                         headers=auth.accounts_headers(auth_token))
+                auth.observe_accounts_reply(resp)
             if resp.status_code // 100 == 2:
                 data = resp.json() if resp.content else {}
                 # accounts returns the created tracking-issue id under "ticket"
@@ -2786,7 +2792,8 @@ async def health():
     creds = credentials  # None until bootstrapped
     return HealthResponse(
         status="healthy",
-        bootstrapped=_bootstrapped,
+        # a refused agent identity reads as not bootstrapped, so accounts re-pushes one (DAT-498 slice 3)
+        bootstrapped=_bootstrapped and not auth.identity_refused(),
         configured=(anthropic_key_status != "missing"),
         anthropic_key_status=anthropic_key_status,
         agent_version=AGENT_VERSION,
@@ -2919,6 +2926,8 @@ async def bootstrap(authorization: Optional[str] = Header(default=None)):
     broker.configure(credentials)
     # Before the key: validating it must go to wherever it will be used.
     _apply_gateway_url(claims.get("llm_gateway_url"))
+    # DAT-498 slice 3: this agent's own identity, sent back beside the user's session on every call to accounts
+    auth.set_agent_identity(claims.get("agent_identity"))
     _apply_anthropic_key()
     _apply_credentials_env()
     _bootstrapped = True
